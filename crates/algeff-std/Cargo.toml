@@ -9,6 +9,16 @@ description = "Algeff 标准适配层：tokio 物理后端（DataOp 执行器 + 
 algeff-core = { path = "../algeff-core", version = "0.1.0" }
 tokio.workspace = true
 
+# 审计 R1（contract-F2 配套）：feature 转发缺口修复——algeff-std 测试/用户
+# 需经本 crate 启用 core 的可选 feature（此前只能直接依赖 algeff-core）。
+[features]
+default = []
+# 转发：逻辑时钟（确定性时间重放）。开启后 Sleep 瞬时推进虚拟时钟、
+# GetTime 读虚拟时钟、Timeout 走双通道判定（见 core runtime.rs 注释）。
+virtual-clock = ["algeff-core/virtual-clock"]
+# 转发：余效应依赖表。
+coeffects = ["algeff-core/coeffects"]
+
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true

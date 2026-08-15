@@ -355,6 +355,7 @@ fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
 /// 子状态机（含 deadline/elapsed）在堆上，不参与每层递归的栈帧预算。
 #[cfg(feature = "virtual-clock")]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn run_virtual_timeout<'a>(
     inner: Action,
     on_timeout: Action,
@@ -928,6 +929,9 @@ async fn interpret_impl(
                     )
                     .await;
                 }
+                // VC 构建下上方恒 return，此处为墙钟路径（`#[allow]`：cfg 剥离
+                // 后不可达性编译器无法跨 feature 感知）。
+                #[allow(unreachable_code)]
                 match tokio::time::timeout(
                     duration,
                     run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth),
