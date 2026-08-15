@@ -9,9 +9,10 @@
 //!    - 深度 5 不规则 Fork 树 → 全 fd 两两不相交 + 执行器映射读回正确；
 //!    - 同一 Runtime 50 轮 Fork 连续执行 → fd 紧凑单调（归一化生效，无爆涨）；
 //!    - 1000 个顺序冲突 Fork → 区间序号单调、fd 不碰撞、next_fd 不爆涨；
-//!    - **已知缺陷 RFC-06**：右分支有分配的连续 Fork 使 next_fd 呈二次增长
-//!      （每轮 +k·2^48），~360 轮后 u64 溢出（debug panic / release 回绕），
-//!      阶段 3+ 修复（`ResourceRegistry::offset_next_fd` / merge 归一化）；
+//!    - **RFC-06（已修复）**：右分支有分配的连续 Fork 曾使 next_fd 二次增长
+//!      （每轮 +k·2^48），~360 轮后 u64 溢出（debug panic / release 回绕）——
+//!      `ResourceRegistry::merge` 锚点吸收修复（分支 fork_region 根基线回灌父，
+//!      后续轮次偏移锚定根基线，父 next_fd 线性增长；见 spec §10 RFC-06）；
 //!    - **已知缺陷 RFC-07**：管道半端（PipeReader/PipeWriter）经 Fork registry
 //!      Clone（D13）共享 Arc，分支内对管道 IO 时 executor 的 `Arc::get_mut`
 //!      失败 → InvalidInput（文件工作对象是 Arc<Mutex<File>>，不受影响）。
@@ -407,16 +408,16 @@ fn fd_1000_conflict_forks_region_seq_and_fd_monotonic() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 1d【已知缺陷记录 RFC-06】：右分支有分配的连续 Fork 使父 next_fd 每轮
-// 抬高 k·2^48（k = 全局区间序号，二次增长），~360 轮后 base + k<<48 溢出
-// u64（debug panic / release 回绕 → fd 碰撞）。修复点
-// （ResourceRegistry::offset_next_fd / merge 的区间归一化）不在本审计允许的
-// 最小修复范围（runtime.rs / executor.rs）内，只记录不修（R1 RFC-05 先例：
-// 以「断言偏差可复现」的测试记录，修复后测试会失败提醒更新）。
+// 攻击面 1d【RFC-06 已修复】：右分支有分配的连续 Fork —— `ResourceRegistry`
+// merge 锚点吸收（分支 fork_region 根基线回灌父，后续轮次偏移锚定根基线）
+// 后，父 next_fd 线性增长（每轮恰跨一个 2^48 区间），不再 Σk·2^48 二次增长
+// （~362 轮 u64 溢出，debug panic / release 回绕 → fd 复用，违反 D1）。
+// 确定性回归门（精确线性公式）见 resource.rs 单测
+// `merge_right_branch_alloc_anchors_base_no_quadratic_growth`。
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn fd_region_quadratic_growth_known_deviation() {
+fn fd_region_right_branch_alloc_linear_not_quadratic() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let mut seen = std::collections::HashSet::new();
     for _ in 0..30u64 {
@@ -431,8 +432,8 @@ fn fd_region_quadratic_growth_known_deviation() {
                     // 左分支声明 wu(wfd) 与右分支 rd(wfd) 冲突 → 顺序路径；
                     // 左分支 op 改用 PipeOpen（新建管道，不与父管道 Arc 共享——
                     // 分支内对父管道半端 IO 会触发 RFC-07 的 Arc::get_mut 失败）；
-                    // 右分支 PipeOpen 在 k<<48 区间**实际分配 2 个 fd** →
-                    // merge 归一化失效（游标已被移动）→ 父 next_fd 抬高 k·2^48。
+                    // 右分支 PipeOpen 在 k<<48 区间**实际分配 2 个 fd**（修复后
+                    // 偏移锚定根基线，父 next_fd 线性增长）。
                     Action::Fork {
                         left: Box::new(syscall(
                             DataOp::PipeOpen {
@@ -456,67 +457,77 @@ fn fd_region_quadratic_growth_known_deviation() {
             ))
             .unwrap();
         let (rfd, wfd) = pair_of(&v);
-        assert!(seen.insert(rfd), "父管道 rfd 碰撞");
-        assert!(seen.insert(wfd), "父管道 wfd 碰撞");
+        assert!(seen.insert(rfd), "父管道 rfd 碰撞（D1）");
+        assert!(seen.insert(wfd), "父管道 wfd 碰撞（D1）");
     }
-    // 30 轮实际只分配 30×4 = 120 个 fd（父 2 + 左分支 2 + 右分支 2 每轮），但
-    // next_fd 已被抬高到 ≥ Σk·2^48（k ≥ 1 且递增，Σ ≥ 465）≈ 2^56 —— 每个
-    // 右分支的**一次分配**永久消耗 2^48 地址空间（D1 单调的代价，RFC-06）。
+    // 30 轮实际分配 30×4 = 120 个 fd；修复后右分支 fd 落在锚定根基线的独立
+    // 区间（[k·2^48, (k+1)·2^48)），父 next_fd 线性量级（≈ k_max·2^48；
+    // 修复前 Σk·2^48 ≥ 2^56 且随轮次发散）。
     let n = rt
         .registry()
         .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(
-        n >= (1u64 << 50),
-        "已知缺陷（记录）：90 次分配后 next_fd 应已爆涨到 ≥ 2^50，实测 {n}"
+        n < (1u64 << 62),
+        "30 轮右分支实际分配后 next_fd 应保持线性量级（< 2^62），实测 {n}"
     );
 }
 
-/// 已知缺陷（debug 构建实证，RFC-06）：右分支有分配的连续 Fork 在 ~360 轮内使
-/// `base + k<<48` 溢出 u64 → debug 构建触发 panic（release 构建静默回绕，
-/// next_fd 回到小值 → 与既有句柄碰撞）。本测试用 catch_unwind 捕获并记录
-/// 该 panic（修复点在 resource.rs，本审计范围外，只记录不修）。
-#[cfg(debug_assertions)]
+/// RFC-06 已修复（回归）：右分支有分配的连续 Fork 400 轮 —— debug 不再
+/// ~362 轮溢出 panic，release 不再回绕复用 fd。修复前 Σ_{k≤n} k·2^48 在
+/// n≈362 轮溢出 u64（debug panic / release 回绕 → fd 碰撞，违反 D1）；修复
+/// 后 merge 锚点吸收使每轮父 next_fd 线性 +2^48（区间锚定根基线），400 轮
+/// ≈ 2^57 无溢出，父管道 fd 逐轮唯一。
 #[test]
-fn fd_region_seq_overflow_panics_under_500_rounds() {
+fn fd_region_seq_no_overflow_or_reuse_400_rounds() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for _ in 0..500u64 {
-            let _ = rt
-                .run_blocking(syscall(
-                    DataOp::PipeOpen {
-                        flags: PipeFlags::default(),
-                    },
-                    vec![],
-                    move |v| {
-                        let (_rfd, wfd) = pair_of(&v);
-                        // 左分支与右分支同 PipeOpen（同 quadratic 测试：分支内
-                        // 不触碰父管道半端，避开 RFC-07；两分支都分配 → 右分支
-                        // k<<48 区间不被归一化 → next_fd 二次增长）。
-                        Action::Fork {
-                            left: Box::new(syscall(
-                                DataOp::PipeOpen {
-                                    flags: PipeFlags::default(),
-                                },
-                                vec![wu(wfd)],
-                                Action::Pure,
-                            )),
-                            right: Box::new(syscall(
-                                DataOp::PipeOpen {
-                                    flags: PipeFlags::default(),
-                                },
-                                vec![rd(wfd)],
-                                Action::Pure,
-                            )),
-                            combine: Box::new(|_, _| Action::Pure(Value::Unit)),
-                        }
-                    },
-                ))
-                .expect("round");
-        }
-    }));
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..400u64 {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::PipeOpen {
+                    flags: PipeFlags::default(),
+                },
+                vec![],
+                move |v| {
+                    let (rfd, wfd) = pair_of(&v);
+                    // 左分支与右分支同 PipeOpen（同 quadratic 测试：分支内
+                    // 不触碰父管道半端，避开 RFC-07；两分支都实际分配 → 右
+                    // 分支 k<<48 区间分配后，merge 锚点吸收保证下轮偏移锚定
+                    // 根基线，父 next_fd 线性增长）。
+                    Action::Fork {
+                        left: Box::new(syscall(
+                            DataOp::PipeOpen {
+                                flags: PipeFlags::default(),
+                            },
+                            vec![wu(wfd)],
+                            Action::Pure,
+                        )),
+                        right: Box::new(syscall(
+                            DataOp::PipeOpen {
+                                flags: PipeFlags::default(),
+                            },
+                            vec![rd(wfd)],
+                            Action::Pure,
+                        )),
+                        combine: Box::new(move |_, _| {
+                            Action::Pure(Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]))
+                        }),
+                    }
+                },
+            ))
+            .expect("round");
+        let (rfd, wfd) = pair_of(&v);
+        assert!(seen.insert(rfd), "父管道 rfd 碰撞（D1 违反）");
+        assert!(seen.insert(wfd), "父管道 wfd 碰撞（D1 违反）");
+    }
+    // 400 轮右分支实际分配后 next_fd 线性量级（≈ k_max·2^48 ≈ 2^57）：修复
+    // 前 Σk·2^48 在 ~362 轮即溢出（debug panic / release 回绕 fd 复用）。
+    let n = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(
-        outcome.is_err(),
-        "已知缺陷（记录）：500 轮内应触发 u64 溢出 panic（attempt to add with overflow）"
+        n < (1u64 << 62),
+        "400 轮后 next_fd 应保持线性量级（< 2^62），实测 {n}"
     );
 }
 
