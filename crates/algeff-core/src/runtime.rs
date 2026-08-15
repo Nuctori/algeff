@@ -237,6 +237,7 @@ impl Runtime {
             &mut self.undo_stack,
             &mut self.resource_registry,
             ExecAccess::Shared(self.executor.clone()),
+            0,
         )
         .await
     }
@@ -256,6 +257,7 @@ impl Runtime {
             undo_stack,
             resource_registry,
             ExecAccess::Shared(executor),
+            0,
         ))
     }
 
@@ -272,16 +274,46 @@ impl Runtime {
 /// 已可 Send，但保持最小改动，不把递归 future Send 化（Send 化留待后续）。
 type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+/// 递归深度守卫阈值（RFC-11 修复，A2 批 7，CTO 批准 96）。
+///
+/// `run_sub_impl` → `interpret_impl` 每层递归在 debug 下消耗 ~13-20KB 栈帧
+/// （Windows 默认 2MB 测试线程栈）。**实测崩溃边界**：本机（Windows debug，
+/// 2MB 栈）深度 100/104 通过、108 即 STATUS_STACK_OVERFLOW 进程级 abort
+/// （R4c 审计记录 ~110-120 同量级）；release 深度 1000 同样溢出；Linux 8MB
+/// 栈约 3-4 倍余量。不受信任蓝图 ~百层嵌套即可使宿主进程崩溃（拒绝服务面）。
+///
+/// 守卫在 `interpret_impl` 递归入口检查，超限返回可捕获错误替代栈溢出。
+/// 阈值取 96：比实测边界（~104）留 ~8% 余量（帧大小随嵌套构造/编译器版本
+/// 波动，保留安全边际），且 r4c 深度 64 安全回归不受影响；统一保守取值保证
+/// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 96 帧余量更大。
+///
+/// **保证范围（文档化限制）**：守卫保证限于 **≥2MB 栈**（Rust 测试线程默认
+/// 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB，在 2MB 栈下留有余量；若宿主在更小
+/// 栈（如 1MB 主线程栈：96 帧可能越界，实测崩溃边界 ~50-54 帧）上执行深嵌套
+/// 蓝图，需由宿主设置 `RUST_MIN_STACK` 提升栈尺寸，否则属用户责任（阈值
+/// 不随栈尺寸动态调整，保持 96）。
+const MAX_NESTING_DEPTH: usize = 96;
+
+/// 深度超限错误：`SysError::Other(105)`（ENOBUFS=105，「嵌套资源耗尽」语义
+/// 近似）。无专用哨兵变体 —— `SysError` 冻结为 14+Other（pdr.md §10.1），
+/// 此处复用 Other(105) 并在文档注明。
+const NESTING_DEPTH_EXCEEDED: SysError = SysError::Other(105);
+
 /// 递归执行子 Action（async fn 不可直接自递归，统一 `Box::pin`）。
 /// 非 Send 约束同 `LocalBoxFuture`（见上）。
+///
+/// `depth`：当前递归深度（解释器维护的嵌套深度计数器，RFC-11 守卫载体）。
+/// 调用方传入自身深度，本函数以 `depth + 1` 进入子解释器 —— 递归入口处
+/// 深度 +1，超 `MAX_NESTING_DEPTH` 时 `interpret_impl` 返回可捕获错误。
 fn run_sub_impl<'a>(
     action: Action,
     ctx: &'a mut Context,
     undo: &'a mut UndoStack,
     reg: &'a mut ResourceRegistry,
     access: ExecAccess<'a>,
+    depth: usize,
 ) -> LocalBoxFuture<'a, Result<Value, SysError>> {
-    Box::pin(async move { interpret_impl(action, ctx, undo, reg, access).await })
+    Box::pin(async move { interpret_impl(action, ctx, undo, reg, access, depth + 1).await })
 }
 
 /// 共享执行器通道（CTO 批准方向，D14 阶段 3）：`Runtime` 内部以
@@ -491,6 +523,8 @@ async fn run_fork_parallel(
 
     // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化）。
     // 子任务把（结果, 隔离 registry, 独立撤销栈）带回，供完成后合并。
+    // 子任务在独立阻塞线程（`spawn_blocking`，全新栈）上驱动 —— 深度计数器
+    // 从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫按线程栈独立生效）。
     let l_task = tokio::task::spawn_blocking(move || {
         let v = drive(interpret_impl(
             left,
@@ -498,6 +532,7 @@ async fn run_fork_parallel(
             &mut l_undo,
             &mut l_reg,
             ExecAccess::Shared(l_shared),
+            0,
         ));
         (v, l_reg, l_undo)
     });
@@ -508,6 +543,7 @@ async fn run_fork_parallel(
             &mut r_undo,
             &mut r_reg,
             ExecAccess::Shared(r_shared),
+            0,
         ));
         (v, r_reg, r_undo)
     });
@@ -559,7 +595,15 @@ async fn interpret_impl(
     undo: &mut UndoStack,
     reg: &mut ResourceRegistry,
     mut access: ExecAccess<'_>,
+    depth: usize,
 ) -> Result<Value, SysError> {
+    // RFC-11 深度守卫：递归入口检查嵌套深度，超限返回可捕获错误（`Other(105)`
+    // ENOBUFS 语义）替代栈溢出。阈值依据见 `MAX_NESTING_DEPTH`。守卫在
+    // **栈溢出之前**触发（阈值 96 < 实测崩溃边界 ~104），进程不 abort；错误
+    // 沿调用链上抛，可被外层 Catch 捕获（拒绝服务面转为可恢复错误）。
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(NESTING_DEPTH_EXCEEDED);
+    }
     let mut cur = Value::Unit;
     let mut action = action;
     loop {
@@ -567,7 +611,7 @@ async fn interpret_impl(
             Action::Pure(v) => return Ok(v),
 
             Action::Sequential { current, next } => {
-                let v = run_sub_impl(*current, ctx, undo, reg, access.reborrow()).await?;
+                let v = run_sub_impl(*current, ctx, undo, reg, access.reborrow(), depth).await?;
                 let na = next(v);
                 (Value::Unit, na)
             }
@@ -623,8 +667,10 @@ async fn interpret_impl(
                     let mut l_reg = reg.clone();
                     let mut r_reg = reg.clone();
                     r_reg.offset_next_fd(fork_fd_region_offset());
-                    let lv = run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow()).await;
-                    let rv = run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow()).await;
+                    let lv =
+                        run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow(), depth).await;
+                    let rv =
+                        run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow(), depth).await;
                     reg.merge(l_reg);
                     reg.merge(r_reg);
                     let na = combine(lv?, rv?);
@@ -646,7 +692,7 @@ async fn interpret_impl(
                 ctx.cwd = reg.canonicalize_path(&base, &old);
                 // finally 模式：inner 无论成功/失败，先恢复 cwd 再传播结果，
                 // 保证异常路径同样恢复（RAII 守卫因 ctx 双重可变借用不可行）。
-                let v = run_sub_impl(*inner, ctx, undo, reg, access.reborrow()).await;
+                let v = run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth).await;
                 ctx.cwd = old;
                 let v = v?;
                 let na = next(v);
@@ -663,7 +709,7 @@ async fn interpret_impl(
                 // 标记，next_fd 保留 D1 单调），再执行 target，以其结果结束（不回原流）。
                 undo.recover().await;
                 reg.clear();
-                return run_sub_impl(*target, ctx, undo, reg, access.reborrow()).await;
+                return run_sub_impl(*target, ctx, undo, reg, access.reborrow(), depth).await;
             }
 
             Action::Invoke {
@@ -708,14 +754,15 @@ async fn interpret_impl(
             } => {
                 match tokio::time::timeout(
                     duration,
-                    run_sub_impl(*inner, ctx, undo, reg, access.reborrow()),
+                    run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth),
                 )
                 .await
                 {
                     Ok(Ok(v)) => return Ok(v),
                     Ok(Err(e)) => return Err(e),
                     Err(_elapsed) => {
-                        return run_sub_impl(*on_timeout, ctx, undo, reg, access.reborrow()).await
+                        return run_sub_impl(*on_timeout, ctx, undo, reg, access.reborrow(), depth)
+                            .await
                     }
                 }
             }
@@ -723,9 +770,11 @@ async fn interpret_impl(
             Action::Catch {
                 action: inner,
                 handler,
-            } => match run_sub_impl(*inner, ctx, undo, reg, access.reborrow()).await {
+            } => match run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth).await {
                 Ok(v) => return Ok(v),
-                Err(e) => return run_sub_impl(handler(e), ctx, undo, reg, access.reborrow()).await,
+                Err(e) => {
+                    return run_sub_impl(handler(e), ctx, undo, reg, access.reborrow(), depth).await
+                }
             },
         };
         cur = next_cur;
@@ -745,7 +794,8 @@ pub async fn interpret(
     reg: &mut ResourceRegistry,
     ex: &mut dyn SyscallExecutor,
 ) -> Result<Value, SysError> {
-    interpret_impl(action, ctx, undo, reg, ExecAccess::Direct(ex)).await
+    // 公开入口：深度从 0 起调（冻结签名不可改，depth 仅为 interpret_impl 私有参数）。
+    interpret_impl(action, ctx, undo, reg, ExecAccess::Direct(ex), 0).await
 }
 
 // 供外部使用的类型别名

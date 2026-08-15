@@ -434,3 +434,9 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 ### RFC-10：Windows 原生错误码未映射至 POSIX 语义（R4b 对抗发现）
 
 `create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
+
+### RFC-11：解释器嵌套蓝图无递归深度上限 → 进程级栈溢出（R4c 对抗发现）
+
+`run_sub_impl`（runtime.rs）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下实测崩溃边界深度 ~104-108（100/104 通过、108 即 STATUS_STACK_OVERFLOW 进程级 abort；R4c 审计记录 ~110-120 同量级；release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。
+
+**已修复（A2 批 7，runtime.rs，冻结面外）**：`interpret_impl` 递归入口维护嵌套深度计数器（`depth` 为 interpret_impl 私有参数，冻结签名 `interpret`/`run_blocking` 从 0 起调），超阈值返回 `SysError::Other(105)`（ENOBUFS=105「嵌套资源耗尽」语义近似；`SysError` 冻结为 14+Other，无专用哨兵）替代栈溢出——错误可被外层 Catch 捕获（拒绝服务面转为可恢复错误）。阈值 96（CTO 裁决）：比实测边界 ~104 留 ~8% 余量（帧大小随嵌套构造/编译器版本波动），统一保守取值保证最弱平台（Windows 2MB 栈）安全。**保证范围（文档化限制）**：守卫保证限于 ≥2MB 栈（Rust 测试线程默认 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB；若宿主在更小栈（如 1MB 主线程栈，实测崩溃边界 ~50-54 帧）上执行深嵌套蓝图，需宿主设置 RUST_MIN_STACK 提升栈尺寸，否则属用户责任（阈值不随栈尺寸动态调整）；Fork 并行分支在独立阻塞线程（全新栈）上驱动，深度从 0 独立起算。测试（`tests/interpreter.rs`）：`deep_nesting_under_limit_ok`（深度 64 成功，与 R4c 安全深度一致）、`deep_nesting_over_limit_returns_error`（深度 200 → `Err(Other(105))` 且不 abort，守卫先于栈溢出触发）、`deep_nesting_catchable`（超深蓝图经 Catch → handler 收到 Other(105)）。回归对照：`adversarial_r4c.rs::nested_sequential_64_deep_recursive_frames_values_flow`（安全深度 64）不受影响。
