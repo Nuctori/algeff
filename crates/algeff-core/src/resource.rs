@@ -220,6 +220,14 @@ pub struct ResourceRegistry {
     consumed: HashSet<Resource>,
     /// A4 线性检查：Own 已终结的资源（Own 之后该资源任何 usage 都拒绝）。
     owned_consumed: HashSet<Resource>,
+    /// Fork 分支预留 fd 区间（F1 修复，由 `offset_next_fd` 记录）：
+    /// `(基线 next_fd, 偏移量)`。`merge` 归一化时若预留区间**从未实际分配**
+    /// （`next_fd` 恰为 基线+偏移，分配游标未被任何 `allocate` 移动），其
+    /// 游标收敛回基线 —— 否则「右分支未分配新 fd」时父 `next_fd` 被大常数
+    /// 永久抬高（破坏 D1 单调序列紧凑性，如 concurrency_stress 的 fd 序列
+    /// 断言 [1,2,3]）。一旦发生过任何分配，游标只升不降（分配的 fd 可能已
+    /// 逃逸到用户值/执行器轮换映射，不得复用，D1）。
+    fork_region: Option<(Fd, Fd)>,
 }
 
 impl ResourceRegistry {
@@ -257,19 +265,45 @@ impl ResourceRegistry {
         self.owned_consumed.clear();
     }
 
+    /// Fork 分支 fd 区间预分割（F1 审查修复）：把 `next_fd` 增加 `offset`，使
+    /// 本注册表后续分配的 fd 落入高位区间，与未偏移的注册表（父/左分支）分配
+    /// 互不重叠；同时记录 `(基线, 偏移)` 供 `merge` 归一化（未实际分配时
+    /// 收敛回基线，见 `fork_region`）。
+    ///
+    /// 背景：Fork 并行/顺序路径的左右分支都克隆自父（同源 `next_fd`），若两分支
+    /// 都分配新 fd 会得到**相同 fd** —— merge 时 `HashMap::extend` 静默覆盖丢弃
+    /// 一侧句柄，执行器内部轮换映射同样碰撞。调用方（A2 解释器）在 spawn 前给
+    /// 右分支偏移大常数（`1 << 48`，远离任何实际 fd 规模），即得不相交区间。
+    ///
+    /// 注意：只移动分配游标，**已分配的句柄 fd 不变**（fd 身份保留，D13 merge
+    /// 以原 fd 并入后仍可 lookup；分支返回值中携带的 Fd 同样指向同一句柄）。
+    pub fn offset_next_fd(&mut self, offset: Fd) {
+        self.fork_region = Some((self.next_fd, offset));
+        self.next_fd += offset;
+    }
+
     /// 合并另一个注册表的状态（决策 D13「完成后合并回父」，RFC-A3-2 / A1
     /// 审计偏差-1 落地）：`other` 的全部句柄按**原 fd** 直接插入（fd 不冲突由
-    /// D1 单调性保证：`other` 克隆自 `self` 或其子，新分配的 fd 均 ≥ 自身
-    /// `next_fd`，与自身已有句柄互不重叠）、`consumed`/`owned_consumed` 取
-    /// 并集、`next_fd = max(self.next_fd, other.next_fd)`。
+    /// D1 单调性 + F1 区间预分割保证：`other` 克隆自 `self` 或其子，新分配的
+    /// fd 均 ≥ 自身 `next_fd`，且 Fork 分支经 `offset_next_fd` 预分割后左右
+    /// 区间互不重叠）、`consumed`/`owned_consumed` 取并集、`next_fd` 归一化
+    /// 为 `max(self.next_fd, other.next_fd)`（即全部已分配 fd 的最大值 + 1，
+    /// 父继续分配不冲突、不复用）。归一化细节（F1 修复配套）：`other` 若经
+    /// `offset_next_fd` 预留高位区间但**从未实际分配**，其游标收敛回基线，
+    /// 避免父 `next_fd` 被大常数永久抬高（见 `fork_region`）。
     ///
-    /// 由 A2 解释器在 Fork 并行分支完成后调用（D14 升级）；本方法为加法
-    /// API，不改变任何既有方法签名。
+    /// 由 A2 解释器在 Fork 并行/顺序分支完成后调用（D14 升级 + F1/F2 修复）；
+    /// 本方法为加法 API，不改变任何既有方法签名。
     pub fn merge(&mut self, other: Self) {
         self.handles.extend(other.handles);
         self.consumed.extend(other.consumed);
         self.owned_consumed.extend(other.owned_consumed);
-        self.next_fd = self.next_fd.max(other.next_fd);
+        // F1 归一化：预留区间未实际分配（next_fd 恰为 基线+偏移）→ 收敛回基线。
+        let other_next = match other.fork_region {
+            Some((base, offset)) if other.next_fd == base + offset => base,
+            _ => other.next_fd,
+        };
+        self.next_fd = self.next_fd.max(other_next);
     }
 
     /// 公理 A4 线性检查（运行时断言）：
