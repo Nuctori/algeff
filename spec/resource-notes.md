@@ -361,17 +361,36 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 
 `Replace`（D10：recover + `reg.clear()`）后，executor 内部 `files`/流映射表仍持旧 fd 的 Arc 强引用——旧 fd Write 成功且物理落盘（`adversarial_r1.rs::lin_stale_fd_write_after_replace_succeeds` 实证；R2 `adversarial_r2.rs::r1_stale_fd_write_after_replace_recheck` 复现确认）。D10「资源不泄漏」与 P4「资源状态恢复至执行前」在**句柄活性维度**有可观察反例：A4 线性标记已清（Replace 后同资源可再写），但物理句柄残留可绕过。修复方向（阶段 3+，RFC-05 原记录于决策链 D-031 与 §9.2 上下文，本条目为登记表补录）：executor↔registry 通道（execute 返回的 undo 携带句柄回收信息，或 Replace 时 executor 同步失效表项）。修复后 `lin_stale_fd_write_after_replace_succeeds` 断言需反转（旧 fd Write 应失败）。
 
-### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）
+### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）——**已修复**
 
-右分支在 `k<<48` 预留区间（`offset_next_fd`，F1/S6/A2 全局唯一区间）**实际分配
-fd** 后，`merge` 的归一化分支失效（`fork_region` 已记录但 `next_fd != base+offset`），
-父 `next_fd` 被抬高 `k·2^48`；连续多轮后二次增长（Σk·2^48），~360 轮溢出 u64
-（debug panic / release 回绕 → fd 碰撞）。修复点：`ResourceRegistry::offset_next_fd`
-/ `merge` 的区间归一化（resource.rs，冻结面外）。
+**缺陷**：右分支在 `k<<48` 预留区间（`offset_next_fd`，F1/S6/A2 全局唯一区间）
+**实际分配 fd** 后，`merge` 的归一化分支失效（`fork_region` 已记录但
+`next_fd != base+offset`），父 `next_fd` 被抬高 `k·2^48`；连续多轮后二次增长
+（Σk·2^48），~362 轮溢出 u64（debug panic / release 回绕 → fd 碰撞，违反 D1）。
 
-测试记录：`adversarial_r2.rs::fd_region_quadratic_growth_known_deviation`（断言
-`next_fd ≥ 2^50` 的爆涨行为可复现）+ `fd_region_seq_overflow_panics_under_500_rounds`
-（debug 下 catch_unwind 捕获 ~360 轮溢出 panic）。修复后两测试会失败，提醒更新。
+**修复（RFC-06 批，resource.rs，冻结面外）**：`ResourceRegistry::merge` 区间
+归一化锚点吸收 —— `other` 记录过 `fork_region` 时，把其**根基线**以偏移 0
+回灌父（父未记录任何基线时），使后续轮次 Fork 右分支的 `offset_next_fd` 沿用
+根基线（而非被上一轮 merge 抬高的 `next_fd`）。区间位置仍只由全局唯一偏移
+序号 k 决定（S6/A2 并发区间互斥语义不变）；右分支实际分配后父 `next_fd` 每轮
+仅线性 +2^48（分支高位 fd 逃逸，D1 游标只升不降），不再 Σk·2^48 二次增长。
+
+**测试证据**：
+- `resource.rs::merge_right_branch_alloc_anchors_base_no_quadratic_growth`（新，
+  确定性回归门）：400 轮右分支实际分配后父 `next_fd` 恰为 `400·2^48 + 2`
+  （修复前 debug ~362 轮溢出 panic / release 回绕）；
+- `adversarial_r2.rs::fd_region_right_branch_alloc_linear_not_quadratic`（原
+  `fd_region_quadratic_growth_known_deviation` 改写）：30 轮右分支实际分配，
+  D1 父 fd 不复用 + `next_fd` 线性量级（< 2^62）；
+- `adversarial_r2.rs::fd_region_seq_no_overflow_or_reuse_400_rounds`（原
+  `fd_region_seq_overflow_panics_under_500_rounds` 改写，去 cfg(debug)）：400
+  轮右分支实际分配无溢出 panic、父管道 fd 逐轮唯一；
+- `adversarial_r4c.rs::fork_100_sequential_rounds_region_monotonic_no_collision`
+  （区间序号断言改为 `rfd>>48`，RFC-06 锚定根基线语义）；
+- 既有 `fork_parallel/sequential_both_branches_allocate_fds_disjoint`（fd 身份
+  保留、区间互斥）、`reg_merge_d13_semantics_combos`（收敛/身份/并集）、
+  `fd_multi_round_fork_50_rounds_*` / `fd_1000_conflict_forks_*`（紧凑单调）
+  全绿。
 
 ### RFC-07：管道半端经 Fork registry Clone 共享 Arc → 分支内管道 IO InvalidInput
 
@@ -402,14 +421,17 @@ Timeout+Fork 组合边界**不成立**（部分可撤销性反例）。对 P5/A7
 测试记录：`adversarial_r2.rs::time_timeout_parallel_fork_orphan_effects_unrecoverable`
 （断言孤儿 Open 副作用物理发生；修复方向 = 超时传播/分支取消协议，阶段 3+）。
 
-### RFC-06 的 D1 边界影响（R2 数学审计）
+### RFC-06 的 D1 边界影响（R2 数学审计）——已修复
 
-release 下 u64 回绕 → fd 复用 = D1「单调不复用」**违反**（debug 下 catch_unwind
-panic）。数学核验：Σ_{k=1..n} k·2^48 ≥ 2^64 ⟺ n≈362 轮。模型承诺（D1）无界，
-故非 pdr §17 类固有局限，而是 merge 归一化的实现缺陷——已登记（§10 RFC-06），
-建议 D1 契约行加边界注（承诺范围为不溢出前缀）或提升修复优先级（阶段 3+ 中
-优先）。对 P2/P3 语义本体无直接证伪（交换律/隔离是 trace 语义命题，与 fd 值域
-无关）。
+原结论：release 下 u64 回绕 → fd 复用 = D1「单调不复用」**违反**（debug 下
+catch_unwind panic），数学核验 Σ_{k=1..n} k·2^48 ≥ 2^64 ⟺ n≈362 轮。该二次
+增长根因（merge 归一化失效）已由 RFC-06 修复（merge 锚点吸收，见上）消除：
+右分支实际分配后父 `next_fd` 每轮仅线性 +2^48，400 轮 ≈ 2^57 无溢出；对
+P2/P3 语义本体无影响（交换律/隔离是 trace 语义命题，与 fd 值域无关）——该
+结论保持。**残余边界（D1 契约行边界注保留）**：(1) Fork 右分支全局区间序号
+静态上限 2^16-1（`FORK_FD_REGION_SEQ` fail-fast assert，见 runtime.rs）；
+(2) 相邻轮次间父级实际分配数 ≪ 2^48（区间基数假设，实际分配越过下一区间
+起点即碰撞——物理不可达量级）。
 
 ### RFC-09：Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover（可恢复，非永久毒化）
 

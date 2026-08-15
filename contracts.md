@@ -48,7 +48,7 @@
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
-| D1 | `Fd = u64` 全局唯一句柄 | pdr.md §2.3「Fd 由运行时分配全局唯一句柄，避免重用冲突」；i32 只是示意。**边界注（R2 数学审计/RFC-06）**：承诺范围为不溢出前缀——Fork 右分支分配使 next_fd 二次增长，~362 轮后 u64 溢出（release 回绕 = fd 复用，违反本决策；修复优先级阶段 3+ 中优先） |
+| D1 | `Fd = u64` 全局唯一句柄 | pdr.md §2.3「Fd 由运行时分配全局唯一句柄，避免重用冲突」；i32 只是示意。**边界注（R2 数学审计/RFC-06，已修复）**：承诺范围为不溢出前缀——Fork 右分支分配曾使 next_fd 二次增长，~362 轮后 u64 溢出（release 回绕 = fd 复用，违反本决策）；已由 `ResourceRegistry::merge` 锚点吸收修复（区间偏移锚定根基线，父 next_fd 线性增长，见 spec/resource-notes.md §10 RFC-06）。残余边界：右分支全局区间序号 ≤ 2^16-1、相邻轮次实际分配数 ≪ 2^48 |
 | D2 | Action 递归字段装箱 | E0072 无限大小；spec §14 示例本身也 `Box::new` |
 | D3 | SyscallExecutor 返回 BoxFuture | async fn 不 dyn 兼容，Runtime 需 `Box<dyn>` |
 | D4 | UndoOp 为异步 future | tokio IO 撤销必然异步（恢复文件内容、关闭 fd） |
