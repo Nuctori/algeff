@@ -29,8 +29,8 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 
 | 模块 | 状态 | 测试数 | 待办 |
 | --- | --- | --- | --- |
-| `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter + Fork 并行（D17）；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 102（实测 `cargo test -p algeff-core`） | 无（契约冻结） |
-| `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器 + 错误路径句柄恢复） | 已实现并合并（A5） | 28（adapters 5 + adapters_flow 6 + e2e 4 + executor 13） | 无 |
+| `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter + Fork 并行（D17）+ 深度守卫（RFC-11）；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 141（实测 `cargo test -p algeff-core`） | 无（契约冻结） |
+| `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器 + 错误路径句柄恢复 + 深度守卫测试） | 已实现并合并（A5） | 132（实测 `cargo test -p algeff-std`） | 无 |
 | `algeff-macro`（plan!/fork!/scope!/choose!） | 已实现并合并（A4） | 19 + 8 doc-test | 无（可选语法糖） |
 | 基准 benches（echo/parallel_reads/shared_read/append + algeff 对比臂） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 并行读对比列受 executor 锁串行化限制（pdr §17 已知局限，阶段 3+ 重构） |
 | CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + feature 测试 + mdBook 构建 | — | — |
