@@ -190,11 +190,12 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 
 ## 8. ResourceArbiter 与公理 A7 的映射（批 3 落地）
 
-> **接入状态（批 7 更新）**：arbiter ↔ `MutexLock`（`DataOp::MutexLock { id }`）
-> 的动态层接入为**接入中（A5 批 5）**：`op_mutex_lock` 将由阻塞 `lock_owned`
-> 改为 arbiter `try_claim` + 有限重试（D16 设计目标，G4 残余 R-1 待办②）。接入前，
-> Fork 分支内使用 `MutexLock { id }` 的蓝图必须声明对应 `Resource::Fd(id)` 以
-> 触发静态顺序化（强制规则，见 §2）。批 7 新增 core 侧组合验证
+> **接入状态（批 7/8 更新）**：arbiter ↔ `MutexLock`（`DataOp::MutexLock { id }`）
+> 的动态层接入为**已接入**（A5 批 7 `254eaf3`：`try_claim` + 8×1ms 有限重试 +
+> WouldBlock；批 8 `f897669`：RAII claim guard 覆盖取消路径；契约 D16 已同步，
+> D-034）。Fork 分支内使用 `MutexLock { id }` 的蓝图**必须**声明对应
+> `Resource::Fd(id)` 以触发静态顺序化（强制规则，见 §2；未声明时动态层
+> WouldBlock 快速失败是最后防线）。批 7 新增 core 侧组合验证
 > `tests/arbiter_mutex.rs`（占坑-释放周期 / Read 共享 vs Write 独占 × tokio
 > Mutex 对应 / 有限重试上界 WouldBlock 无残留），作为接入后行为契约的占坑侧预演。
 

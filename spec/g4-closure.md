@@ -91,7 +91,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 
 | # | 残余项 | 现状 | 裁决建议 |
 | --- | --- | --- | --- |
-| **R-1（C4 延续）** | D16 arbiter ↔ `op_mutex_lock` 接入：执行器仍用阻塞 `lock_owned`，未走 arbiter `try_claim`/try_lock | 无死锁可达性论证成立：①静态层 `fork_conflict` 在 Fork 分支声明同资源时强制顺序化；②D14 顺序路径下同一 Runtime 无并发任务；③`concurrent_arbiter_claims` 已验证 arbiter 原语无死锁。**但**并行 Fork 已落地（D17），若蓝图在 Fork 分支内对**同一** MutexLock id 未声明 `Resource::Fd(id)` 资源，静态冲突检测不可见 → 第二分支持共享执行器锁阻塞 `lock_owned`，存在死锁可达窗口 | **接受**（当前冻结语义下：资源声明是蓝图作者责任，A4 线性同此边界；D16 已如实注明「接入待 C4 裁决」）。**待办**（低优先，A7/A5）：①在 resource-notes §2 补「Fork 分支内 MutexLock 必须声明对应资源以触发静态串行化」的强制记录；②后续可将 `op_mutex_lock` 改为 arbiter `try_claim` + 有限重试（D16 设计目标） |
+| **R-1（C4 延续）** | D16 arbiter ↔ `op_mutex_lock` 接入 | **已落地（A5 批 7 `254eaf3` + 批 8 `f897669`，D-034）**：`try_claim` + 8×1ms 有限重试 + WouldBlock；RAII claim guard（取消路径释放，批 8）；强制记录已入 resource-notes §2；语义变更（阻塞→快速失败）已入契约 D16 与决策链 | ✅ **核销**（D-034） |
 | **R-2** | A3 执行级 left∥right 与 right∥left 双序 commutation 测试未单列 | 已补录：`tests/commutation.rs`（`4e2dc9e`，3 项）`fork_commutation_disjoint`（异资源双序 Fork 断言轨迹多集一致）+ `fork_commutation_same_value`（同值不同序 Pure，A1/A3 联合）；§1 A3 行残余标注已同步清除 | **已闭环**（G4 条件-2 交付） |
 | **R-3** | `Arc::make_mut` 物理 COW 未实现（A5/P3 物理层） | registry Clone 层隔离已闭环（consumed/owned_consumed 独立）；物理 Arc 共享句柄下子分支破坏性操作（Close）无拒绝路径测试 | **接受**（阶段 3 并行化载体，final-audit §6 判定维持；语义层闭环满足 G4 判据「公理被测试覆盖」的执行级） |
 | **R-4** | A7 批 4 性能复测数据未合并 | 已合入：`77a411b`/`88e70e0`，`perf/baseline-2026-08-15.txt` [5]–[8] 节刷新（echo 103.1% ✅ / parallel_reads 366.2% / shared_read 570.9% / append 24.3%，parallel_reads 双复跑 366.2%/383.6% 稳定） | **已交付**（G4 条件-1）；并行读偏离归因见 §4 残余-6（executor 锁串行化，接受，无需 CTO 新裁决） |
