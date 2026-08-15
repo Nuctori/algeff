@@ -348,8 +348,8 @@ fn fix_five_point_regression_single_blueprint() {
     let _pb_fd = pb_fd.lock().unwrap().expect("阶段2 Open 已执行");
     assert_eq!(
         std::fs::read(&pb).unwrap(),
-        b"VISIBLEush-original",
-        "阶段2：写入内容可见（flush 契约）"
+        b"VISIBLEriginal",
+        "阶段2：写入内容可见（flush 契约；7 字节覆盖原文前 7 字节）"
     );
 
     // 3. put_back：写失败后句柄未被吞 → 双端 Close 均成功（未吞句柄证明）。
@@ -481,7 +481,7 @@ fn storm_round(pa: PathBuf, i: u64) -> Action {
                             syscall(
                                 DataOp::Write {
                                     fd,
-                                    data: format!("X{i}").into_bytes(),
+                                    data: format!("X{i:02}").into_bytes(),
                                 },
                                 vec![wr(fd)],
                                 Action::Pure,
@@ -516,6 +516,7 @@ fn combo_storm_50_rounds_catch_fork_timeout_scope_trajectory() {
     for i in 0..50u64 {
         let pa = dir.path().join(format!("storm-{i:02}.txt"));
         std::fs::write(&pa, b"storm-original").unwrap();
+        let data = format!("X{i:02}").into_bytes();
         let v = rt.run_blocking(storm_round(pa.clone(), i)).unwrap();
 
         // 轨迹一致（1）：每轮结果与首轮完全相同（左超时 42 + 右捕获 1）。
@@ -530,10 +531,15 @@ fn combo_storm_50_rounds_catch_fork_timeout_scope_trajectory() {
         );
         // 轨迹一致（2）：Scope finally 恢复 cwd。
         assert_eq!(rt.context().cwd, before, "第 {i} 轮 Scope 退出后 cwd 恢复");
-        // 轨迹一致（3）+ flush 回归：右分支 Write 立即可观察。
+        // 轨迹一致（3）+ flush 回归：右分支 Write 立即可观察（覆盖原文同长前缀）。
+        let expect = [
+            data.clone(),
+            b"storm-original"[data.len()..].to_vec(),
+        ]
+        .concat();
         assert_eq!(
             std::fs::read(&pa).unwrap(),
-            format!("X{i}storm-original").into_bytes(),
+            expect,
             "第 {i} 轮：Write op 完成后内容立即可见（flush 契约）"
         );
         files.push(pa);
@@ -602,8 +608,8 @@ fn interact_depth_guard_clean_registry_then_new_blueprint() {
     .unwrap();
     assert_eq!(
         std::fs::read(&pa).unwrap(),
-        b"NEW-original",
-        "守卫后新蓝图写生效"
+        b"NEWoriginal",
+        "守卫后新蓝图写生效（3 字节覆盖原文前 3 字节）"
     );
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
