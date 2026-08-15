@@ -3,17 +3,22 @@
 //! 对照 pdr.md §16「并行读取同一文件（只读共享）」：原生 tokio = 100%，
 //! Algeff 静态路径预期 ~100%（读-读可并行）。
 //!
-//! ## 实施说明（D14 顺序 Fork + 游标读）
+//! ## 实施说明（D17 Fork 并行 + 游标读）
 //! Algeff 臂：Open{read} 共享文件 → `Action::Fork` 8 路（平衡二叉 Fork 树，combine
 //! 汇总字节数）→ Close。每路 = Read(fd, 1MB)，8 路声明同一 fd 的 Read 模式
-//! （A4：Read 不消费，可重复）。契约决策 D14：Fork 阶段 1 = 静态冲突检测
-//! （读-读无冲突，`can_parallel` 通过）+ **顺序执行**——因此 8 路实际串行；
-//! 又因顺序执行，游标语义良定义：第 k 路自然读到 [k×1MB, (k+1)×1MB)，等价于
-//! 原生臂的位置读区间，无需显式 Seek。实测耗时为串行 8 × 1MB 读——**预期差距
-//! 归因 D14 顺序 Fork**，并行化属阶段 3 待办（pdr §16 的 ~100% 是并行化后目标值）。
+//! （A4：Read 不消费，可重复；冲突矩阵 Read∥Read 兼容 → can_parallel=true）。
 //!
-//! 对比基准：本文件内建 `tokio_native_8tasks_8MB` 同参数参照臂（与批 2 相同的
-//! Arc<File> + 位置读 + spawn_blocking，零锁零偏移竞争）。
+//! **A7 批 4 实测（D17 并行后）**：并行路径确实被触发（分支线程并发、读-读无冲突），
+//! 但读**无并行收益**，归因两层串行化：
+//! 1. 执行器互斥锁（`ExecAccess::Shared` 的 `Arc<Mutex<SendExecutor>>`）在
+//!    `exec_via` 中对整个 `execute`（含物理 IO await）持锁 → 跨分支 Syscall
+//!    全部串行；
+//! 2. 同一 fd 的游标读共用 `files[fd]` 的文件互斥锁与游标（`op_read` 按序
+//!    推进），即使锁边界收窄也读不并行（需要位置读原语）。
+//! 加上逐 Fork 节点 spawn_blocking + current-thread runtime 创建开销，实测
+//! 8.58ms（570%）反超 D14 顺序基线（6.41ms / 307.6%）——诚实数据，不修饰。
+//! pdr §16 的 ~100% 需位置读（Seek 语义跨分支原子化）与执行器锁边界收窄
+//! （A2 域）后再验。
 
 use std::path::PathBuf;
 use std::sync::Arc;
