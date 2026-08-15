@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algeff_core::{
-    Action, DataOp, OpenFlags, ReadOnly, ResourceInner, ResourceUsage, Runtime,
-    TypedResource, Value, WriteOnly,
+    Action, DataOp, OpenFlags, ReadOnly, ResourceInner, ResourceUsage, Runtime, TypedResource,
+    Value, WriteOnly,
 };
 use algeff_std::adapters;
 use algeff_std::TokioExecutor;
@@ -85,7 +85,10 @@ fn tcp_client_blueprint(
         let fd = fd_of(&v);
         adapters::and_then(
             syscall(
-                DataOp::TcpWrite { fd, data: payload.clone() },
+                DataOp::TcpWrite {
+                    fd,
+                    data: payload.clone(),
+                },
                 vec![wr(fd)],
                 Action::Pure,
             ),
@@ -140,7 +143,13 @@ fn and_then_after_syscall_structural() {
     match a {
         Action::Sequential { current, next } => {
             // current 为原 syscall（open_file 的 Open 节点）。
-            assert!(matches!(*current, Action::Syscall { op: DataOp::Open { .. }, .. }));
+            assert!(matches!(
+                *current,
+                Action::Syscall {
+                    op: DataOp::Open { .. },
+                    ..
+                }
+            ));
             // next 即 f 的包装：交付 Fd → f 收到 fd 值。
             let out = next(Value::Fd(77));
             assert_eq!(*received.lock().unwrap(), Some(Value::Fd(77)));
@@ -167,16 +176,13 @@ fn and_then_after_syscall_executes_chain() {
     let done2 = done.clone();
     let payload2 = payload.clone();
     // open_file → and_then(write) → and_then(close)：fd 经闭包词法捕获贯穿。
-    let action = adapters::and_then(
-        adapters::open_file(path.clone(), flags),
-        move |v| {
-            let fd = fd_of(&v);
-            adapters::and_then(adapters::write(fd, payload2.clone()), move |_| {
-                *done2.lock().unwrap() = true;
-                adapters::close(fd)
-            })
-        },
-    );
+    let action = adapters::and_then(adapters::open_file(path.clone(), flags), move |v| {
+        let fd = fd_of(&v);
+        adapters::and_then(adapters::write(fd, payload2.clone()), move |_| {
+            *done2.lock().unwrap() = true;
+            adapters::close(fd)
+        })
+    });
 
     let v = rt.run_blocking(action).unwrap();
     assert_eq!(v, Value::Unit);
@@ -198,12 +204,24 @@ fn seq_folds_chain() {
     match s {
         Action::Sequential { current, next } => {
             match *current {
-                Action::Sequential { current: a, next: a_next } => {
-                    assert!(matches!(*a, Action::Syscall { op: DataOp::GetTime, .. }));
+                Action::Sequential {
+                    current: a,
+                    next: a_next,
+                } => {
+                    assert!(matches!(
+                        *a,
+                        Action::Syscall {
+                            op: DataOp::GetTime,
+                            ..
+                        }
+                    ));
                     // 内层 next 忽略值 → b。
                     assert!(matches!(
                         a_next(Value::Unit),
-                        Action::Syscall { op: DataOp::GetTime, .. }
+                        Action::Syscall {
+                            op: DataOp::GetTime,
+                            ..
+                        }
                     ));
                 }
                 _ => panic!("seq 左折叠：内层应为 Sequential(then(a, b))"),
@@ -211,13 +229,19 @@ fn seq_folds_chain() {
             // 外层 next 忽略值 → c。
             assert!(matches!(
                 next(Value::Unit),
-                Action::Syscall { op: DataOp::GetTime, .. }
+                Action::Syscall {
+                    op: DataOp::GetTime,
+                    ..
+                }
             ));
         }
         _ => panic!("seq 应构造 Sequential 链"),
     }
     // 退化：空列表 → Pure(Unit)；单元素 → 原样返回。
-    assert!(matches!(adapters::seq(Vec::new()), Action::Pure(Value::Unit)));
+    assert!(matches!(
+        adapters::seq(Vec::new()),
+        Action::Pure(Value::Unit)
+    ));
     assert!(matches!(
         adapters::seq(vec![Action::Pure(Value::U64(9))]),
         Action::Pure(Value::U64(9))
@@ -231,7 +255,13 @@ fn then_ignores_value() {
     let a = adapters::then(adapters::get_time(), Action::Pure(Value::U64(5)));
     match a {
         Action::Sequential { current, next } => {
-            assert!(matches!(*current, Action::Syscall { op: DataOp::GetTime, .. }));
+            assert!(matches!(
+                *current,
+                Action::Syscall {
+                    op: DataOp::GetTime,
+                    ..
+                }
+            ));
             // 无论当前值是什么，next 恒返回固定动作。
             assert!(matches!(next(Value::U64(123)), Action::Pure(Value::U64(5))));
         }
@@ -254,9 +284,7 @@ fn tcp_client_blueprint_echo() {
     let server = std::thread::spawn(move || {
         let srt = tokio::runtime::Runtime::new().unwrap();
         srt.block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; srv_len];

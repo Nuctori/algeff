@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use algeff_core::{
-    Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, ResourceInner,
-    ResourceUsage, Signal, TypedResource, Value,
+    Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, ResourceInner, ResourceUsage,
+    Signal, TypedResource, Value,
 };
 
 /// 构造一个 next 为 `Pure` 的 Syscall 节点。
