@@ -346,8 +346,6 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 
 > R2/R3c 对抗审计（`adversarial_r2.rs` / `adversarial_r3c.rs`）新确认的已知缺陷
 > （RFC-06/07/08/09，含 RFC-06 的 D1 边界影响小节与 R3c 风暴实测数据）。
-> 均不在冻结面（runtime.rs / executor.rs / resource.rs）允许的最小修复范围内，
-> 以「断言偏差可复现」测试记录，阶段 3+ 修复。
 
 ### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）
 
