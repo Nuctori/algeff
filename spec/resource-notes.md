@@ -200,6 +200,7 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 | 随机 usage 序列的状态机不变量 | — | A4 | `linearity_sequence_random` |
 
 > 备注（已核销）：RFC-A3-3 所指的 D14 缺口已于 `f3494c0` 补录（契约决策表 D1-D19，D14=Fork 阶段 1 语义）——本备注为历史记录，保留以供追溯。
+>
 ## 8. ResourceArbiter 与公理 A7 的映射（批 3 落地）
 
 > **接入状态（批 7/8/9 更新）**：arbiter ↔ `MutexLock`（`DataOp::MutexLock { id }`）
@@ -358,7 +359,6 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 
 ### RFC-05：Replace 后旧 fd 仍可写（句柄活性反例，R1 对抗发现，登记补录）
 
-
 `Replace`（D10：recover + `reg.clear()`）后，executor 内部 `files`/流映射表仍持旧 fd 的 Arc 强引用——旧 fd Write 成功且物理落盘（`adversarial_r1.rs::lin_stale_fd_write_after_replace_succeeds` 实证；R2 `adversarial_r2.rs::r1_stale_fd_write_after_replace_recheck` 复现确认）。D10「资源不泄漏」与 P4「资源状态恢复至执行前」在**句柄活性维度**有可观察反例：A4 线性标记已清（Replace 后同资源可再写），但物理句柄残留可绕过。修复方向（阶段 3+，RFC-05 原记录于决策链 D-031 与 §9.2 上下文，本条目为登记表补录）：executor↔registry 通道（execute 返回的 undo 携带句柄回收信息，或 Replace 时 executor 同步失效表项）。修复后 `lin_stale_fd_write_after_replace_succeeds` 断言需反转（旧 fd Write 应失败）。
 
 ### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）——**已修复**
@@ -376,6 +376,7 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 仅线性 +2^48（分支高位 fd 逃逸，D1 游标只升不降），不再 Σk·2^48 二次增长。
 
 **测试证据**：
+
 - `resource.rs::merge_right_branch_alloc_anchors_base_no_quadratic_growth`（新，
   确定性回归门）：400 轮右分支实际分配后父 `next_fd` 恰为 `400·2^48 + 2`
   （修复前 debug ~362 轮溢出 panic / release 回绕）；
@@ -511,6 +512,7 @@ ConnectionReset/ConnectionRefused 具名变体、CrossesDevices → `CrossDevice
 AlreadyExists），跨平台一致。
 
 **测试证据**：
+
 - 新增 `crates/algeff-std/tests/rfc10_windows_errno.rs`（跨平台真实路径）：
   `create_new_existing_maps_to_already_exists`、
   `udp_bind_port_in_use_maps_to_eaddr_inuse`（UDP 面原「未测」已补齐断言）、
@@ -555,6 +557,7 @@ AlreadyExists），跨平台一致。
 （错误不压栈——现有契约，r4b 错误透传测试不回归）。
 
 **测试证据**：
+
 - `crates/algeff-core/tests/adversarial_r6_f2.rs`（假执行器，D9 契约独立性）：
   `failed_open_write_rolls_back_path_marker_same_path_retry_ok`（失败 Open(w) → 同路径
   Write 重试成功）、`failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept`
@@ -573,3 +576,70 @@ AlreadyExists），跨平台一致。
 预插入的线性标记不触发回滚（同 RFC-08「Timeout 取消 ⇒ 孤儿副作用」族）。无测试覆盖
 「Timeout 取消飞行中的 Write」；修复方向 = 取消传播协议（RFC-08/09 同路径）。「恢复同路径
 可重试语义」的承诺范围 = exec 失败路径，Timeout 丢弃路径不在承诺内。
+
+## 11. R7 对抗审计轮（5 轮串行循环第 1 轮，2026-08-16）——virtual-clock 时域统一 + 新登记
+
+### 已修复（R7-1 批，测试驱动）
+
+**① Timeout×virtual-clock 时域统一（全 workspace 唯一红灯根因，r1 对抗测试遗留）**：
+`Action::Timeout` 原用墙钟 `tokio::time::timeout` 竞速虚拟 `Sleep`（瞬时完成）→ on_timeout
+永不触发（`err_timeout_keeps_undo_stack_and_registry` 红灯，虚拟推进 10s 内层永不 Elapsed）。
+修复 = **双通道判定**（runtime.rs `run_virtual_timeout`，仅 virtual-clock feature）：
+墙钟通道（真实执行超时：慢 syscall/IO）+ 虚拟通道（inner 完成后虚拟流逝 ≥ deadline），
+任一超限即执行 on_timeout。语义裁决：虚拟时间全局累计 → 嵌套 Timeout 在 VC 下**级联触发**
+（r5b 3a 门控为墙钟语义 + 新增 `timeout_nested_3_levels_virtual_clock_cascades` 固化级联）；
+墙钟通道仍有取消语义（RFC-12 残余缺口仅此通道适用）。
+
+**② GetTime 虚拟化（契约-F2）**：virtual-clock 下 `DataOp::GetTime` 路由到 `vc.now()`
+（确定性重放承诺，executor 注释「由 virtual-clock feature 提供」兑现）——不达物理执行器、
+不推进时钟。墙钟路径行为不变。测试载体迁移：r4b/execution_axioms/interpreter/exec_integration
+的 GetTime 通用载体换 `Close { fd: 999 }`（VC 下仍走执行器）。
+
+**③ Fork 并行分支虚拟时钟合并（状态-MEDIUM-1）**：`run_fork_parallel` 分支克隆时钟推进
+（Sleep）合并回父（sum，与顺序路径观察等价）——此前克隆被丢弃，同一蓝图并行/顺序调度
+产生不同可观察时钟（确定性重放支柱破坏）。
+
+**④ VirtualClock::advance 溢出饱和（契约-F8）**：Duration 加法溢出（debug/release 均无条件
+panic）是用户可控崩溃面（连续 Sleep 之和超上限）→ `saturating_add` 封顶。
+
+**⑤ 无界分配防御（契约-F7）**：`vec![0u8; len]` 在 debug 下分配失败 = 进程级 abort
+（handle_alloc_error 不可捕获）/ release 下 OOM abort——不受信任蓝图可崩溃宿主进程
+（RFC-11 同族拒绝服务面）。新增 `MAX_IO_LEN = 64MB`（algeff-core re-export）：
+`Action::Alloc` 与执行器 Read 族（文件/管道/TCP/UDP/SendFile）len 超限返回可捕获
+`InvalidInput`。TDD 证据：`alloc_huge_len_returns_invalid_input` 修复前实测进程级
+abort（0xc0000409）。
+
+**⑥ feature 转发缺口（contract.md 残余风险）**：algeff-std 增加 `[features]` 转发
+`virtual-clock`/`coeffects`（此前用户须直接依赖 algeff-core 才能启用）。
+
+**⑦ Dup2 降级语义固化（契约-F6）**：决策 D1（fd 单调不复用）使 POSIX dup2「精确落到
+new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 → 新增
+`dup2_degrades_to_close_then_dup` 固化降级行为。
+
+**⑧ r3b 并行证据 flaky 修复**：virtual-clock 下 GetTime 短路使 spawn_blocking 分支任务极短
+→ 阻塞池线程复用 → 线程断言误报。TracedExecutor 注入 `op_delay`（50ms 真实延迟）保证
+并行窗口确定性。
+
+栈帧纪律（r5a 边界测试回归）：解释器状态机帧被 Timeout VC 分支内联临时（deadline/elapsed
+跨 await 存活）撑大 → 嵌套边界跌破 96。判定逻辑提取为 `#[inline(never)] fn` + `Box::pin`
+堆分配（`run_virtual_timeout` 返回 `LocalBoxFuture`）——解释器帧只存 8B 指针。
+
+### 新登记（R7 审计发现，阶段 3+，修复方向 = 取消传播协议 RFC-08/09/12 同路径）
+
+- **R7-A [MEDIUM] take→await→put_back 旋转窗口取消泄漏（未登记实例）**：轮换型句柄
+  （TcpStream/管道半端/Child）`reg.take` 后 IO await 被 `Timeout` Elapsed 丢弃 → `put_back`
+  永不执行：注册表条目已取走、arc 唯一强引用 → 物理资源被关闭（TCP 连接断/管道对端
+  EOF/Child 无人 wait）；执行器映射表残留陈旧项（`reg.clear()` 也不清 executor 表）；
+  后续同逻辑 fd 一律 NotFound。修复方向：仿 ArbiterClaimGuard 加「已取句柄 RAII 守卫」。
+- **R7-B [MEDIUM] Timeout{Fork{MutexLock}} 孤儿分支占坑永久泄漏**：Timeout 丢弃 Fork future
+  → spawn_blocking 分支成为孤儿继续执行 → 分支私有 undo（含锁释放）随任务结果丢弃 →
+  arbiter 占坑永久残留，同 id 后续 Lock 永久 WouldBlock，**Replace/recover 也无法释放**
+  （RFC-09「recover 可恢复」对孤儿分支不成立）。
+- **R7-C [LOW] set_dependency 双份等价 undo footgun（coeffects）**：栈副本 + handed 副本
+  「只执行其中一份」依赖微妙前提（间隔无中间 set），无测试覆盖。
+- **R7-D [LOW] fork_conflict 静态收集漏 `Invoke.captures`**（闭包盲区之外的另一盲区）。
+- **R7-E [MEDIUM] D12 路径规范化仅 Scope 生效**：执行器用 DataOp 原样路径 → 别名拼写
+  （`a/../b` vs `b`）产生不同 `Resource::Path` 键 → can_parallel 漏报冲突 → 并行并发写
+  同一物理文件（resource-notes §4「以规范化路径为准」承诺未兑现）。
+- **R7-F 语义裁决记录**：VC 下 Timeout = 双通道（虚拟累计 + 墙钟防御）、GetTime = `vc.now()`、
+  Fork 并行分支时钟 = sum 合并；墙钟路径语义不变。
