@@ -402,8 +402,11 @@ fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
 ///   语义，VC 下保持）；
 /// - 瞬时完成的 inner（虚拟 0ms < deadline）→ 返回 inner 结果（错误原样透传）。
 ///
-/// 注意：墙钟通道仍有取消语义（真实超时丢弃飞行中 future，RFC-12 残余缺口
-/// 仅此通道适用）；虚拟通道无「飞行中」状态、无取消。
+/// 注意：墙钟通道有**回滚语义**（真实超时丢弃飞行中 future 后回滚其已入栈
+/// undo 与线性标记——审计 R3 修复，RFC-08/09/12 残余的锁/标记面）；但 inner
+/// 已被丢弃、无法 join，并行分支成为孤儿继续执行（残余缺口：宽限耗尽路径
+/// 的既有效果回收，见 resource-notes §11 R7-A/B）。虚拟通道无「飞行中」
+/// 状态、无取消、效果保留（post-check）。
 ///
 /// 栈帧纪律：deadline/elapsed 跨 await 存活，必须放在本独立 async fn 内 ——
 /// 若内联进 `interpret_impl` 状态机，会撑大每层递归的状态机帧、压低 RFC-11
@@ -444,6 +447,12 @@ fn run_virtual_timeout<'a>(
             }
         };
         let deadline = t0.saturating_add(duration);
+        // 审计 R3 修复（VC 墙钟通道回滚）：inner 前记录 undo/线性快照——
+        // 墙钟通道真实超时（慢 syscall）时 inner 已被丢弃、无法 join，但已
+        // 入栈 undo 与预插线性标记可回滚（RFC-08/09/12 残余：锁释放、标记
+        // 不残留、同路径可重试）。虚拟通道（post-check）效果保留不受影响。
+        let undo_mark = undo.len();
+        let linear_snap = reg.snapshot_linear();
         match tokio::time::timeout(
             duration,
             run_sub_impl(
@@ -459,6 +468,10 @@ fn run_virtual_timeout<'a>(
         .await
         {
             Err(_elapsed) => {
+                // 墙钟通道超时：inner 已 drop（无分支可 join），回滚其已入栈
+                // undo 与线性标记后执行 on_timeout。
+                undo.rollback_from(undo_mark).await;
+                reg.rollback_linear_to(&linear_snap);
                 run_sub_impl(
                     on_timeout,
                     ctx,

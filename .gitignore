@@ -4,3 +4,4 @@
 .pi-subagents/
 *.proptest-regressions
 target-r7
+.orchestra/

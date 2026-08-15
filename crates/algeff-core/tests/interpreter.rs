@@ -808,6 +808,55 @@ fn timeout_virtual_clock_within_deadline_returns_inner() {
     assert_eq!(v, Ok(Value::U64(7)), "期限内完成返回 inner 结果");
 }
 
+/// 审计 R3 修复（VC 墙钟通道回滚）：virtual-clock 下墙钟通道真实超时
+/// （慢 syscall）后必须回滚 inner 已入栈 undo 与预插线性标记（RFC-08/09/12
+/// 残余的锁/标记面）——修复前标记残留 → 同路径 Write 重试被 A4 误拒。
+/// 注：inner 的慢操作须走执行器（GetTime 在 VC 下虚拟化短路，不产生真实
+/// 延迟）——用 Close{fd:999} 载体（MockExecutor delay 全局生效）。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn timeout_virtual_clock_wall_channel_rolls_back_linear_markers() {
+    let mut ex = MockExecutor::new();
+    ex.delay = Duration::from_millis(100); // 所有 execute 慢 → 墙钟通道触发
+    ex.with_undo = true;
+    let mut rt = Runtime::new(Box::new(ex));
+    let fd = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+
+    // inner：Write(fd)（预插 Write 标记 + undo 入栈）→ Close（真实慢 100ms）
+    let inner = Action::Sequential {
+        current: Box::new(syscall_step(
+            DataOp::Write {
+                fd,
+                data: b"x".to_vec(),
+            },
+            vec![usage(Resource::Fd(fd), AccessMode::Write)],
+        )),
+        next: Box::new(|_| syscall_step(DataOp::Close { fd: 999 }, vec![])),
+    };
+    let v = rt.run_blocking(Action::Timeout {
+        action: Box::new(inner),
+        duration: Duration::from_millis(10),
+        on_timeout: Box::new(Action::Pure(Value::U64(42))),
+    });
+    assert_eq!(v, Ok(Value::U64(42)), "墙钟通道超时 → on_timeout");
+
+    // 回滚后：同 fd 再 Write 应成功（线性标记已回滚；修复前 InvalidInput）
+    let v = rt.run_blocking(syscall_step(
+        DataOp::Write {
+            fd,
+            data: b"y".to_vec(),
+        },
+        vec![usage(Resource::Fd(fd), AccessMode::Write)],
+    ));
+    assert_eq!(
+        v,
+        Ok(Value::Unit),
+        "墙钟通道超时后线性标记已回滚（同路径可重试）"
+    );
+}
+
 /// 虚拟时钟下 Timeout 与墙钟路径的等价性：无时间消耗的 inner（Pure）在
 /// deadline 内完成 → 返回 inner 结果；错误路径原样透传。
 #[cfg(feature = "virtual-clock")]

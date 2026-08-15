@@ -643,3 +643,60 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   同一物理文件（resource-notes §4「以规范化路径为准」承诺未兑现）。
 - **R7-F 语义裁决记录**：VC 下 Timeout = 双通道（虚拟累计 + 墙钟防御）、GetTime = `vc.now()`、
   Fork 并行分支时钟 = sum 合并；墙钟路径语义不变。
+
+## 12. R3 对账审计轮（5 轮串行循环第 3 轮，2026-08-16）——取消传播复核 + 文档对账
+
+### 状态更新（对账结论，doc.md 逐项）
+
+- **RFC-08/09 已修（墙钟路径）**：§10 原标「阶段 3+ 未修」过时——rfc0809 取消传播协议
+  （668b7ed）已合入：Timeout 超时 = watch 广播取消 → 有界宽限（CANCEL_JOIN_GRACE=500ms）
+  join 并行分支 → `rollback_from`（分支 undo 已合并回父）→ `rollback_linear_to`（快照差）
+  → on_timeout。断言已翻转（r2 孤儿 Open 不发生、executor 取消即释放锁）。**残余**：
+  宽限耗尽孤儿分支的既有效果（锁/句柄/写）不可回收（R7-A/B 同族）；嵌套 Timeout 不复合
+  外层取消令牌（取消穿透延迟 ≤ 嵌套 deadline）；VC 墙钟通道**无广播/无 join**（inner 已
+  drop）但已补 undo+线性回滚（R3-① 修复，见下）。
+- **RFC-07 未真合入**：59e5509 merge 名「RFC-07 管道双表」但 diff 无 executor.rs 改动；
+  共享管道 IO 仍 InvalidInput。aa0c2bf 分支有完整实现（未合入）。
+- **RFC-05 分面更新**：写拒绝面已修（file_fd_stale + 断言翻转）；「句柄回收通道」未实现
+  （files 表/OS fd 在 Replace 后永久残留——见 R3-C 登记）。
+- **RFC-12 残余缺口收窄**：非 VC 墙钟路径已回滚（rollback_from+rollback_linear_to）；残余
+  仅 VC 墙钟通道（已补回滚，R3-①）与宽限耗尽路径。
+
+### 已修复（R3-①，测试驱动）
+
+**VC 墙钟通道回滚**（cancel.md #3 / fork.md F4）：`run_virtual_timeout` 的墙钟通道真实
+超时（慢 syscall > duration）后原直接 drop inner + 跑 on_timeout——已入栈 undo 与预插
+线性标记不回滚（RFC-08/09/12 在 VC 构建下全回归）。修复：inner 前记录 undo_mark/线性
+快照，墙钟超时后 `rollback_from` + `rollback_linear_to` 再执行 on_timeout。TDD 测试：
+`interpreter.rs::timeout_virtual_clock_wall_channel_rolls_back_linear_markers`（修复前
+同路径 Write 重试被 A4 误拒）。**残余**：inner 已 drop 无法 join——并行分支成为孤儿
+（无广播信号），效果回收依赖宽限耗尽路径的后续工作（R7-A/B 登记）。
+
+### 新登记（R3 审计发现，阶段 3+）
+
+- **R3-A [HIGH] 宽限耗尽孤儿分支的既有效果永久泄漏（并行/顺序语义分叉）**：`wait_timeout`
+  宽限（500ms）耗尽 → inner future 被 drop → 已完成兄弟分支的 `l_undo`/`l_reg` 随任务
+  结果丢弃、从不并入父 → 该分支已产生的 Write 内容/MutexLock 持有/arbiter 占坑残留于
+  共享执行器状态（父 rollback 够不到）。**顺序路径**（冲突 Fork）共享父 undo 栈，同一
+  蓝图同超时下已完成效果会被回滚——并行/顺序调度产生不同可观察效果（等价支柱破坏）。
+  修复方向：宽限耗尽时先轮询已完成的 JoinHandle（合并 registry/undo 再回滚）再丢弃
+  未完成的。
+- **R3-B [MEDIUM] 嵌套 Timeout 不复合外层取消令牌**：嵌套 Timeout 的 inner 只见自身
+  fresh token → 外层取消广播不打断嵌套 wait（最多延迟至嵌套 deadline）；嵌套 on_timeout
+  以外层已置位 token 运行 → 其首个 action 即 CANCELLED_ERR、handler 体静默不执行。
+  修复方向：嵌套臂复合外层令牌（watch OR 通道）。
+- **R3-C [MEDIUM] Replace 后 files 表/OS fd 永久泄漏**（R2 res.md #1 补登）：rfc05 只读
+  校验不删缓存条目（D13 隔离），op_close 对失效 fd 直接 NotFound 不清理 → 长驻进程
+  {Open→Replace} 循环累积 OS 描述符至 EMFILE。修复方向：代际标记/引用计数区分分支共享。
+- **R3-D [MEDIUM] R2 增长面补登**：consumed/owned_consumed 线性标记集仅 clear() 重置
+  （不同资源键单调增长）；mutexes/held_locks 表随锁 id 单调增长；children 表仅 Wait 成功
+  移除（Close 后残留）；undo 栈峰值无上限（可逆操作数 × ≤1MB 捕获）。修复方向：文档化
+  「Replace/clear 为唯一回收点」+ 表项回收策略。
+- **R3-E [LOW] clear() 不重置 fork_region 锚点**：{Fork→Replace→Fork} 安全性完全依赖
+  全局单调 k（2^16 assert 上限）；序号耗尽或策略变更即碰撞。修复方向：clear() 复位
+  fork_region 或 offset_next_fd 重新锚定。
+- **R3-F [LOW] 取消域内 Catch 的 handler action 静默不执行**：CANCELLED_ERR(Other(125))
+  与真实 errno-125 不可区分；取消子树内 Catch 的 handler 闭包被调用但其 action 在循环顶
+  检查处立即返回 CANCELLED_ERR（零次执行）。文档化语义陷阱 + 补鉴别 API。
+- **R3-G [LOW] 线性快照全量克隆**：每个墙钟 Timeout 臂入口克隆 consumed/owned_consumed
+  （嵌套 O(depth×|marks|)，未超时臂克隆即弃）。修复方向：延迟克隆/COW。

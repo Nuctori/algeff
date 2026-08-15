@@ -24,7 +24,7 @@
 //! 本文件行为锁定（全部经真实 Runtime + TokioExecutor 全链路，非 mock）：
 //! 1. 写后不 Seek 直接读 → 空字节（游标语义：README §3 的 Seek(0) 不可省）；
 //! 2. fork! 两侧写同一文件 → 静态冲突自动顺序化（left→right），终态确定；
-//! 3. 深度守卫边界：adapters::seq 左结合链 96 元素 OK / 97 元素 Err(Other(105))；
+//! 3. 深度守卫边界：adapters::seq 左结合链 64 元素 OK / 65 元素 Err(Other(105))（迭代 1 阈值 96→64）；
 //! 4. Catch 捕获 Other(105) 后可继续（后续真实系统调用照常执行）；
 //! 5. Timeout 超时后 on_timeout 生效 + 状态可继续。
 
