@@ -85,7 +85,8 @@ fn main() {
 | 入口 | 内容 |
 | --- | --- |
 | `docs/` | mdBook 文档（概述/架构/示例/路线图）：`mdbook build docs` 后打开 `docs/book/index.html` |
-| `spec/` | 形式化规范（axioms/proofs/contracts-audit/resource-notes/verification-plan） |
+| `spec/` | 形式化规范（axioms/proofs/proof-obligations/contracts-audit/resource-notes/verification-plan） |
+| `docs/src/proof-obligations.md` | 证明义务登记表（A1–A7 × P1–P5 证据链闭环，源文件 `spec/proof-obligations.md`） |
 | `pdr.md` | 完整设计规范 v3.2（权威源） |
 | `contracts.md` | 阶段 0 冻结契约、文件所有权表、决策 D1–D14 |
 | `scripts/release.sh` | 发布预览脚本（tag 检查 → dry-run → 发布顺序提示） |
