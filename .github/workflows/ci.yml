@@ -37,9 +37,21 @@ jobs:
       # 选 cargo install --locked 而非下载 release 二进制：
       # 同一命令跨 ubuntu/windows 矩阵，无需维护各平台二进制 URL，
       # --locked 固定依赖版本，保证可复现构建。
+      # mdbook 二进制做 actions/cache 缓存，命中缓存时跳过 cargo install，
+      # 避免每次 push 都重新编译 mdbook（约 1-2 分钟）。
+      - name: Cache mdbook
+        if: hashFiles('docs/book.toml') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/mdbook
+          key: mdbook-${{ runner.os }}-stable
+
+      - name: Install mdbook
+        if: hashFiles('docs/book.toml') != '' && steps.cache.outputs.cache-hit != 'true'
+        run: cargo install mdbook --locked
+
       - name: Build mdBook docs
         if: hashFiles('docs/book.toml') != ''
-        run: |
-          cargo install mdbook --locked
-          mdbook build docs
+        working-directory: docs
+        run: mdbook build
         shell: bash
