@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::action::{Action, DataOp, Id, Signal, Value};
@@ -212,7 +213,8 @@ impl Runtime {
     ///   两分支各自持有 registry/context 隔离副本（D13）+ 独立 UndoStack，经
     ///   共享执行器 Arc<Mutex> 通道在独立阻塞线程上并发驱动，完成后合并回父
     ///   （registry `merge`：handles/consumed/owned_consumed 并集 + next_fd=max
-    ///   归一化；F1 修复：spawn 前右分支预分割 fd 区间避免两分支撞 fd；
+    ///   归一化；F1 修复：spawn 前右分支取全局唯一 fd 区间避免两分支撞 fd
+    ///   （S6/A2：嵌套 Fork 任意深度下并发分支区间同样互斥）；
     ///   undo：right 先、left 后，保持 LIFO 与观察序）；can_parallel=false
     ///   保持顺序执行（left→right→combine），完成后同样 merge 回父（F2 修复：
     ///   分支 fd 与线性标记不泄漏）；
@@ -412,13 +414,36 @@ pub fn fork_conflict(reg: &ResourceRegistry, left: &Action, right: &Action) -> b
     !reg.can_parallel(&l_res, &r_res)
 }
 
-/// Fork 分支 fd 预分割偏移（F1 审查修复）：左右分支都克隆自父（同源
-/// `next_fd`），若都分配新 fd 会得到**相同 fd** —— merge 时 `HashMap::extend`
-/// 静默覆盖丢弃一侧句柄，执行器内部轮换映射同样碰撞。修复：右分支在远离
-/// 父/左分支的高位区间（偏移大常数）分配，左分支沿用父基线，两区间互不
-/// 重叠（fd 身份保留：分支返回值携带的 Fd 与 merge 后 registry 中句柄一致）。
-/// 嵌套 Fork 每层相对当前基线再偏移一次，区间依然不相交（`N + k·2^48`）。
-const FORK_FD_REGION_OFFSET: u64 = 1 << 48;
+/// Fork 分支 fd 全局唯一区间序号（HIGH 嵌套碰撞修复，CTO 批准方向）。
+///
+/// 每次进入 Fork 右分支（无论并行/顺序、任意嵌套深度）`fetch_add(1)` 取全局
+/// 唯一序号 k ∈ [1, 2^16)，区间偏移 = `k << 48`（从 1 起跳：0 偏移会与继承
+/// 基线的左分支同区）。区间绝对位置 = 偏移 + **未偏移基线**（见
+/// `ResourceRegistry::offset_next_fd` 的基线复用：本 registry 已记录
+/// `fork_region` 时沿用旧基线，而非当前已偏移游标）—— 只由全局唯一 k 与根
+/// 基线决定，**与路径无关**：任意嵌套深度下所有并发分支区间互斥（修复批 5
+/// 「相对当前 next_fd 偏移 2^48」在嵌套 Fork 下内层右分支与外层右分支同基线
+/// 碰撞的 HIGH；基线复用同时消除「两条路径的序号和相等」的累加碰撞）。
+///
+/// 上限 2^16 区间：2^16 × 2^48 = 2^64 恰满 u64 地址空间，序号不溢出；区间
+/// 基数 2^48 远超实际 fd 规模（分配数 ≪ 2^48），且 `merge` 归一化（未分配
+/// 区间游标收敛回基线）使父 `next_fd` 不被抬高 —— 实践中区间序号极少被消耗
+/// （每进程每次 Fork 右分支 +1，归一化回收下 2^16 充足）。进程级全局
+/// （`static AtomicU64`）：多 Runtime 并存时区间消耗共享，正确性无碍（仅序号
+/// 消耗更快）；`interpret` 冻结签名不带 Runtime 引用，static 是唯一不破坏
+/// 签名冻结的选择。
+static FORK_FD_REGION_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 取下一个全局唯一 fd 区间偏移（`k << 48`，k 全局唯一递增）。见
+/// [`FORK_FD_REGION_SEQ`] 的注释（上限 2^16 区间，超出即 u64 溢出）。
+fn fork_fd_region_offset() -> u64 {
+    let k = FORK_FD_REGION_SEQ.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        k < (1 << 16),
+        "Fork 全局 fd 区间序号耗尽（>2^16-1 个右分支）—— 静态计数上限"
+    );
+    k << 48
+}
 
 /// Fork 并行分支执行（D14 阶段 3，CTO 批准方向）：
 ///
@@ -431,9 +456,10 @@ const FORK_FD_REGION_OFFSET: u64 = 1 << 48;
 /// 完成后合并回父：
 /// - registry：子 handles 以原 fd 并入 + consumed/owned_consumed 并集 +
 ///   `next_fd = max` 归一化（`ResourceRegistry::merge`，RFC-A3-2 / D13「合并
-///   回父」）；F1 修复：spawn 前右分支 `offset_next_fd(1<<48)` 预分割 fd 区间，
-///   两分支分配互不冲突，合并后父 `next_fd = max(父, 左, 右)`（= 全部已分配
-///   fd 最大值 + 1，D1 单调不复用）;
+///   回父」）；F1 修复：spawn 前右分支 `offset_next_fd(fork_fd_region_offset())`
+///   取全局唯一 fd 区间（S6/A2 嵌套修复：任意嵌套深度并发分支互斥），
+///   合并后父 `next_fd = max(父, 左, 右)`（= 全部已分配 fd 最大值 + 1，D1
+///   单调不复用）;
 /// - undo：并入顺序为 left 后 right（栈序与顺序路径一致）—— LIFO recover
 ///   先执行 right 的逆操作再执行 left 的（right 的效果后发生、先撤销，
 ///   与「left 先执行」的观察序一致）。
@@ -453,9 +479,9 @@ async fn run_fork_parallel(
     let mut r_ctx = ctx.clone();
     let mut l_reg = reg.clone();
     let mut r_reg = reg.clone();
-    // F1 修复：spawn 前预分割 fd 区间 —— 右分支 next_fd 偏移大常数，两分支
-    // 分配互不重叠（见 `FORK_FD_REGION_OFFSET` 注释）。
-    r_reg.offset_next_fd(FORK_FD_REGION_OFFSET);
+    // F1 修复：spawn 前取全局唯一 fd 区间 —— 右分支偏移 `k<<48`（k 全局唯一，
+    // 见 `FORK_FD_REGION_SEQ` 注释），任意嵌套深度下并发分支区间互斥。
+    r_reg.offset_next_fd(fork_fd_region_offset());
     let mut l_undo = UndoStack::new();
     let mut r_undo = UndoStack::new();
     let l_shared = shared.clone();
@@ -514,7 +540,8 @@ async fn run_fork_parallel(
 ///   且为 `Shared` 通道时真并行（`run_fork_parallel`：registry/ctx 隔离 + 独立
 ///   UndoStack + 共享执行器，完成后合并回父），否则顺序执行（left→right→combine，
 ///   阶段 1 语义保持）；两条路径完成后均 merge 回父（F2：顺序路径不丢分支 fd/
-///   线性标记），且右分支均预分割 fd 区间（F1：两分支不撞 fd）；
+///   线性标记），且右分支均取全局唯一 fd 区间（F1+S6/A2：任意嵌套深度下
+///   两分支不撞 fd）；
 /// - `Scope`：cwd 压栈/弹栈（inner 出错时同样恢复）；
 /// - `Replace`：先 `recover()`（清空撤销栈）+ `reg.clear()`（释放 handles 与
 ///   线性标记，next_fd 保留 D1），再执行 target，以其结果结束（D10）；
@@ -587,12 +614,13 @@ async fn interpret_impl(
                     // 即压栈序）；完成后**同样 merge 回父**（left 先、right 后，merge
                     // 顺序与观察序一致）—— 分支新分配的 fd 与线性标记（Write 消费 /
                     // Own 终结）并入父，修复分支 fd 泄漏与「冲突型 Fork 后父级同资源
-                    // Write 被 A4 错误放行」（F2）。右分支同样 `offset_next_fd` 预分割
-                    // fd 区间（两分支同源父 next_fd，若都分配新 fd 会撞 fd，F1）。
+                    // Write 被 A4 错误放行」（F2）。右分支同样取全局唯一 fd 区间
+                    // （`fork_fd_region_offset`，两分支同源父 next_fd，若都分配新 fd
+                    // 会撞 fd，F1；嵌套任意深度下区间依然互斥，S6/A2）。
                     // 成功/失败均合并（同并行路径「子任务错误仍合并」）。
                     let mut l_reg = reg.clone();
                     let mut r_reg = reg.clone();
-                    r_reg.offset_next_fd(FORK_FD_REGION_OFFSET);
+                    r_reg.offset_next_fd(fork_fd_region_offset());
                     let lv = run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow()).await;
                     let rv = run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow()).await;
                     reg.merge(l_reg);
