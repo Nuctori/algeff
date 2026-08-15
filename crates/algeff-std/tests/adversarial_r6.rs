@@ -13,27 +13,25 @@
 //! 文件只补**未覆盖面**：更多物理码链、失败路径毒化、Catch 不粘滞、映射表
 //! 边界（未入 14 集的码 → Other(n)）、以及两条已证实缺陷的行为锁定。
 //!
-//! 已证实缺陷（src 冻结，只记录不修，测试锁定现状）：
+//! 发现与修复状态（本文件断言**修复后行为**）：
 //! - F1（RFC-10 遗留）：Win32 `ERROR_NOT_SAME_DEVICE(17)` 未归一化 →
-//!   跨卷 rename 误映射 `AlreadyExists`（Unix 同蓝图 → `CrossDevice`）。
-//!   根因：normalize_windows_errno 表缺 `17→18`（executor.rs:98-114）；kind
-//!   优先路径无 `CrossesDevices` 臂（executor.rs:64-92）；兜底
-//!   `from_errno(normalize(raw))` 把**未映射的 Win32 码按 POSIX errno 空间
-//!   重解释**（error.rs:90-94 数值碰撞面：Win32 4/11/13/18/20/21/22/28/32/
-//!   104/110/111 与 14 错误集码值重合 → 全部会被误标 POSIX 语义，如
-//!   ERROR_INVALID_DATA(13)→PermissionDenied、ERROR_TOO_MANY_OPEN_FILES(4)
-//!   →Interrupted、ERROR_SHARING_VIOLATION(32)→BrokenPipe）。正确兜底应为
-//!   未映射码 → `Other(raw)` 而非再经 from_errno。
-//!   `InvalidInput`。r4b 的 open_exclusive_existing_fails_no_state_poison 只
-//!   验证了异路径重开（p2），同路径盲区由本文件补齐。与 A7 仲裁「失败回滚」
-//!   原则（executor.rs:442-451）不一致。
+//!   跨卷 rename 误映射 `AlreadyExists`（Unix 同蓝图 → `CrossDevice`）；
+//!   兜底 `from_errno(raw)` 还会把未映射 Win32 码按 POSIX errno 空间重解释
+//!   （如 ERROR_INVALID_DATA(13)→PermissionDenied、
+//!   ERROR_TOO_MANY_OPEN_FILES(4)→Interrupted、
+//!   ERROR_SHARING_VIOLATION(32)→BrokenPipe）。修复：JD-2（609c393）kind
+//!   臂补 `CrossesDevices → 18`；未映射码兑底 `Other(raw)`（MEDIUM-1，
+//!   4d9a263）。
+//! - F2（错误路径毒化）：`check_linear` 在 syscall **执行前**插入 Write 消费
+//!   标记，interpret Syscall 臂 exec 失败直接上抛不回滚 → 失败后同路径再以
+//!   Write 模式打开 → `InvalidInput`（r4b 只验证异路径重开，同路径盲区由
+//!   本文件补齐）。修复：RFC-12（6ded2db）exec 失败回滚本批标记 + B2
+//!   （2bfac05）批内部分失败前缀回滚——同路径重试语义恢复。
 //!
-//! 修复状态（R6 已落地，本文件断言修复后行为）：
-//! - F1 → JD-2（609c393）：kind 臂补 `CrossesDevices → 18`，Windows 跨卷
-//!   rename 现正确映射 `CrossDevice`；未映射码兑底改为 `Other(raw)`（审查
-//!   MEDIUM-1，4d9a263）。
-//! - F2 → RFC-12（6ded2db）：exec 失败路径回滚本批预插入的 Write/Own 标记
-//!   （+ B2 前缀回滚 2bfac05），同路径重试语义恢复。
+//! 文件结构：§1 三级链核验、§2 F1/F2 修复后行为锁定（测试名
+//! `xvol_rename_windows_maps_to_cross_device` /
+//! `failed_write_syscall_rolls_back_linear_mark`）、§3 错误路径状态毒化、
+//! §4 Catch 不粘滞。
 //!
 //! 疑似（无测试或仅行为锁定，见对应测试注释）：
 //! - S1：Rmdir 非空 → Windows `Other(145)` vs Unix `Other(39)`（同蓝图跨平台
@@ -572,7 +570,7 @@ async fn xvol_rename_windows_maps_to_cross_device() {
 /// 标记（与 A7 仲裁「失败回滚」同原则）——本测试现断言**修复后行为**（同路径
 /// 重开成功）。
 #[test]
-fn poison_failed_write_syscall_leaves_linear_mark() {
+fn failed_write_syscall_rolls_back_linear_mark() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("keep.txt");
     std::fs::write(&p, b"data").unwrap();
@@ -721,7 +719,7 @@ async fn poison_failed_rename_source_intact_not_sticky() {
 /// Catch 捕获 RFC-10 归一化 IO 错误（exclusive 撞已存在 → AlreadyExists）：
 /// handler 收到正确变体；失败无 undo/fd 残留；随后同一 Runtime 读打开并读取
 /// 同一文件成功（错误不粘滞）。注：后续用 Read 模式重开——Write 面残留为 F2
-/// 缺陷，见 poison_failed_write_syscall_leaves_linear_mark。
+/// 缺陷，见 failed_write_syscall_rolls_back_linear_mark。
 #[test]
 fn catch_rfc10_io_error_is_caught_and_not_sticky() {
     let dir = tempfile::tempdir().unwrap();

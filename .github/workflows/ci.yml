@@ -10,8 +10,9 @@ jobs:
   ci:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # 三平台独立超时保护：默认 360 分钟过长，卡死的测试/构建（如
-    # runner 调度异常、死锁）应在 60 分钟内暴露，而不是挂满默认超时。
+    # 三平台独立超时保护：默认 360 分钟过长，卡死的测试/构建（如 runner
+    # 调度异常、死锁、依赖安装挂起）应在 60 分钟内暴露，而不是挂满默认超时；
+    # 超时后整个 job 失败并释放 runner，防费用空耗。
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -20,9 +21,6 @@ jobs:
         # 语义存在差异，仅此平台可捕获），并构成 ubuntu/windows/macos 三平台矩阵覆盖。
         os: [ubuntu-latest, windows-latest, macos-latest]
 
-    # job 级超时 30 分钟：防止 runner 挂起（网络/依赖安装卡死等）导致任务无限占用
-    # 和费用空耗，超时后整个 job 失败并释放 runner。
-    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -53,6 +51,13 @@ jobs:
       - name: cargo test -p algeff-core --features coeffects,virtual-clock
         run: cargo test -p algeff-core --features coeffects,virtual-clock
 
+      # 文档一致性门禁：四处文档（README/derivation/resource-notes/proof-
+      # obligations）的 7 组事实（测试计数 352/46+3、对抗 E2E 164、RFC-10/11
+      # 状态、CI 三平台、性能 canonical 103.1/366.2/570.9/39.1、深度守卫 96/
+      # 105/97）不得漂移；GitHub runner 预装 Python，直接调用。
+      - name: python scripts/check-doc-consistency.py
+        run: python scripts/check-doc-consistency.py
+
       # mdBook 构建：仅当 docs/book.toml 存在时执行。
       # 选 cargo install --locked 而非下载 release 二进制：
       # 同一命令跨 ubuntu/windows/macos 矩阵，无需维护各平台二进制 URL，
@@ -78,7 +83,6 @@ jobs:
       - name: Install mdbook
         if: hashFiles('docs/book.toml') != '' && steps.cache.outputs.cache-hit != 'true'
         run: cargo install mdbook --locked
-
       # 显式 shell: bash：仅本步骤需要（working-directory + mdbook 子命令），
       # Windows runner 自带 Git Bash，与其余步骤默认 shell（pwsh）混用无碍——
       # 其余 run 步骤均为纯 `cargo ...` 调用，无 shell 专属语法，pwsh/bash 行为一致。
