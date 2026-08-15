@@ -10,6 +10,9 @@ jobs:
   ci:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # 三平台独立超时保护：默认 360 分钟过长，卡死的测试/构建（如
+    # runner 调度异常、死锁）应在 60 分钟内暴露，而不是挂满默认超时。
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -41,26 +44,44 @@ jobs:
 
       # 特性测试：crates/algeff-core/tests/runtime_features.rs 的 7 个测试
       # 由 coeffects/virtual-clock 特性门控，默认测试不含，此处三平台补跑。
-      - name: cargo test --workspace --features coeffects,virtual-clock
-        run: cargo test --workspace --features coeffects,virtual-clock
+      # 必须限定 -p algeff-core：特性只声明在 algeff-core；virtual-clock 会把
+      # Action::Sleep 改为“推进逻辑时钟、立即返回”（解释器按设计如此），
+      # algeff-std 的 Timeout 测试（adversarial_r1::err_timeout_keeps_undo_*
+      # 等）依赖真实 sleep 计时，在 --workspace 全量跑下会确定性失败（已本地
+      # 复现，两步同因：Sleep 立即完成 → Timeout 不触发）。故只补跑核心特性
+      # 测试，algeff-std/algeff-macro 由上面默认特性步骤覆盖。
+      - name: cargo test -p algeff-core --features coeffects,virtual-clock
+        run: cargo test -p algeff-core --features coeffects,virtual-clock
 
       # mdBook 构建：仅当 docs/book.toml 存在时执行。
       # 选 cargo install --locked 而非下载 release 二进制：
-      # 同一命令跨 ubuntu/windows 矩阵，无需维护各平台二进制 URL，
+      # 同一命令跨 ubuntu/windows/macos 矩阵，无需维护各平台二进制 URL，
       # --locked 固定依赖版本，保证可复现构建。
+      # macOS 可行性：mdbook 为纯 Rust crate（无 C/native 依赖），
+      # arm64 macOS runner（macos-latest 现指向 macos-15）编译无阻碍。
       # mdbook 二进制做 actions/cache 缓存，命中缓存时跳过 cargo install，
       # 避免每次 push 都重新编译 mdbook（约 1-2 分钟）。
+      # 缓存路径用通配 mdbook*：Windows 上 cargo install 产物是 mdbook.exe，
+      # 精确路径 ~/.cargo/bin/mdbook 在 Windows 匹配不到文件，缓存永远不命中/
+      # 不保存（save 阶段报路径不存在警告）；通配符三平台一致命中
+      # （Unix 匹配 mdbook，Windows 匹配 mdbook.exe）。
+      # 缓存 key 含手动版本旋钮 vN：mdbook 上游大版本升级需重建缓存时
+      # 递增 vN 强制失效（cargo install 未锁 mdbook 自身版本，缓存可能陈旧）。
       - name: Cache mdbook
+        id: cache
         if: hashFiles('docs/book.toml') != ''
         uses: actions/cache@v4
         with:
-          path: ~/.cargo/bin/mdbook
-          key: mdbook-${{ runner.os }}-stable
+          path: ~/.cargo/bin/mdbook*
+          key: mdbook-${{ runner.os }}-v1
 
       - name: Install mdbook
         if: hashFiles('docs/book.toml') != '' && steps.cache.outputs.cache-hit != 'true'
         run: cargo install mdbook --locked
 
+      # 显式 shell: bash：仅本步骤需要（working-directory + mdbook 子命令），
+      # Windows runner 自带 Git Bash，与其余步骤默认 shell（pwsh）混用无碍——
+      # 其余 run 步骤均为纯 `cargo ...` 调用，无 shell 专属语法，pwsh/bash 行为一致。
       - name: Build mdBook docs
         if: hashFiles('docs/book.toml') != ''
         working-directory: docs
