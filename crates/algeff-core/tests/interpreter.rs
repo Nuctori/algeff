@@ -12,11 +12,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 use std::time::Duration;
 
-use algeff_core::action::{Action, DataOp, Value};
+use algeff_core::action::{Action, DataOp, OpenFlags, Value};
 use algeff_core::error::SysError;
-use algeff_core::resource::{AccessMode, Resource, ResourceRegistry, ResourceUsage};
+use algeff_core::resource::{
+    AccessMode, Resource, ResourceHandle, ResourceRegistry, ResourceUsage,
+};
 use algeff_core::runtime::{interpret, Context, Runtime, UndoStack};
 use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
 
@@ -41,11 +44,13 @@ enum MockOutcome {
 struct MockExecutor {
     /// 每次 execute 的 op 描述（调用顺序）。
     log: Arc<Mutex<Vec<String>>>,
+    /// 每次 execute 的执行线程 id（与 `log` 同序，Fork 并行路径证据）。
+    thread_log: Arc<Mutex<Vec<ThreadId>>>,
     /// undo 执行记录（recover 顺序）。
     undo_log: Arc<Mutex<Vec<String>>>,
     /// op 描述 → 返回结果（未配置 → Ok(Value::Unit)）。
     responses: HashMap<String, MockOutcome>,
-    /// 每个 execute 的执行延迟（timeout 测试用）。
+    /// 每个 execute 的执行延迟（timeout 测试用 / Fork 并行窗口）。
     delay: Duration,
     /// 是否在 Ok 时附带 undo。
     with_undo: bool,
@@ -72,6 +77,7 @@ impl MockExecutor {
 /// op → 稳定描述串（测试按此配置响应并断言调用序）。
 fn describe(op: &DataOp) -> String {
     match op {
+        DataOp::Open { path, .. } => format!("open:{}", path.display()),
         DataOp::Write { fd, .. } => format!("write:{fd}"),
         DataOp::Read { fd, len } => format!("read:{fd}:{len}"),
         DataOp::GetTime => "gettime".to_string(),
@@ -83,13 +89,24 @@ impl SyscallExecutor for MockExecutor {
     fn execute<'a>(
         &'a mut self,
         op: &'a DataOp,
-        _registry: &'a mut ResourceRegistry,
+        registry: &'a mut ResourceRegistry,
     ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
         let desc = describe(op);
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
+            self.thread_log
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
+            }
+            // Open：由注册表分配全局唯一 fd（D1），不产生 undo（简化，同
+            // concurrency_stress.rs 的 MockExecutor）。
+            if matches!(op, DataOp::Open { .. }) {
+                let fd =
+                    registry.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+                return Ok((Value::Fd(fd), None));
             }
             let out = match self.responses.get(&desc).cloned() {
                 Some(MockOutcome::Err(e)) => return Err(e),
@@ -721,4 +738,181 @@ fn sleep_advances_virtual_clock() {
         rt.virtual_clock().expect("virtual clock 存在").now(),
         Duration::from_secs(60)
     );
+}
+
+// ── 14. Fork 并行化（D14 阶段 3）+ D10 Replace registry 清空 ───────────
+
+/// 异资源 Fork 走并行路径（`Runtime` 的 Shared 执行器通道）：
+/// - 左右分支在不同阻塞线程执行（MockExecutor 记录每 op 线程 id，左右 op
+///   线程不同 = 真并行证据，spawn_blocking × 2 各自 drive current-thread runtime）；
+/// - 结果合并正确（combine）；
+/// - D13 合并回父：左分支 Open 在子隔离 registry 分配的 fd（0）以**原 fd**
+///   并入父 registry，父 next_fd = max 后继续分配不冲突。
+#[test]
+fn fork_parallel_true_path() {
+    let mut ex = MockExecutor::new();
+    ex.with_undo = true;
+    // 每个 execute 延迟 30ms：保证两个 spawn_blocking 子任务同时在飞
+    // （阻塞池两个线程同时被占用 → 线程断言确定、无调度竞态）。
+    ex.delay = Duration::from_millis(30);
+    ex.respond("write:7", MockOutcome::Value(Value::U64(20)));
+
+    let ops_log = Arc::clone(&ex.log);
+    let thread_log = Arc::clone(&ex.thread_log);
+    let mut rt = Runtime::new(Box::new(ex));
+
+    // 父 registry 预置 1 个句柄（右分支 Write 的对象为既有 fd 7，不新分配；
+    // 左分支 Open 在子隔离 registry 中从 next_fd=1 起分配 → 无子间 fd 冲突）。
+    rt.registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+
+    let action = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/left"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/left".to_string()), AccessMode::Read)],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 7,
+                data: vec![0xCC],
+            },
+            vec![usage(Resource::Fd(7), AccessMode::Write)],
+        )),
+        combine: Box::new(|l, r| match (l, r) {
+            (Value::Fd(lfd), Value::U64(rn)) => Action::Pure(Value::U64(lfd + rn)),
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let v = rt.run_blocking(action);
+    // 左 fd = 1（父预置 1 个后子隔离分配）+ 右 20 = 21
+    assert_eq!(v, Ok(Value::U64(21)), "combine 结果合并正确");
+
+    // 并行路径证据：左右 op 出现在不同线程（真并行，非顺序回退）。
+    // 并行下 op 日志顺序不确定（两子任务并发），只断言集合成员与线程差。
+    let ops = ops_log.lock().unwrap().clone();
+    let threads = thread_log.lock().unwrap().clone();
+    assert_eq!(ops.len(), 2, "左右各一个 op");
+    let idx_l = ops
+        .iter()
+        .position(|o| o == "open:/left")
+        .expect("左分支 op 已执行");
+    let idx_r = ops
+        .iter()
+        .position(|o| o == "write:7")
+        .expect("右分支 op 已执行");
+    assert_ne!(
+        threads[idx_l], threads[idx_r],
+        "左右 op 应在不同线程执行（真并行）"
+    );
+
+    // D13 合并回父：左分支子 registry 的句柄以原 fd（1）并入父；
+    // 父 next_fd = max → 继续分配不冲突。
+    assert!(
+        rt.registry().lookup(1).is_some(),
+        "子 registry 句柄应合并回父（原 fd 保留）"
+    );
+    let nfd = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+    assert!(nfd > 1, "合并后父 next_fd = max，新分配不冲突");
+}
+
+/// Fork 并行后的 undo 合并顺序：right 的 undo 先、left 的后 —— LIFO recover
+/// 先弹 right 再弹 left，与顺序路径「left 先执行」的观察序一致。
+#[test]
+fn fork_parallel_undo_merge() {
+    let mut ex = MockExecutor::new();
+    ex.with_undo = true;
+    ex.respond("write:1", MockOutcome::Value(Value::U64(10)));
+    ex.respond("write:2", MockOutcome::Value(Value::U64(20)));
+
+    let undo_log = Arc::clone(&ex.undo_log);
+    let mut rt = Runtime::new(Box::new(ex));
+
+    let action = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xAA],
+            },
+            vec![usage(Resource::Fd(1), AccessMode::Write)],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 2,
+                data: vec![0xBB],
+            },
+            vec![usage(Resource::Fd(2), AccessMode::Write)],
+        )),
+        combine: Box::new(|l, r| match (l, r) {
+            (Value::U64(a), Value::U64(b)) => Action::Pure(Value::U64(a + b)),
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let v = rt.run_blocking(action);
+    assert_eq!(v, Ok(Value::U64(30)));
+    assert_eq!(rt.undo_stack().len(), 2, "左右各压入一个 undo");
+
+    drive(rt.recover());
+    assert_eq!(
+        *undo_log.lock().unwrap(),
+        vec!["undo(write:2)".to_string(), "undo(write:1)".to_string()],
+        "LIFO：right 的 undo 先弹出，left 的后（观察序一致）"
+    );
+    assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
+}
+
+/// D10 对齐：Replace 分支先 recover 再 `reg.clear()` —— handles 与线性标记
+/// 全部释放（next_fd 保留 D1 单调），随后执行 target。
+#[test]
+fn replace_clears_registry() {
+    let mut ex = MockExecutor::new();
+    ex.with_undo = true;
+    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+
+    let undo_log = Arc::clone(&ex.undo_log);
+    let mut rt = Runtime::new(Box::new(ex));
+
+    // Replace 前 registry 积累：1 个句柄 + 1 条 Write 消费。
+    let fd0 = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+    assert!(rt
+        .registry()
+        .check_linear(&usage(Resource::Fd(fd0), AccessMode::Write))
+        .is_ok());
+
+    let action = Action::Sequential {
+        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        next: Box::new(|_| Action::Replace {
+            target: Box::new(Action::Pure(Value::U64(42))),
+        }),
+    };
+    let v = rt.run_blocking(action);
+    assert_eq!(v, Ok(Value::U64(42)), "Replace 后执行 target 的结果");
+    assert_eq!(
+        *undo_log.lock().unwrap(),
+        vec!["undo(gettime)".to_string()],
+        "recover 先执行（LIFO 撤销累积逆操作）"
+    );
+    assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
+
+    // reg.clear()：handles 清空 + 线性复位（next_fd 保留 D1）。
+    assert!(
+        rt.registry().lookup(fd0).is_none(),
+        "Replace 后句柄应全部释放"
+    );
+    assert!(
+        rt.registry()
+            .check_linear(&usage(Resource::Fd(fd0), AccessMode::Write))
+            .is_ok(),
+        "clear() 后同资源应可再次 Write（线性复位）"
+    );
+    let nfd = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+    assert!(nfd > fd0, "fd 永不复用（决策 D1）");
 }
