@@ -23,7 +23,7 @@
 
 | 义务 | 形式化陈述 | 数学论证位置 | 测试证据（文件:测试） | 对抗 E2E 补充 | 审计结论 |
 | --- | --- | --- | --- | --- | --- |
-| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity；辅助压力证据：adversarial_r1.rs:conc_repeat_blueprint_100_rounds_deterministic（100 轮确定性——序列稳定维度，非直接结合律） | 轮 R1 ✅ | ✅ 有效（R1：演绎链严格，执行级+对抗双证据；深度承诺域见 P1 行——≤96 左结合/无限制右结合） |
+| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity；辅助压力证据：adversarial_r1.rs:conc_repeat_blueprint_100_rounds_deterministic（100 轮确定性——序列稳定维度，非直接结合律） | 轮 R1 ✅ | ✅ 有效（R1：演绎链严格，执行级+对抗双证据；深度承诺域见 P1 行——≤64 左结合/无限制右结合（迭代 1 阈值 96→64）） |
 | A2 单位元 | 1;a = a;1 = a | spec/proofs.md | execution_axioms.rs:exec_A2_identity | 轮 R1 ✅ | ✅ 有效（R1：Pure 前缀/后缀/双侧 op 序列一致） |
 | A3 交换律 | Δ(a)∩Δ(b)=∅ ∧ Sym(f) ∧ Cov(Δ) ⇒ Fork(a,b,f)≡Fork(b,a,f) | spec/proofs.md（R2：Sym/Cov 并入陈述；R3：静态可见性前提声明） | commutation.rs:fork_commutation_disjoint + fork_commutation_same_value + a3_can_parallel_symmetric（proptest 对称）；辅助压力：adversarial_r1.rs:conc_fork_parallel_two_files_both_handles_readable、adversarial_r2.rs fd 分配完整性、adversarial_r3b.rs:ub_fork_conflict_blindspot_*（盲区实证） | 轮 R1/R2/R3 ✅ | ✅ 有效（附声明前提）（R2 收敛 + R3：盲区前提已入 axioms/proofs——系统性不完全声明，工程应用范围限定） |
 | A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence + adversarial_r1.rs:lin_fork_conflict_double_write_then_parent_blocked（冲突 Fork 后父级拦截）+ lin_stale_fd_write_after_replace_succeeds（Replace 后线性标记清空但句柄残留反例）+ adversarial_r3a.rs:d10_replace_resets_linearity_same_resource_rewrite（D10 复位）+ 盲区线性保持（闭包内 Write 经 merge 仍并入父） | 轮 R1/R3 ✅ | ⚠️ 部分（R1/R3：线性标记维度闭环+多路径证据；句柄活性反例→RFC-05 登记） |
@@ -35,7 +35,7 @@
 
 | 义务 | 陈述 | 证明位置 | 测试证据 | 审计结论 |
 | --- | --- | --- | --- | --- |
-| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 + adversarial_r4c.rs（1000 节点平链规模证据） | ✅ 有效（R1/R4：演绎链严格，规模证据；**范围前提（R5 审查）**：深度守卫阈值 96 下结合律在深度 ≤96 内成立——**左结合形式 `(a;b);c` 型 current 嵌套先触及阈值**（消耗深度 = 链长-1），右结合 `a;(b;c)` 型 next-CPS 延续恒为深度 1；边界处两种结合形式行为可不对称，超限行为不在结合律承诺内；`seq()` 左折叠 ≥97 步返回 Err(Other(105))） |
+| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 + adversarial_r4c.rs（1000 节点平链规模证据） | ✅ 有效（R1/R4：演绎链严格，规模证据；**范围前提（R5 审查，迭代 1 更新）**：深度守卫阈值 64 下结合律在深度 ≤64 内成立——**左结合形式 `(a;b);c` 型 current 嵌套先触及阈值**（消耗深度 = 链长-1），右结合 `a;(b;c)` 型 next-CPS 延续恒为深度 1；边界处两种结合形式行为可不对称，超限行为不在结合律承诺内；`seq()` 左折叠 ≥65 步返回 Err(Other(105))） |
 | P2 交换律 | Δ(a)∩Δ(b)=∅ ∧ Sym(f) ∧ Cov(Δ) ⇒ Fork(a,b,f)≡Fork(b,a,f) | spec/proofs.md（R2 修正 + R3 静态可见性前提） | commutation.rs + a3_can_parallel_symmetric + adversarial_r3b.rs 盲区实证 | ✅ 有效（附声明前提）（R2 收敛 + R3：盲区前提入依赖清单，工程应用范围限定） |
 | P3 分支写隔离 | Choose/Fork 写隔离 | spec/proofs.md（R3：make_mut 文本同步为范围声明） | fork_same_fd_write + branch_isolation.rs（4 测试）+ adversarial_r3a.rs（Fork 内 Scope cwd 恢复/双分支 undo 合并/8 文件 LIFO 撤销栈压力） | ⚠️ 部分→**有效（附范围声明）**（R3 升级：语义层证据充分；物理层 make_mut 阶段 3 推迟有完整裁决） |
 | P4 撤销双态 | w;w̄ 状态恢复 | spec/proofs.md（R3：trackΓ+Full 限定 + RFC-08/09 例外） | exec_A6 + e2e undo + adversarial_r1.rs + r3a.rs（catch 组合/撤销栈压力） | ⚠️ 部分（R1/R3：证明有效、边界完整；范围例外 RFC-05/08/09 登记，句柄活性反例未闭环——RFC-05） |

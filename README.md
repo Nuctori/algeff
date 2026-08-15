@@ -361,7 +361,7 @@ fn main() {
 | 2   | 公理化     | A1–A7 七条公理（结合律/单位元/交换律/资源线性/分支隔离/撤销双态/无死锁）                                                            | `spec/axioms.md`               |
 | 3   | 命题      | P1–P5 五条可证明性质（幺半群/并行交换律/写隔离/撤销双态/无死锁）                                                                 | `spec/proofs.md`               |
 | 4   | 契约冻结    | D1–D19 决策表 = 正确性承诺边界                                                                                  | `contracts.md`                 |
-| 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 96 = 实测崩溃边界 104–108 留 8% 余量（D-052） | 决策链 + `spec/resource-notes.md` |
+| 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 64（D-052 初版 96 → 迭代 1 取消传播帧膨胀复测裁决 64） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
 | 7   | 验证分层    | 352 个测试函数（约 344 二进制 + 8 doc-test），46 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
 | 8   | 对抗审计 ×5+R6 | 164 个 E2E 测试（R1-R5=122 + R6=42，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
