@@ -410,7 +410,7 @@ fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
 ///
 /// 栈帧纪律：deadline/elapsed 跨 await 存活，必须放在本独立 async fn 内 ——
 /// 若内联进 `interpret_impl` 状态机，会撑大每层递归的状态机帧、压低 RFC-11
-/// 深度守卫的嵌套边界（r5a 边界测试 95/96/97 实测：内联时 95 层即栈溢出）。
+/// 深度守卫的嵌套边界（r5a 边界测试 63/64/65 实测：内联时 63 层即栈溢出）。
 /// 返回 `LocalBoxFuture`（`Box::pin` 堆分配）：解释器状态机帧只存 8B 指针，
 /// 子状态机（含 deadline/elapsed）在堆上，不参与每层递归的栈帧预算。
 #[cfg(feature = "virtual-clock")]
@@ -577,7 +577,7 @@ async fn wait_timeout<'a>(
 ///
 /// 独立 async fn（非解释器状态机内联）：取消协议的局部状态（watch 通道、
 /// CancelToken、线性快照）若留在 `interpret_impl` 的 match 臂内，会撑大
-/// **每层递归**的状态机帧（RFC-11 深度守卫 95/96/97 边界实测会栈溢出）——
+/// **每层递归**的状态机帧（RFC-11 深度守卫 63/64/65 边界实测会栈溢出）——
 /// 提取后解释器帧只持一个 BoxFuture 指针。VC 路径见 `run_virtual_timeout`。
 #[allow(clippy::too_many_arguments)]
 async fn run_wall_timeout<'a>(
@@ -1236,7 +1236,7 @@ async fn interpret_impl(
                     // （RFC-12 残余缺口仅墙钟路径适用）。
                     // 栈帧纪律：判定逻辑在独立 async fn（`run_virtual_timeout`）
                     // 内——deadline/elapsed 跨 await 存活，若内联进解释器状态机
-                    // 会撑大**每层递归**的状态机帧（r5a 边界测试 95/96/97 实测
+                    // 会撑大**每层递归**的状态机帧（r5a 边界测试 63/64/65 实测
                     // 崩溃），提取后解释器帧恢复原尺寸。
                     return run_virtual_timeout(
                         *inner,

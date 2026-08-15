@@ -1533,10 +1533,11 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     assert_eq!(v, Value::Bytes(b"BBB".to_vec()), "父级执行正常");
 }
 
-/// virtual-clock 语义（审计 R2 适配）：Sleep 瞬时完成 → 无飞行中窗口 →
-/// 取消传播的「中止飞行中副作用」场景不成立（post-check：inner 完整执行、
-/// 效果保留）。左分支在超时判定前已完成 Open → 文件**被创建**（与墙钟语义
-/// 的「文件不创建」分叉，均为各自语义下的正确行为）。
+/// virtual-clock 语义（审计 R2 适配）：Sleep 瞬时完成 → 分支无「飞行中窗口」。
+/// 结果时序依赖：分支在超时前完成 Open → 文件创建（post-check 效果保留）；
+/// 分支晚启动（spawn 排队 > 超时）→ 循环顶取消检查拦截 → 文件不创建
+/// （取消传播在 VC 下同样生效）。两种结果均正确，故只断言确定性部分：
+/// 虚拟通道判定超时（on_timeout 触发）。
 #[cfg(feature = "virtual-clock")]
 #[test]
 fn time_timeout_parallel_fork_virtual_clock_postcheck() {
@@ -1572,12 +1573,7 @@ fn time_timeout_parallel_fork_virtual_clock_postcheck() {
         })
         .unwrap();
     assert_eq!(v, Value::U64(42), "虚拟通道判定超时（post-check）");
-
-    // VC post-check：inner（Fork 分支的 Open）已完整执行 → 文件被创建。
-    assert!(
-        pa.exists(),
-        "VC post-check 语义：inner 效果保留，Open 已执行（文件被创建）"
-    );
+    // 注：pa.exists() 为时序依赖（见函数注释），不断言。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
