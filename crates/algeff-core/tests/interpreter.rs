@@ -1558,3 +1558,75 @@ fn replace_clears_registry() {
         .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(nfd > fd0, "fd 永不复用（决策 D1）");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// RFC-11 修复回归（A2 批 7）：解释器递归深度守卫。
+//
+// R4c 对抗发现 HIGH：`run_sub_impl` → `interpret_impl` 每层递归 ~13-20KB
+// 栈帧（debug），Windows 默认 2MB 测试线程栈下实测崩溃边界深度 ~104-108
+// （100/104 通过、108 即 STATUS_STACK_OVERFLOW 进程级 abort；R4c 审计记录
+// ~110-120 同量级），不受信任蓝图 ~百层嵌套即可使宿主进程崩溃（拒绝服务面）。
+// 修复：interpret_impl 递归入口维护嵌套深度计数器，超阈值（96，比实测边界
+// 留 ~8% 余量）返回 `SysError::Other(105)`（ENOBUFS「嵌套资源耗尽」语义）
+// 替代栈溢出 —— 守卫在栈溢出**之前**触发，错误可被外层 Catch 捕获。
+//
+// 以下 3 个测试覆盖：安全深度 64 不受影响；超深 200 返回可捕获错误且进程
+// 不 abort（测试能跑完即证明）；超深蓝图外包 Catch → handler 收到 Other(105)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 深度 depth 的嵌套 Sequential：current 为下一层；叶子返回 U64(300)，每层
+/// next 原样上抛（值保真）。与 `adversarial_r4c.rs::nested_seq` 同构。
+fn nested_seq_chain(depth: u64) -> Action {
+    if depth == 0 {
+        return Action::Pure(Value::U64(300));
+    }
+    Action::Sequential {
+        current: Box::new(nested_seq_chain(depth - 1)),
+        next: Box::new(Action::Pure),
+    }
+}
+
+/// RFC-11 a：安全深度 64 正常执行（与 R4c 固定安全深度一致，远低于守卫阈值
+/// 96 与实测崩溃边界 ~104）——守卫不误伤合法嵌套。
+#[test]
+fn deep_nesting_under_limit_ok() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(nested_seq_chain(64));
+    assert_eq!(
+        v,
+        Ok(Value::U64(300)),
+        "64 层嵌套应在守卫阈值（96）之下正常执行，收到 {v:?}"
+    );
+    assert!(rt.undo_stack().is_empty());
+}
+
+/// RFC-11 b：深度 200（Windows debug 会溢出的量级）→ 守卫在栈溢出前触发，
+/// 返回 `Err(Other(105))` 且进程不 abort —— 测试本身能跑完即证明未发生
+/// STATUS_STACK_OVERFLOW。
+#[test]
+fn deep_nesting_over_limit_returns_error() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(nested_seq_chain(200));
+    assert_eq!(
+        v,
+        Err(SysError::Other(105)),
+        "超深嵌套应返回深度守卫错误（ENOBUFS=105 语义近似），收到 {v:?}"
+    );
+}
+
+/// RFC-11 c：超深蓝图外包 Catch → 守卫错误可被捕获（拒绝服务面转为可恢复
+/// 错误）：handler 收到 Other(105) 并执行。
+#[test]
+fn deep_nesting_catchable() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let action = Action::Catch {
+        action: Box::new(nested_seq_chain(200)),
+        handler: Box::new(|e| Action::Pure(Value::Str(format!("handled:{e}")))),
+    };
+    let v = rt.run_blocking(action);
+    assert_eq!(
+        v,
+        Ok(Value::Str("handled:Other(105)".to_string())),
+        "Catch 应捕获深度守卫错误并执行 handler，收到 {v:?}"
+    );
+}

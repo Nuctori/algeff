@@ -425,8 +425,10 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 ### RFC-10：Windows 原生错误码未映射至 POSIX 语义（R4b 对抗发现）
 
-`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE，**未测**——登记表引用的测试仅覆盖文件面，UDP 面待补断言）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
+=======
+`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
 
 ### RFC-11：解释器嵌套蓝图无递归深度上限 → 进程级栈溢出（R4c 对抗发现）
 
-`run_sub_impl`（runtime.rs:277）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下 **深度 ~110-120 即 STATUS_STACK_OVERFLOW 进程级 abort**（release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。修复方向（A2 批 7 实施中，runtime.rs 冻结面外）：解释器维护嵌套深度计数器，超阈值（**96**——实测 Windows 2MB 栈崩溃边界 ~104-108，留 ~8% 余量；128 会晚于崩溃触发）返回可捕获错误（`SysError::Other(105)`）替代栈溢出；长期可堆上延续（explicit work stack）。测试：`adversarial_r4c.rs` 固定安全深度 64 回归；修复后补「深度 200 蓝图返回 Err(Other(105)) 而非 abort」断言。
+`run_sub_impl`（runtime.rs）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下实测崩溃边界深度 ~104-108（100/104 通过、108 即 STATUS_STACK_OVERFLOW 进程级 abort；R4c 审计记录 ~110-120 同量级；release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。
+
