@@ -238,6 +238,16 @@ pub struct ResourceRegistry {
     fork_region: Option<(Fd, Fd)>,
 }
 
+/// A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：捕获
+/// `ResourceRegistry` 的 `consumed`（Write 消费）与 `owned_consumed`
+/// （Own 终结）两集。由 `snapshot_linear` 产生、`rollback_linear_to`
+/// 消费（按「时段」回滚取消子树新增的线性标记）。
+#[derive(Default, Clone)]
+pub struct LinearSnapshot {
+    consumed: HashSet<Resource>,
+    owned_consumed: HashSet<Resource>,
+}
+
 impl ResourceRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -400,6 +410,30 @@ impl ResourceRegistry {
                 AccessMode::Read | AccessMode::Append => {}
             }
         }
+    }
+
+    /// 捕获当前 A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：
+    /// `check_linear` 预插入的 Write（`consumed`）/ Own（`owned_consumed`）
+    /// 消费标记两集。快照**不含**句柄表与 `next_fd`——取消回滚只移除取消
+    /// 子树新插入的线性标记，不动句柄（物理清理由 undo 负责）与 D1 单调
+    /// 游标（fd 永不复用）。
+    pub fn snapshot_linear(&self) -> LinearSnapshot {
+        LinearSnapshot {
+            consumed: self.consumed.clone(),
+            owned_consumed: self.owned_consumed.clone(),
+        }
+    }
+
+    /// 回滚线性状态至快照（取消传播协议，`Action::Timeout` 取消回滚用，
+    /// RFC-12 残余）：**移除**取消子树期间新增的 Write/Own 标记（当前集 ∖
+    /// 快照集），子树自身移除的标记（如 Replace 的 `clear`、失败路径的
+    /// `rollback_linear`）保持移除、不回补——只撤销新增，尊重子树自身的
+    /// 状态操作。与 `rollback_linear`（逐批回滚）互补：快照回滚按「时段」
+    /// 而非「批次」工作，适用于无法逐批跟踪的取消路径（inner future 被
+    /// 丢弃/中断后不再有逐批上下文）。
+    pub fn rollback_linear_to(&mut self, snap: &LinearSnapshot) {
+        self.consumed.retain(|r| snap.consumed.contains(r));
+        self.owned_consumed.retain(|r| snap.owned_consumed.contains(r));
     }
 
     /// 公理 A3 / 冲突矩阵（pdr.md §9.1）。保守默认：Append∥Append 视为不可并行
