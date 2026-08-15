@@ -1,11 +1,13 @@
 //! A5 集成测试：直接调用 `TokioExecutor::execute` + `ResourceRegistry`
 //! （不经 interpret——A2 的解释器在另一分支）。Registry 用 default + tempfile 目录。
+//! g4 的 Timeout 取消场景走完整 interpret 链路（`Runtime` + `run_blocking`，
+//! 复用 e2e.rs 的 D9 驱动模式：普通 `#[test]`）。
 
 use std::time::Duration;
 
 use algeff_core::{
-    DataOp, MmapProt, OpenFlags, PipeFlags, ResourceHandle, ResourceRegistry, SysError,
-    SyscallExecutor, Value,
+    AccessMode, Action, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceHandle,
+    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, Value,
 };
 use algeff_std::TokioExecutor;
 
@@ -416,6 +418,70 @@ async fn mutex_unlock_releases_arbiter() {
     if let Some(u2) = undo2 {
         u2.await;
     }
+}
+
+// ── g4. Timeout 取消不毒化 MutexLock id（R-1 MEDIUM 批 8：claim 取消泄漏修复）──
+// 蓝图：Timeout{ Sequential{ MutexLock(id) → Sleep(200ms) 慢操作 }, 20ms, on_timeout }。
+// Sleep 使内层 future 在到期时仍 pending → Elapsed → runtime 丢弃内层 future
+// （runtime.rs Timeout 语义）→ 走 on_timeout。取消后撤销栈仍保留 MutexLock 的
+// undo（占坑是「待 recover 释放」而非「泄漏」）；recover（Replace 触发，D10）
+// 后同一 executor 再次 MutexLock 同 id 必须成功（非永久 WouldBlock）。
+
+#[test]
+fn mutex_claim_released_on_timeout_cancel() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let id = 77u64;
+    let claim = vec![ResourceUsage {
+        resource: Resource::Fd(id),
+        mode: AccessMode::Write,
+    }];
+    // MutexLock(id) 后接慢操作 Sleep(200ms)：短 duration(20ms) 必 Elapsed。
+    let inner = Action::Sequential {
+        current: Box::new(Action::Syscall {
+            op: DataOp::MutexLock { id },
+            resources: claim.clone(),
+            next: Box::new(move |_| Action::Sleep {
+                duration: Duration::from_millis(200),
+                next: Box::new(|_| Action::Pure(Value::Unit)),
+            }),
+        }),
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    let blueprint = Action::Timeout {
+        action: Box::new(inner),
+        duration: Duration::from_millis(20),
+        on_timeout: Box::new(Action::Pure(Value::Unit)),
+    };
+    // 执行蓝图：20ms 后 Elapsed，内层 future（已完成的 MutexLock + pending 的
+    // Sleep）被丢弃，on_timeout 生效并返回。
+    assert_eq!(rt.run_blocking(blueprint).unwrap(), Value::Unit);
+    // 取消语义：内层完成的 undo 保留在撤销栈（占坑待 recover 释放，而非泄漏）。
+    // 此刻再次 MutexLock 同 id → 占坑仍在 → 有限重试后 WouldBlock（不挂死）。
+    let probe = Action::Syscall {
+        op: DataOp::MutexLock { id },
+        resources: Vec::new(),
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    assert_eq!(
+        rt.run_blocking(probe).unwrap_err(),
+        SysError::WouldBlock,
+        "取消后、recover 前占坑应仍持有（undo 栈保留释放职责）"
+    );
+    // recover（Replace：先 recover 后执行 target，D10）→ undo 释放占坑与物理锁。
+    assert_eq!(
+        rt.run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap(),
+        Value::Unit
+    );
+    // 同一 executor 再次 MutexLock 同 id：占坑已释放 → 成功（非永久 WouldBlock）。
+    let again = Action::Syscall {
+        op: DataOp::MutexLock { id },
+        resources: claim,
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    assert_eq!(rt.run_blocking(again).unwrap(), Value::Unit);
 }
 
 // ── h. 子进程退出码 ────────────────────────────────────────────────────
