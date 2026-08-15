@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use algeff_core::{
     Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, ResourceInner,
-    ResourceUsage, Signal, TypedResource,
+    ResourceUsage, Signal, TypedResource, Value,
 };
 
 /// 构造一个 next 为 `Pure` 的 Syscall 节点。
@@ -192,5 +192,38 @@ pub fn sleep(duration: Duration) -> Action {
     Action::Sleep {
         duration,
         next: Box::new(Action::Pure),
+    }
+}
+
+// ── 值流组合器（RFC-A5-3：让值流可组合，pdr.md §14 编程体验）────────────
+
+/// 值流接续：`prev` 执行完毕后，其**最终值**交给 `f(v)` 构造下一段 Action
+/// （CPS 链）。若 `prev` 为 `Pure(v)`（无运行时步骤）直接返回 `f(v)`；否则
+/// 包装为 `Action::Sequential { current: prev, next: f }`——解释器对
+/// Sequential 先完整执行 `current` 子树，再将其最终值交付给 `next`，与 CPS
+/// 接续语义等价。fd 等中间值经闭包词法捕获贯穿整条链（TCP 客户端蓝图
+/// 示例见 `tests/adapters_flow.rs` 的 `tcp_client_blueprint`）。
+pub fn and_then(prev: Action, f: impl FnOnce(Value) -> Action + 'static) -> Action {
+    match prev {
+        Action::Pure(v) => f(v),
+        other => Action::Sequential {
+            current: Box::new(other),
+            next: Box::new(f),
+        },
+    }
+}
+
+/// 忽略值接续：`prev` 执行完毕后无条件执行 `next`（`and_then` 便捷包装）。
+pub fn then(prev: Action, next: Action) -> Action {
+    and_then(prev, move |_| next)
+}
+
+/// 列表折叠为 Sequential 链（`then` 的左折叠版本；值传递由闭包词法捕获完成）。
+/// 空列表 → `Pure(Unit)`；单元素 → 原样返回。
+pub fn seq(actions: Vec<Action>) -> Action {
+    let mut iter = actions.into_iter();
+    match iter.next() {
+        None => Action::Pure(Value::Unit),
+        Some(first) => iter.fold(first, then),
     }
 }
