@@ -63,7 +63,7 @@
 | D13 | `ResourceRegistry` 实现 `Clone` | Fork 并行时子任务隔离状态，完成后合并回父（A1 审计补录） |
 | D14 | Fork 阶段 1 语义：静态冲突检测 + 顺序执行（left→right→combine）；并行化由 A7 基准驱动（阶段 3） | A3 交换律是「可并行」而非「必须并行」；顺序执行保持 combine 语义且零状态共享风险 |
 | D15 | undo 闭包只能捕获物理资源数据（Arc 句柄/原内容/路径），禁止捕获 registry 引用 | execute 只拿到 &mut registry，闭包是 'static（审计补录） |
-| D16 | `ResourceArbiter`：动态资源仲裁原语（原子占坑+失败回滚，A7 工程载体），静态 can_parallel 管 Fork 级、动态 arbiter 管 MutexLock 级 | 审计补录；资源仲裁分层无循环等待 |
+| D16 | `ResourceArbiter`：动态资源仲裁原语（原子占坑+失败回滚，A7 工程载体）——仲裁分层：静态 can_parallel 管 Fork 级；动态 arbiter 为 MutexLock 级预留（接入待 C4 裁决，审查 Medium-1 修正措辞） | 审计补录；资源仲裁分层无循环等待 |
 | D17 | Fork 并行路径：executor 经 `Arc<Mutex<Box<dyn SyscallExecutor>>>` 共享；子任务隔离 registry/undo/context，完成后合并回父（handles/consumed/owned_consumed 并入，next_fd 取 max；undo 按 right-left 合并保持 LIFO）；无法满足 Send 边界时回退顺序 | D13 的完整落地（审计 blocker-1 修复中，A2 批 4 实施） |
 
 ## 4. 阶段门禁（CTO 执行）
