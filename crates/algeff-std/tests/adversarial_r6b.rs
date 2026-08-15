@@ -661,12 +661,11 @@ async fn r6b_pipe_write_no_reader_error_handle_restored() {
         },
     )
     .await;
-    #[cfg(windows)]
-    #[cfg(unix)]
+    // 两平台已统一（JD-1 kind-first）：无条件断言，禁止 cfg 双重门控。
     assert_eq!(
         e1,
         SysError::BrokenPipe,
-        "Unix：无读端写 → BrokenPipe（纯 kind → kind-first，JD-1 修复后；修复前 Other(0)）"
+        "无读端写 → BrokenPipe（纯 kind → kind-first，JD-1 修复后；修复前 Unix 为 Other(0)）"
     );
 
     // 第二次写：同一错误（非 NotFound）——put_back 已恢复句柄与映射。
@@ -698,8 +697,9 @@ async fn r6b_pipe_write_no_reader_error_handle_restored() {
 }
 
 /// SendFile 错误面（Runtime 层）：
-/// (a) 输出侧为无读端管道写端 → 与 op_write 管道路径同源错误（Windows
-///     BrokenPipe / Unix Other(0)，同上注明）；输入侧文件 fd 不受影响
+/// (a) 输出侧为无读端管道写端 → 与 op_write 管道路径同源错误（两平台均
+///     BrokenPipe——JD-1 kind-first 统一；修复前 Unix 为 Other(0)）；输入侧
+///     文件 fd 不受影响（Seek+Read 仍可用，错误路径不丢输入句柄）；
 ///     （Seek+Read 仍可用，错误路径不丢输入句柄）；
 /// (b) out == input 自拷贝 → InvalidInput（无 io、无状态变化）。
 /// 句柄恢复（put_back）的重复错误断言见
@@ -857,12 +857,11 @@ async fn r6b_send_file_error_handle_restored() {
         len: 3,
     };
     let e1 = exec_err(&mut ex, &mut reg, &op).await;
-    #[cfg(windows)]
-    #[cfg(unix)]
+    // 两平台已统一（JD-1 kind-first）：无条件断言，禁止 cfg 双重门控。
     assert_eq!(
         e1,
         SysError::BrokenPipe,
-        "Unix：SendFile 到无读端管道 → BrokenPipe（纯 kind → kind-first，JD-1 修复后）"
+        "SendFile 到无读端管道 → BrokenPipe（纯 kind → kind-first，JD-1 修复后）"
     );
 
     // 第二次 SendFile：同一错误（非 NotFound）——输出句柄已恢复（blocker-3）。
