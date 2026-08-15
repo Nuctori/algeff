@@ -74,7 +74,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 
 - **D1–D14**：批 5 终审结论 **12 项完全落地 + D10/D13 核心语义落地**；本批复核 D10/D13 缺口已由 C1/C2 核销 → **D1–D14 全部完全落地**（final-audit §2 表格逐项证据：D1 唯一句柄 / D2 Box 递归 / D3 BoxFuture / D4 UndoOp / D5 duplex / D6 保守并行 / D7 typestate / D8 SendFile.input / D9 自持 reactor / D10 Replace 语义 / D11 Alloc / D12 词法规范化 / D13 Clone+merge / D14 冲突检测+调度）。
 - **D15**（undo 闭包只捕获物理数据，禁捕 registry 引用）：`executor.rs` undo 闭包均捕获 Arc 句柄/原内容/路径（`op_write`/`op_truncate`/`op_rename`/`op_mutex_lock` 等），无 registry 引用捕获 —— ✅ **落地**。
-- **D16**（ResourceArbiter 动态仲裁原语）：`resource.rs:385` + `tests/arbiter.rs` 8 项 + proptest + 并发层 —— ✅ **落地**（MutexLock 级接入待 C4 裁决，D16 措辞已如实记录）。
+- **D16**（ResourceArbiter 动态仲裁原语）：`resource.rs:385` + `tests/arbiter.rs` 8 项 + proptest + 并发层 —— ✅ **落地**（MutexLock 级已接入：A5 批 7-9 `254eaf3`/`f897669`/`4c993f3`，D-034）。
 - **D17**（Fork 并行路径：`Arc<Mutex<Box<dyn SyscallExecutor + Send>>>` 共享 + 子任务隔离 + 合并回父 + Send 边界不满足时回退顺序）：`runtime.rs` `SharedExecutor`（:285）/`run_fork_parallel`（spawn_blocking 双线程 + `drive` current-thread runtime）；调度判定 `parallel = !conflict && matches!(&access, ExecAccess::Shared(_))` —— **Direct 公共签名路径恒顺序（阶段 1 回退）、Shared Runtime 路径冲突即顺序**。A2 批 5（`38bca67`）：原 `SendExecutor` **unsafe 包装已删除**，改由 D19 `SyscallExecutor: Send` 超 trait + `Runtime::new(Box<dyn SyscallExecutor + Send>)` 编译期强制（见 §4 残余-5）—— ✅ **落地**。
 - **D18**（四闭包类型别名 `+ Send`，Action 变 Send）：`action.rs:41-44` `NextFn`/`CondFn`/`CombineFn`/`HandlerFn` 均 `+ Send`；`adapters.rs`/测试闭包全部满足 Send 约束（`2f612f9` 集成修复使其全量编译）—— ✅ **落地**。
 - **D19**（`SyscallExecutor: Send` 超 trait + `Runtime::new(Box<dyn SyscallExecutor + Send>)` + 删除 unsafe 包装）：`syscall.rs:27` `pub trait SyscallExecutor: Send`；`runtime.rs::Runtime::new` 签名改为 `Box<dyn SyscallExecutor + Send>`；原 `SendExecutor` unsafe 包装整体删除（`38bca67`，D19 补录 `fac7b38`）—— ✅ **落地**（编译期强制执行器 Send，消除 unsafe 健全性风险，§4 残余-5 已修复）。
@@ -108,7 +108,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 
 1. **所有公理被证明/测试覆盖** —— ✅ 满足：A1–A4、A6–A7 全部「已验证」（执行级），A5 语义层已验证（Choose/Fork 隔离 + 并行路径），物理层 make_mut 归阶段 3（规范边界内非阻塞）；P1–P5 对应闭环（A3 双序 commutation 已由 `tests/commutation.rs` 补录，`4e2dc9e`）。批 7 复核 `cargo test --workspace` **157/157 全绿（25 测试二进制）**（批 6 151 基线上 + commutation 3 + interpreter 3）。
 2. **性能满足预期** —— ⚠️ 条件满足（条件-1 已交付）：静态路径达标（echo 103.1% ≈ 预期 103%，批 4 复测无回归；append 24.3% 优于预期）；并行类复测确认未回归（parallel_reads 366.2% / shared_read 570.9%），偏离归因 **executor 互斥锁串行化 + 同 fd 游标读**（pdr §17 已知局限，规范自认局限，工程缓解待阶段 3+，§4 残余-6）——接受，无 blocker。
-3. **合并主分支、冻结 API** —— ✅ 满足：worktree = main @ `fac7b38` 零落后（C5 核销）；D1–D19 决策表与代码逐项一致（C1 经 A2 批 5 复核、R-5 已修复）、冻结类型 §2 零漂移（唯一签名变化 `Runtime::new` `+ Send` 已由 D19 契约化）；批 5 条件清单中 C1/C2/C3/C5 全部核销，C4 观察项按「接受+待办」处理（R-1）。
+3. **合并主分支、冻结 API** —— ✅ 满足：worktree = main 零落后（C5 核销）；D1–D19 决策表与代码逐项一致（C1 经 A2 批 5 复核、R-5 已修复）、冻结类型 §2 零漂移（唯一签名变化 `Runtime::new` `+ Send` 已由 D19 契约化）；批 5 条件清单中 C1/C2/C3/C5 全部核销，C4 已核销（A5 批 7-9，R-1 翻绿 D-034）。
 
 **条件清单（核销后 G4 正式放行）**：
 
