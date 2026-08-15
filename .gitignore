@@ -2,3 +2,4 @@
 .wt/
 .pi/
 .pi-subagents/
+*.proptest-regressions
