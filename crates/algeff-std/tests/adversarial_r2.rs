@@ -26,7 +26,7 @@
 //! 3. **R1 修复回归**：
 //!    - 游标撤销在嵌套 Sequential + Replace 组合下仍成立；
 //!    - put_back 错误循环（TcpShutdown try_unwrap 分支）10 次后 fd 仍可用；
-//!    - RFC-05 偏差（Replace 后旧 fd 可写）在新代码上仍复现 + 分支级 Replace
+//!    - RFC-05 已修复（Replace 后旧 fd 写失败 NotFound）+ 分支级 Replace
 //!      不清父级 A4 状态的隔离语义。
 //! 4. **Fork 顺序/并行错误路径**：左分支 Err → 右分支副作用发生 → 错误传播
 //!    → Catch 捕获后右分支 merge 的句柄仍可见。
@@ -992,8 +992,8 @@ fn r1_putback_tcp_shutdown_10_rounds_fd_still_usable() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 3c：RFC-05 偏差回归 —— Replace 后旧 fd 可写在新代码上仍复现
-// （已知偏差，无需修复，确认测试记录仍准确）；另验证分支级 Replace 只
+// 攻击面 3c：RFC-05 回归 —— Replace 后旧 fd 写失败（修复验证，与 R1
+// lin_stale_fd_write_after_replace_fails 一致）；另验证分支级 Replace 只
 // 清分支 registry（父级 A4 状态隔离保留）。
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1073,24 +1073,28 @@ fn r1_stale_fd_write_after_replace_recheck() {
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), seed, "父级 Replace 已恢复内容");
 
-    // RFC-05 偏差复现：executor.files 仍持有旧 fd 强引用 → 旧 fd 可写且
-    // 物理落盘（与 R1 lin_stale_fd_write_after_replace_succeeds 记录一致）。
-    let v = rt.run_blocking(syscall(
-        DataOp::Write {
-            fd,
-            data: b"ZZ".to_vec(),
-        },
-        vec![wr(fd)],
-        Action::Pure,
-    ));
-    assert!(
-        v.is_ok(),
-        "偏差复现：父级 Replace 后旧 fd Write 仍成功（executor 侧句柄残留，RFC-05）"
+    // RFC-05 已修复：父级 Replace 后旧 fd Write 必须失败（NotFound）——registry
+    // 是 fd 活性唯一真相，executor 侧 files 缓存不得绕过（与 R1
+    // lin_stale_fd_write_after_replace_fails 一致）。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"ZZ".to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "RFC-05 修复后：父级 Replace 后旧 fd Write 必须失败"
     );
-    assert_ne!(
+    assert_eq!(
         std::fs::read(&pa).unwrap(),
         seed,
-        "偏差复现：旧 fd 的写确实物理落盘"
+        "旧 fd 写失败 → 恢复后的内容不再被破坏"
     );
 }
 
