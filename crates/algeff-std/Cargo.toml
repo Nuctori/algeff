@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Algeff 标准适配层：tokio 物理后端（DataOp 执行器 + 预包装适配器）"
 
 [dependencies]
-algeff-core = { path = "../algeff-core" }
+algeff-core = { path = "../algeff-core", version = "0.1.0" }
 tokio.workspace = true
 
 [dev-dependencies]
