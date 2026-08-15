@@ -23,6 +23,7 @@ dependencies = [
 name = "algeff-macro"
 version = "0.1.0"
 dependencies = [
+ "algeff-core",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
