@@ -185,8 +185,10 @@ pub enum ResourceHandle {
 pub struct ResourceRegistry {
     next_fd: Fd,
     handles: HashMap<Fd, ResourceHandle>,
-    /// A4 线性检查：Write/Own 已在当前执行路径上被消费的资源。
+    /// A4 线性检查：Write 已消费的资源（每资源至多一次）。
     consumed: HashSet<Resource>,
+    /// A4 线性检查：Own 已终结的资源（Own 之后该资源任何 usage 都拒绝）。
+    owned_consumed: HashSet<Resource>,
 }
 
 impl ResourceRegistry {
@@ -215,13 +217,38 @@ impl ResourceRegistry {
         self.handles.remove(&fd);
     }
 
-    /// 公理 A4 线性检查（运行时断言）：Write/Own 在一条执行路径上恰好消费一次。
-    /// 通过则登记消费；重复消费返回 `InvalidInput`。
+    /// 清空注册表状态（handles/consumed/owned_consumed），供 A2 的 `Replace`
+    /// （决策 D10）使用：替换蓝图时释放当前执行路径积累的资源与线性标记。
+    /// 注意：`next_fd` 不复位 —— Fd 全局唯一、单调递增、永不复用（决策 D1）。
+    pub fn clear(&mut self) {
+        self.handles.clear();
+        self.consumed.clear();
+        self.owned_consumed.clear();
+    }
+
+    /// 公理 A4 线性检查（运行时断言）：
+    /// - Write：每资源至多一次（重复 Write 拒绝）；
+    /// - Own：终结操作（Own 之后该资源任何 usage —— Read/Write/Append/Own —— 都拒绝）；
+    /// - Read/Append：不限次数。
+    ///
+    /// Write 与 Own 分属不同消费集：`Write → Close(Own)` 是合法序列（pdr.md §14 示例）。
     pub fn check_linear(&mut self, usage: &ResourceUsage) -> Result<(), SysError> {
-        if matches!(usage.mode, AccessMode::Write | AccessMode::Own)
-            && !self.consumed.insert(usage.resource.clone()) {
-                return Err(SysError::InvalidInput);
+        let r = &usage.resource;
+        // Own 为终结：先于一切模式检查。
+        if self.owned_consumed.contains(r) {
+            return Err(SysError::InvalidInput);
+        }
+        match usage.mode {
+            AccessMode::Write => {
+                if !self.consumed.insert(r.clone()) {
+                    return Err(SysError::InvalidInput);
+                }
             }
+            AccessMode::Own => {
+                self.owned_consumed.insert(r.clone());
+            }
+            AccessMode::Read | AccessMode::Append => {}
+        }
         Ok(())
     }
 
@@ -336,11 +363,100 @@ mod tests {
     }
 
     #[test]
-    fn linearity_read_repeatable() {
+    fn linearity_write_then_own_legal() {
+        // Write → Close(Own) 是合法序列（pdr.md §14 示例）：Write 消费一次，
+        // Own 终结，二者互不排斥。
         let mut reg = ResourceRegistry::new();
-        let u = usage(Resource::Fd(1), AccessMode::Read);
-        assert!(reg.check_linear(&u).is_ok());
-        assert!(reg.check_linear(&u).is_ok());
+        let r = Resource::Fd(1);
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+    }
+
+    #[test]
+    fn linearity_own_is_terminal() {
+        let mut reg = ResourceRegistry::new();
+        let r = Resource::Fd(1);
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+        // Own 之后任何 usage（Read/Write/Append/Own）都拒绝
+        for mode in [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::Append,
+            AccessMode::Own,
+        ] {
+            assert_eq!(
+                reg.check_linear(&usage(r.clone(), mode)),
+                Err(SysError::InvalidInput),
+                "Own 之后 {mode:?} 应被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn linearity_read_append_repeatable() {
+        let mut reg = ResourceRegistry::new();
+        let r = Resource::Fd(1);
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Read)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Read)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Append)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Append)).is_ok());
+    }
+
+    #[test]
+    fn clear_resets_linear_state_and_handles() {
+        let mut reg = ResourceRegistry::new();
+        let fd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        let r = Resource::Fd(fd);
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+        assert_eq!(
+            reg.check_linear(&usage(r.clone(), AccessMode::Read)),
+            Err(SysError::InvalidInput)
+        );
+
+        reg.clear();
+        // 句柄与线性标记全部清空；fd 分配仍单调递增（不重用）
+        assert!(reg.lookup(fd).is_none());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+    }
+
+    #[test]
+    fn conflict_matrix_exhaustive_4x4() {
+        // 4×4 AccessMode 对 × 同资源/异资源，断言符合 pdr.md §9.1 冲突矩阵。
+        let modes = [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::Append,
+            AccessMode::Own,
+        ];
+        let reg = ResourceRegistry::new();
+        for &m1 in &modes {
+            for &m2 in &modes {
+                // 同资源：仅 Read×Read 并行；Append×Append 需显式 opt-in（决策 D6）；
+                // Read×Write / Write×Write / Own×任何 一律串行。
+                let a = vec![usage(Resource::Fd(1), m1)];
+                let b = vec![usage(Resource::Fd(1), m2)];
+                let same_expected = matches!((m1, m2), (AccessMode::Read, AccessMode::Read));
+                assert_eq!(
+                    reg.can_parallel(&a, &b),
+                    same_expected,
+                    "同资源 {m1:?} × {m2:?}"
+                );
+
+                // 异资源：Δ(a) ∩ Δ(b) = ∅，任何模式组合都可并行（公理 A3）。
+                let a2 = vec![usage(Resource::Fd(1), m1)];
+                let b2 = vec![usage(Resource::Fd(2), m2)];
+                assert!(
+                    reg.can_parallel(&a2, &b2),
+                    "异资源 {m1:?} × {m2:?}"
+                );
+            }
+        }
+        // Append×Append 顺序无关时 opt-in 并行（pdr.md §9.1 / 决策 D6）
+        let a = vec![usage(Resource::Fd(1), AccessMode::Append)];
+        let b = vec![usage(Resource::Fd(1), AccessMode::Append)];
+        assert!(reg.can_parallel_with(&a, &b, true));
     }
 
     #[test]

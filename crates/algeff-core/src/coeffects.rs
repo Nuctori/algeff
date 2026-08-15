@@ -1,9 +1,10 @@
 //! 反应式余效应（pdr.md §5.2，可选 feature `coeffects`）。
 //!
 //! A3 拥有本文件：DependencyTable、CoeffectStore（可逆 set）、
-//! Component 生命周期回调与 notify 驱动的激活/停用。
+//! Component 生命周期回调、ComponentRegistry（notify 驱动的激活/停用）。
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::action::Value;
@@ -83,21 +84,135 @@ impl CoeffectStore {
     }
 }
 
-/// 组件：依赖规范 d ⊆ K + 生命周期回调（A3 完善回调语义）。
-#[derive(Debug, Default, Clone)]
+/// 组件：依赖规范 d ⊆ K + 生命周期回调（pdr.md §5.2.2）。
+///
+/// 回调为 `FnMut`（可捕获可变状态），仅在 `ComponentRegistry::sync` 检测到
+/// 状态翻转（Activating/Deactivating）时调用。回调不参与 Clone/序列化：
+/// 克隆组件时回调被丢弃（None），避免共享闭包状态产生不可预期行为。
+#[derive(Default)]
 pub struct Component {
     pub name: String,
     pub deps: HashSet<DepKey>,
+    on_activate: Option<Box<dyn FnMut() + Send>>,
+    on_deactivate: Option<Box<dyn FnMut() + Send>>,
+}
+
+impl Clone for Component {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            deps: self.deps.clone(),
+            // 闭包不可克隆：克隆体不携带回调。
+            on_activate: None,
+            on_deactivate: None,
+        }
+    }
+}
+
+impl fmt::Debug for Component {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Component")
+            .field("name", &self.name)
+            .field("deps", &self.deps)
+            .field("on_activate", &self.on_activate.is_some())
+            .field("on_deactivate", &self.on_deactivate.is_some())
+            .finish()
+    }
 }
 
 impl Component {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), deps: HashSet::new() }
+        Self {
+            name: name.into(),
+            deps: HashSet::new(),
+            on_activate: None,
+            on_deactivate: None,
+        }
     }
 
     pub fn depends_on(mut self, k: DepKey) -> Self {
         self.deps.insert(k);
         self
+    }
+
+    /// 绑定激活回调：依赖从「不满足」翻转为「满足」（notify = Activating）时调用。
+    pub fn on_activate(mut self, f: impl FnMut() + Send + 'static) -> Self {
+        self.on_activate = Some(Box::new(f));
+        self
+    }
+
+    /// 绑定停用回调：依赖从「满足」翻转为「不满足」（notify = Deactivating）时调用。
+    pub fn on_deactivate(mut self, f: impl FnMut() + Send + 'static) -> Self {
+        self.on_deactivate = Some(Box::new(f));
+        self
+    }
+}
+
+/// 组件注册表：管理组件列表与各组件「上次满足状态」（pdr.md §5.2.2 notify 的工程载体）。
+///
+/// `sync` 对每个组件取 `store.snapshot()` 计算依赖是否满足（σ⊨d ⇔ d ⊆ dom(σ)），
+/// 与上次状态比较得到 Activation：翻转时触发对应生命周期回调并返回事件列表。
+/// `last_satisfied` 是 notify(σ, σ′, d) 中 σ⊨d 的折叠结果，避免为每个组件保留完整
+/// 依赖表快照；组件初始视为「未满足」，首次满足即产生 Activating。
+#[derive(Debug, Default)]
+pub struct ComponentRegistry {
+    components: Vec<Component>,
+    last_satisfied: Vec<bool>,
+}
+
+impl ComponentRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 注册组件，返回其索引。
+    pub fn register(&mut self, component: Component) -> usize {
+        let idx = self.components.len();
+        self.components.push(component);
+        self.last_satisfied.push(false);
+        idx
+    }
+
+    pub fn components(&self) -> &[Component] {
+        &self.components
+    }
+
+    /// 查询组件最近一次 `sync` 时的满足状态。
+    pub fn last_satisfied(&self, idx: usize) -> Option<bool> {
+        self.last_satisfied.get(idx).copied()
+    }
+
+    /// 基于 `store` 当前快照同步全部组件：状态翻转时触发回调，返回
+    /// `(组件索引, Activation)` 事件列表（仅含 Activating/Deactivating）。
+    pub async fn sync(&mut self, store: &CoeffectStore) -> Vec<(usize, Activation)> {
+        let snapshot = store.snapshot().await;
+        let mut events = Vec::new();
+        for (idx, comp) in self.components.iter_mut().enumerate() {
+            let satisfied = comp.deps.iter().all(|k| snapshot.contains(k));
+            let prev = self.last_satisfied[idx];
+            let activation = match (prev, satisfied) {
+                (false, true) => Activation::Activating,
+                (true, false) => Activation::Deactivating,
+                _ => Activation::Neutral,
+            };
+            self.last_satisfied[idx] = satisfied;
+            match activation {
+                Activation::Activating => {
+                    if let Some(cb) = comp.on_activate.as_mut() {
+                        cb();
+                    }
+                    events.push((idx, activation));
+                }
+                Activation::Deactivating => {
+                    if let Some(cb) = comp.on_deactivate.as_mut() {
+                        cb();
+                    }
+                    events.push((idx, activation));
+                }
+                Activation::Neutral => {}
+            }
+        }
+        events
     }
 }
 
@@ -139,5 +254,94 @@ mod tests {
         s2.entries.insert(1, Value::Unit);
         assert_eq!(notify(&s, &s2, &deps), Activation::Activating);
         assert_eq!(notify(&s2, &s, &deps), Activation::Deactivating);
+    }
+
+    #[tokio::test]
+    async fn registry_sync_activation_sequence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = CoeffectStore::new();
+        let mut reg = ComponentRegistry::new();
+        let activates = Arc::new(AtomicUsize::new(0));
+        let deactivates = Arc::new(AtomicUsize::new(0));
+        let a = Arc::clone(&activates);
+        let d = Arc::clone(&deactivates);
+        let idx = reg.register(
+            Component::new("svc")
+                .depends_on(1)
+                .on_activate(move || {
+                    a.fetch_add(1, Ordering::SeqCst);
+                })
+                .on_deactivate(move || {
+                    d.fetch_add(1, Ordering::SeqCst);
+                }),
+        );
+        assert_eq!(idx, 0);
+
+        // 初始空 store：依赖未满足 → 无事件、无回调
+        assert!(reg.sync(&store).await.is_empty());
+        assert_eq!(activates.load(Ordering::SeqCst), 0);
+        assert_eq!(deactivates.load(Ordering::SeqCst), 0);
+        assert_eq!(reg.last_satisfied(0), Some(false));
+
+        // 激活：注册依赖键 1
+        let undo = store.set(1, Value::U64(1)).await;
+        assert_eq!(reg.sync(&store).await, vec![(0, Activation::Activating)]);
+        assert_eq!(activates.load(Ordering::SeqCst), 1);
+        assert_eq!(deactivates.load(Ordering::SeqCst), 0);
+        assert_eq!(reg.last_satisfied(0), Some(true));
+
+        // 停用：撤销依赖键 1（set 的逆操作）
+        undo.await;
+        assert_eq!(reg.sync(&store).await, vec![(0, Activation::Deactivating)]);
+        assert_eq!(activates.load(Ordering::SeqCst), 1);
+        assert_eq!(deactivates.load(Ordering::SeqCst), 1);
+        assert_eq!(reg.last_satisfied(0), Some(false));
+
+        // 再激活：完整 激活→停用→再激活 序列
+        let _undo2 = store.set(1, Value::U64(2)).await;
+        assert_eq!(reg.sync(&store).await, vec![(0, Activation::Activating)]);
+        assert_eq!(activates.load(Ordering::SeqCst), 2);
+        assert_eq!(deactivates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_sync_multi_component_and_neutral() {
+        let store = CoeffectStore::new();
+        let mut reg = ComponentRegistry::new();
+        reg.register(Component::new("a").depends_on(1));
+        reg.register(Component::new("b").depends_on(2));
+
+        // 全部未满足：无事件
+        assert!(reg.sync(&store).await.is_empty());
+
+        let undo1 = store.set(1, Value::Unit).await;
+        assert_eq!(reg.sync(&store).await, vec![(0, Activation::Activating)]);
+        // 无状态变化：Neutral，不产生事件
+        assert!(reg.sync(&store).await.is_empty());
+
+        let undo2 = store.set(2, Value::Unit).await;
+        assert_eq!(reg.sync(&store).await, vec![(1, Activation::Activating)]);
+
+        // 全部撤销：按索引顺序逐个 Deactivating
+        undo1.await;
+        undo2.await;
+        assert_eq!(
+            reg.sync(&store).await,
+            vec![(0, Activation::Deactivating), (1, Activation::Deactivating)]
+        );
+    }
+
+    #[test]
+    fn component_clone_drops_callbacks() {
+        let c = Component::new("x")
+            .depends_on(7)
+            .on_activate(|| {})
+            .on_deactivate(|| {});
+        let c2 = c.clone();
+        assert_eq!(c2.name, "x");
+        assert!(c2.deps.contains(&7));
+        // 克隆体不携带回调（闭包不可克隆）
+        let _ = format!("{c:?}");
     }
 }
