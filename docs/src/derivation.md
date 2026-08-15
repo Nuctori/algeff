@@ -296,11 +296,14 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 - **parallel_reads 366.2%**：D17 并行路径**已触发**（10 文件零冲突 → `can_parallel=true` →
   分支线程并发），但读仍串行化——执行器互斥锁（`ExecAccess::Shared` 的 `Arc<Mutex<SendExecutor>>`）
   在 `exec_via` 中对**整个 execute（含物理 IO await）**持锁，跨分支所有 Syscall 串行通过该锁；
-  逐 Fork 节点 spawn_blocking + current-thread runtime 创建开销进一步抵消收益。**R-6**：锁边界
-  收窄（物理 IO 移出锁外）属 A2 域，待阶段 3+ 重构。
-- **shared_read 570.9%**：同 fd 游标读共用 `files[fd]` 文件互斥锁与游标（`op_read` 按序推进），
-  即使锁边界收窄也不并行，需位置读原语（执行器层，A5 域待办）；实测 8.58ms 反超 D14 顺序基线
-  （6.41ms）——D17 并行对同 fd 游标读是纯损失（诚实数据，不修饰）。
+   逐 Fork 节点 spawn_blocking + current-thread runtime 创建开销进一步抵消收益。**R-6（迭代 1，
+   fork_snapshot 快照通道）**：并行分支独占执行器实例、物理 IO 移出共享锁——复测 **366%→264%**
+   （`perf/baseline-it1-r6-2026-08-16.txt`）；残余瓶颈 = spawn_blocking 线程创建 + 分支 registry
+   克隆/merge + per-fd 锁（游标语义必需），pdr §16 目标未全兑现，方向：线程池复用 + registry
+   读快照 COW（阶段 2）。
+- **shared_read 570.9%→380.6%（R-6 后复测）**：同 fd 游标读共用 `files[fd]` 文件互斥锁与游标
+  （`op_read` 按序推进），即使锁边界收窄也不并行，需位置读原语（执行器层，A5 域待办）；
+  改善 33% 来自快照通道去除跨分支锁串行；游标串行本体未变（诚实数据，不修饰）。
 - **append 39.1%（R6 复测）**：走 D6 默认串行路径（顺序 Open{append}+Write+Close）；小负载下
   串行追加（2.36ms，R6 实测）快于原生 10 路并行追加（6.04ms）。**注意**：基线 24.3%/1.48ms 是
   af27ce9（R1 写可见性修复，D-039「Write 返回 ⇔ OS 落盘」契约）**之前**的历史值——修复后 Algeff
