@@ -24,6 +24,9 @@ use algeff_core::resource::{
 use algeff_core::runtime::{interpret, Context, Runtime, UndoStack};
 use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
 
+use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
+
 /// 本地 current-thread runtime 驱动（interpret future 非 Send，不能用多线程 block_on）。
 fn drive<F: Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -55,6 +58,12 @@ struct MockExecutor {
     delay: Duration,
     /// 是否在 Ok 时附带 undo。
     with_undo: bool,
+    /// registry 分配的 fd 序列（每次 Open/PipeOpen 追加；S6/A2 属性测试断言
+    /// 整棵 Fork 树分配的 fd 两两不相交）。
+    alloc_log: Arc<Mutex<Vec<u64>>>,
+    /// Open 分配的 fd → 路径记录（嵌套 Fork 映射覆盖检测载体：若并发分支撞 fd，
+    /// 后写覆盖先写 → 条目数 < Open 次数，读回内容张冠李戴）。
+    path_log: Arc<Mutex<HashMap<u64, PathBuf>>>,
 }
 
 impl MockExecutor {
@@ -107,7 +116,20 @@ impl SyscallExecutor for MockExecutor {
             if matches!(op, DataOp::Open { .. } | DataOp::PipeOpen { .. }) {
                 let fd =
                     registry.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+                self.alloc_log.lock().unwrap().push(fd);
+                if let DataOp::Open { path, .. } = op {
+                    self.path_log.lock().unwrap().insert(fd, path.clone());
+                }
                 return Ok((Value::Fd(fd), None));
+            }
+            // Read：若 fd 在本执行器开过（path_log 命中），返回路径内容 —— 供
+            // 「读回内容验证映射未被覆盖」断言（fd 撞档时内容张冠李戴）。
+            if let DataOp::Read { fd, len } = op {
+                if let Some(p) = self.path_log.lock().unwrap().get(fd).cloned() {
+                    let mut bytes = p.to_string_lossy().as_bytes().to_vec();
+                    bytes.truncate(*len);
+                    return Ok((Value::Bytes(bytes), None));
+                }
             }
             let out = match self.responses.get(&desc).cloned() {
                 Some(MockOutcome::Err(e)) => return Err(e),
@@ -1023,6 +1045,466 @@ fn fork_sequential_both_branches_allocate_fds_disjoint() {
     );
     assert!(reg.lookup(lfd).is_some(), "左分支句柄经 merge 以原 fd 可见");
     assert!(reg.lookup(rfd).is_some(), "右分支句柄经 merge 以原 fd 可见");
+}
+
+// ── 15. 嵌套 Fork fd 全局唯一区间（S6/A2 HIGH 修复）+ 顺序错误路径 ────────
+
+/// 构造嵌套 Fork 蓝图 `fork!( fork!(open(p1), open(p2)), open(p3) )`：三层
+/// 资源互不相交 → 两层 can_parallel 均 true（并行路径）/ Direct 恒顺序（顺序
+/// 路径）。内层 combine 记录 p1/p2 的 fd 并返回 List，外层 combine 记录 p3 的
+/// fd；`got` 最终收集 [p1, p2, p3] 三个 fd。
+fn nested_fork_action(p1: &str, p2: &str, p3: &str, got: Arc<Mutex<Vec<u64>>>) -> Action {
+    let got_inner = Arc::clone(&got);
+    let inner_fork = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from(p1),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path(p1.to_string()), AccessMode::Read)],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from(p2),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path(p2.to_string()), AccessMode::Read)],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::Fd(a), Value::Fd(b)) => {
+                let mut g = got_inner.lock().unwrap();
+                g.push(a);
+                g.push(b);
+                Action::Pure(Value::List(vec![Value::Fd(a), Value::Fd(b)]))
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let got_outer = Arc::clone(&got);
+    Action::Fork {
+        left: Box::new(inner_fork),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from(p3),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path(p3.to_string()), AccessMode::Read)],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::List(_), Value::Fd(c)) => {
+                got_outer.lock().unwrap().push(c);
+                Action::Pure(Value::Unit)
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    }
+}
+
+/// 断言 fd 列表两两不同，且每个 fd 在 registry 中可 lookup（句柄未被覆盖丢弃）。
+fn assert_fds_disjoint_lookupable(fds: &[u64], reg: &ResourceRegistry) {
+    let mut uniq = std::collections::HashSet::new();
+    for fd in fds {
+        assert!(uniq.insert(*fd), "fd 重复: {fd}，全部: {fds:?}");
+        assert!(
+            reg.lookup(*fd).is_some(),
+            "fd {fd} 句柄不可 lookup（覆盖丢弃）"
+        );
+    }
+    assert_eq!(uniq.len(), fds.len(), "fd 集合与列表一致");
+}
+
+/// 经 Runtime 读回 fd 内容（executor 的 fd→路径 记录为内容源）。
+fn read_back_rt(rt: &mut Runtime, fd: u64) -> Vec<u8> {
+    let action = Action::Sequential {
+        current: Box::new(syscall_step(
+            DataOp::Read { fd, len: 64 },
+            vec![usage(Resource::Fd(fd), AccessMode::Read)],
+        )),
+        next: Box::new(|v| match v {
+            Value::Bytes(b) => Action::Pure(Value::Bytes(b)),
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    match rt.run_blocking(action) {
+        Ok(Value::Bytes(b)) => b,
+        other => panic!("fd {fd} 读回失败: {other:?}"),
+    }
+}
+
+/// 经 Direct 通道读回 fd 内容（顺序路径版本）。
+fn read_back_direct(ex: &mut MockExecutor, reg: &mut ResourceRegistry, fd: u64) -> Vec<u8> {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let action = Action::Sequential {
+        current: Box::new(syscall_step(
+            DataOp::Read { fd, len: 64 },
+            vec![usage(Resource::Fd(fd), AccessMode::Read)],
+        )),
+        next: Box::new(|v| match v {
+            Value::Bytes(b) => Action::Pure(Value::Bytes(b)),
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    match drive(interpret(action, &mut ctx, &mut undo, reg, ex)) {
+        Ok(Value::Bytes(b)) => b,
+        other => panic!("fd {fd} 读回失败: {other:?}"),
+    }
+}
+
+/// HIGH（嵌套 Fork 碰撞）并行路径回归：`fork!(fork!(open,open), open)` 全不相交
+/// 资源 → 两层 can_parallel 均 true → 内外层右分支**并发**执行。批 5 修复下内层
+/// 右分支从「左分支当前 next_fd（未分配仍为 N）」+2^48 起分配 → 与外层右分支
+/// （N+2^48 起）分配**相同 fd** → executor fd→路径 映射互相覆盖 + merge 后写覆盖
+/// 先写（句柄静默丢失）。修复后：三个 fd 两两不同、父 registry 三句柄均可
+/// lookup、读回内容指向正确文件（映射未被覆盖）。
+#[test]
+fn fork_nested_parallel_fds_disjoint_and_readback() {
+    let ex = MockExecutor::new();
+    let path_log = ex.path_log.clone();
+    let got = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let mut rt = Runtime::new(Box::new(ex));
+
+    let action = nested_fork_action("/n-a", "/n-b", "/o-c", Arc::clone(&got));
+    let v = rt.run_blocking(action);
+    assert_eq!(v, Ok(Value::Unit), "嵌套 Fork 并行执行成功");
+
+    let mut fds = got.lock().unwrap().clone();
+    assert_eq!(fds.len(), 3, "combine 捕获三个分支 fd");
+    fds.sort_unstable();
+    assert_fds_disjoint_lookupable(&fds, rt.registry());
+
+    // executor 的 fd→路径 记录：三个 Open 各占唯一 fd（无覆盖）。
+    {
+        let log = path_log.lock().unwrap();
+        assert_eq!(log.len(), 3, "executor 记录三个唯一 fd→路径 映射（无覆盖）");
+        for fd in &fds {
+            assert!(
+                log.contains_key(fd),
+                "combine 的 fd {fd} 与 executor 记录一致"
+            );
+        }
+    }
+    // 读回内容验证映射未被覆盖：每 fd 读到对应路径字节。
+    let entries: Vec<(u64, PathBuf)> = {
+        let log = path_log.lock().unwrap();
+        log.iter().map(|(fd, p)| (*fd, p.clone())).collect()
+    };
+    for (fd, path) in entries {
+        let content = read_back_rt(&mut rt, fd);
+        assert_eq!(
+            String::from_utf8_lossy(&content),
+            path.to_string_lossy(),
+            "fd {fd} 读回内容应指向 {path:?}（映射未被覆盖）"
+        );
+    }
+}
+
+/// HIGH 嵌套修复的顺序路径回归：Direct 通道（interpret）Fork 恒顺序执行，嵌套
+/// 左分支内的右分支与外层右分支同样不能撞 fd（批 5 顺序路径同样相对偏移）。
+#[test]
+fn fork_nested_sequential_fds_disjoint_and_readback() {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let mut reg = ResourceRegistry::new();
+    let mut ex = MockExecutor::new();
+    let path_log = ex.path_log.clone();
+    let got = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    let action = nested_fork_action("/s-a", "/s-b", "/s-c", Arc::clone(&got));
+    let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+    assert_eq!(v, Ok(Value::Unit), "嵌套 Fork 顺序执行成功");
+
+    let mut fds = got.lock().unwrap().clone();
+    assert_eq!(fds.len(), 3, "combine 捕获三个分支 fd");
+    fds.sort_unstable();
+    assert_fds_disjoint_lookupable(&fds, &reg);
+
+    {
+        let log = path_log.lock().unwrap();
+        assert_eq!(log.len(), 3, "executor 记录三个唯一 fd→路径 映射（无覆盖）");
+    }
+    let entries: Vec<(u64, PathBuf)> = {
+        let log = path_log.lock().unwrap();
+        log.iter().map(|(fd, p)| (*fd, p.clone())).collect()
+    };
+    for (fd, path) in entries {
+        let content = read_back_direct(&mut ex, &mut reg, fd);
+        assert_eq!(
+            String::from_utf8_lossy(&content),
+            path.to_string_lossy(),
+            "fd {fd} 读回内容应指向 {path:?}（映射未被覆盖）"
+        );
+    }
+}
+
+/// 深层嵌套（3 层）冒烟：`fork!( fork!( fork!(open,open), open ), open )`
+/// 并行路径，四个 fd 两两不同且全部可 lookup。
+#[test]
+fn fork_nested_depth3_smoke() {
+    let ex = MockExecutor::new();
+    let got = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let mut rt = Runtime::new(Box::new(ex));
+
+    let got_ii = Arc::clone(&got);
+    let inner_inner = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/d1"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/d1".to_string()), AccessMode::Read)],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/d2"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/d2".to_string()), AccessMode::Read)],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::Fd(a), Value::Fd(b)) => {
+                let mut g = got_ii.lock().unwrap();
+                g.push(a);
+                g.push(b);
+                Action::Pure(Value::List(vec![Value::Fd(a), Value::Fd(b)]))
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let got_mid = Arc::clone(&got);
+    let middle = Action::Fork {
+        left: Box::new(inner_inner),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/d3"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/d3".to_string()), AccessMode::Read)],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::List(mut vs), Value::Fd(c)) => {
+                got_mid.lock().unwrap().push(c);
+                vs.push(Value::Fd(c));
+                Action::Pure(Value::List(vs))
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let got_outer = Arc::clone(&got);
+    let action = Action::Fork {
+        left: Box::new(middle),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/d4"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/d4".to_string()), AccessMode::Read)],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::List(_), Value::Fd(c)) => {
+                got_outer.lock().unwrap().push(c);
+                Action::Pure(Value::Unit)
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+
+    let v = rt.run_blocking(action);
+    assert_eq!(v, Ok(Value::Unit), "3 层嵌套 Fork 执行成功");
+
+    let mut fds = got.lock().unwrap().clone();
+    assert_eq!(fds.len(), 4, "combine 捕获四个 fd");
+    fds.sort_unstable();
+    assert_fds_disjoint_lookupable(&fds, rt.registry());
+}
+
+/// 审查 MEDIUM-2：顺序 Fork 左分支 Err → 右分支仍执行（op 记录）、merge 发生
+/// （两分支 Write 线性标记并入父）、错误传播；recover 按 right→left 撤销
+/// （LIFO：右分支效果后发生、先撤销）。
+#[test]
+fn fork_sequential_left_error_right_still_executes_and_merges() {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let mut reg = ResourceRegistry::new();
+    let mut ex = MockExecutor::new();
+    ex.with_undo = true;
+    ex.respond("write:1", MockOutcome::Value(Value::U64(10)));
+    ex.respond("write:3", MockOutcome::Err(SysError::NotFound));
+    ex.respond("write:2", MockOutcome::Value(Value::U64(20)));
+    let undo_log = Arc::clone(&ex.undo_log);
+
+    // 左分支：先 Ok（压 undo）再 Err（传播）；右分支：Ok（压 undo）。
+    // Direct 通道（interpret）→ 恒顺序路径，与冲突无关。
+    let left = Action::Sequential {
+        current: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![0x01],
+            },
+            vec![usage(Resource::Fd(1), AccessMode::Write)],
+        )),
+        next: Box::new(|_| {
+            syscall_step(
+                DataOp::Write {
+                    fd: 3,
+                    data: vec![0x03],
+                },
+                vec![usage(Resource::Fd(3), AccessMode::Write)],
+            )
+        }),
+    };
+    let right = syscall_step(
+        DataOp::Write {
+            fd: 2,
+            data: vec![0x02],
+        },
+        vec![usage(Resource::Fd(2), AccessMode::Write)],
+    );
+    let action = Action::Fork {
+        left: Box::new(left),
+        right: Box::new(right),
+        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+    };
+
+    let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+    assert_eq!(v, Err(SysError::NotFound), "左分支 Err 传播");
+    assert_eq!(
+        ex.ops(),
+        vec!["write:1", "write:3", "write:2"],
+        "右分支在左分支 Err 后仍执行（left→right 顺序）"
+    );
+    // merge 发生：两分支的 Write 线性标记并入父。
+    for fd in [1u64, 2, 3] {
+        assert_eq!(
+            reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write)),
+            Err(SysError::InvalidInput),
+            "分支 fd {fd} 的 Write 消费经 merge 并入父"
+        );
+    }
+    // recover 按 right→left 撤销（LIFO：右分支效果后发生、先撤销）。
+    drive(undo.recover());
+    assert_eq!(
+        *undo_log.lock().unwrap(),
+        vec!["undo(write:2)".to_string(), "undo(write:1)".to_string()],
+        "recover 先撤销右分支再左分支"
+    );
+}
+
+// ── 16. 嵌套 Fork 通用属性（proptest，CTO 追加防复发）──────────────────────
+
+/// Fork 树形状（属性测试用）：叶 = 单个 Open Syscall；内部节点 = 左右子形状。
+#[derive(Debug, Clone)]
+enum TreeShape {
+    Leaf,
+    Fork(Box<TreeShape>, Box<TreeShape>),
+}
+
+/// 随机 Fork 树形状策略：Fork 嵌套深度 ∈ [1, max_depth]（调用方传 max_depth+1
+/// 允许最深 max_depth 层分叉），每层 70% 概率分叉（偏深覆盖）、30% 叶。
+fn tree_shape_strategy(max_depth: u32) -> BoxedStrategy<TreeShape> {
+    (0..10u32)
+        .prop_flat_map(move |roll| {
+            if roll < 7 && max_depth > 1 {
+                (
+                    tree_shape_strategy(max_depth - 1),
+                    tree_shape_strategy(max_depth - 1),
+                )
+                    .prop_map(|(l, r)| TreeShape::Fork(Box::new(l), Box::new(r)))
+                    .boxed()
+            } else {
+                Just(TreeShape::Leaf).boxed()
+            }
+        })
+        .boxed()
+}
+
+/// 形状 → Action：DFS 分配唯一路径（/p0, /p1, …，全树叶路径互异 → 所有 Fork
+/// 均可并行），combine 逐层 List 拼接。
+fn shape_to_action(shape: &TreeShape, next_id: &mut usize) -> Action {
+    match shape {
+        TreeShape::Leaf => {
+            let path = format!("/p{next_id}");
+            *next_id += 1;
+            syscall_step(
+                DataOp::Open {
+                    path: PathBuf::from(&path),
+                    flags: OpenFlags::default(),
+                },
+                vec![usage(Resource::Path(path), AccessMode::Read)],
+            )
+        }
+        TreeShape::Fork(l, r) => Action::Fork {
+            left: Box::new(shape_to_action(l, next_id)),
+            right: Box::new(shape_to_action(r, next_id)),
+            combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
+        },
+    }
+}
+
+/// 属性断言：fd 列表两两不相交，且合并后父 registry 中每个 fd 均可 lookup
+/// （句柄未被覆盖丢弃）。
+fn check_fds_disjoint_lookupable(fds: &[u64], reg: &ResourceRegistry) -> Result<(), TestCaseError> {
+    let mut seen = std::collections::HashSet::new();
+    for fd in fds {
+        prop_assert!(seen.insert(*fd), "fd 重复: {fd}，全部: {fds:?}");
+        prop_assert!(
+            reg.lookup(*fd).is_some(),
+            "fd {fd} 句柄不可 lookup（覆盖丢弃），全部: {fds:?}"
+        );
+    }
+    Ok(())
+}
+
+// S6/A2 通用属性（CTO 追加，防复发）：随机任意形状的 Fork 树（Fork 嵌套深度
+// 1..=4，叶为分配 fd 的 Open），顺序路径（Direct/interpret）与并行路径
+// （Runtime/Shared）各跑一遍，断言整棵树所有分支分配的 fd **两两不相交**
+// （合并后父 registry 无重复 fd、每 fd 可 lookup 到独立句柄）。根因级终结
+// 「相对偏移」类区间缺陷复发（fd 区间类缺陷第三次出现）。
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    #[test]
+    fn fork_tree_all_fds_pairwise_disjoint(
+        shape in tree_shape_strategy(5),
+    ) {
+        // 顺序路径（Direct/interpret）：merge 回父后 fd 无重复、可 lookup。
+        {
+            let mut next_id = 0usize;
+            let action = shape_to_action(&shape, &mut next_id);
+            let leaf_count = next_id;
+            prop_assert!(leaf_count >= 1, "树至少一个叶");
+
+            let mut ctx = Context::new();
+            let mut undo = UndoStack::new();
+            let mut reg = ResourceRegistry::new();
+            let mut ex = MockExecutor::new();
+            let alloc_log = ex.alloc_log.clone();
+            let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+            prop_assert!(v.is_ok(), "顺序路径执行失败: {v:?}");
+            let fds = alloc_log.lock().unwrap().clone();
+            prop_assert_eq!(fds.len(), leaf_count, "每个叶 Open 恰好分配一个 fd");
+            check_fds_disjoint_lookupable(&fds, &reg)?;
+        }
+
+        // 并行路径（Runtime/Shared）：并发分支（含嵌套）同样互斥。
+        {
+            let mut next_id = 0usize;
+            let action = shape_to_action(&shape, &mut next_id);
+            let leaf_count = next_id;
+
+            let ex = MockExecutor::new();
+            let alloc_log = ex.alloc_log.clone();
+            let mut rt = Runtime::new(Box::new(ex));
+            let v = rt.run_blocking(action);
+            prop_assert!(v.is_ok(), "并行路径执行失败: {v:?}");
+            let fds = alloc_log.lock().unwrap().clone();
+            prop_assert_eq!(fds.len(), leaf_count, "每个叶 Open 恰好分配一个 fd");
+            check_fds_disjoint_lookupable(&fds, rt.registry())?;
+        }
+    }
 }
 
 /// D10 对齐：Replace 分支先 recover 再 `reg.clear()` —— handles 与线性标记
