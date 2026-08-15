@@ -46,6 +46,80 @@ const ARBITER_RETRY_LIMIT: usize = 8;
 /// 动态仲裁占坑重试退避间隔（固定 1ms，竞争窗口合计约 7ms）。
 const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 
+/// io::Error → SysError 转换（RFC-10 修复，A5 域）。
+///
+/// 缺口：冻结面 `SysError::from_errno`（error.rs）只识别 POSIX errno，而
+/// Windows 上 `io::Error::raw_os_error()` 返回 Win32/WSA 原生码
+/// （ERROR_FILE_EXISTS=80、WSAEADDRINUSE=10048 等）——直接透传会退化为
+/// `Other(n)`，同一蓝图在 Windows 返回 Other(80)、在 Unix 返回
+/// `AlreadyExists`，破坏跨平台错误语义一致性（RFC-10）。
+///
+/// 修复：A5 域内先归一化再转换——优先 std 已解码的 `ErrorKind`
+/// （`decode_error_kind` 在 Windows 上把常见 Win32/WSA 码解码为语义 kind，
+/// 实测 raw=80→AlreadyExists、10048→AddrInUse、10061→ConnectionRefused、
+/// 5→PermissionDenied），兜底按原生码查 `normalize_windows_errno` 映射表后
+/// 再经 `from_errno`。Unix 上为纯透传（raw_os_error 即 POSIX errno），
+/// 行为与冻结面 `From<io::Error>` 完全一致。
+#[cfg(windows)]
+fn to_sys_err(e: std::io::Error) -> SysError {
+    // ErrorKind 优先：std 的 decode_error_kind 已覆盖常见 Win32/WSA 码，
+    // 语义映射不受码值漂移影响（比手写码表更稳健）。
+    let kind_errno = match e.kind() {
+        std::io::ErrorKind::NotFound => Some(2),
+        std::io::ErrorKind::PermissionDenied => Some(13),
+        std::io::ErrorKind::WouldBlock => Some(11),
+        std::io::ErrorKind::Interrupted => Some(4),
+        std::io::ErrorKind::TimedOut => Some(110),
+        std::io::ErrorKind::ConnectionReset => Some(104),
+        std::io::ErrorKind::ConnectionRefused => Some(111),
+        std::io::ErrorKind::BrokenPipe => Some(32),
+        std::io::ErrorKind::StorageFull => Some(28),
+        std::io::ErrorKind::InvalidInput => Some(22),
+        std::io::ErrorKind::AlreadyExists => Some(17),
+        std::io::ErrorKind::NotADirectory => Some(20),
+        std::io::ErrorKind::IsADirectory => Some(21),
+        // EADDRINUSE/EADDRNOTAVAIL 不在 14 错误集（pdr.md §10.1）→ 映射到
+        // POSIX 码后经 from_errno 落为 Other(98)/Other(99)，与 Unix 上
+        // bind 冲突的真实 errno 一致（跨平台可移植性目标）。
+        std::io::ErrorKind::AddrInUse => Some(98),
+        std::io::ErrorKind::AddrNotAvailable => Some(99),
+        _ => None,
+    };
+    if let Some(errno) = kind_errno {
+        return SysError::from_errno(errno);
+    }
+    match e.raw_os_error() {
+        Some(raw) => SysError::from_errno(normalize_windows_errno(raw)),
+        None => SysError::Other(0),
+    }
+}
+
+/// Windows 原生错误码 → POSIX errno（RFC-10 映射表；ErrorKind 未覆盖时的兜底）。
+#[cfg(windows)]
+fn normalize_windows_errno(raw: i32) -> i32 {
+    match raw {
+        // Win32（winerror.h）
+        2 | 3 => 2,     // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND → ENOENT
+        5 => 13,        // ERROR_ACCESS_DENIED → EACCES
+        80 | 183 => 17, // ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS → EEXIST
+        // WSA（winsock2.h）
+        10035 => 11,  // WSAEWOULDBLOCK → EAGAIN
+        10048 => 98,  // WSAEADDRINUSE → EADDRINUSE
+        10049 => 99,  // WSAEADDRNOTAVAIL → EADDRNOTAVAIL
+        10053 => 103, // WSAECONNABORTED → ECONNABORTED
+        10054 => 104, // WSAECONNRESET → ECONNRESET
+        10060 => 110, // WSAETIMEDOUT → ETIMEDOUT
+        10061 => 111, // WSAECONNREFUSED → ECONNREFUSED
+        _ => raw,
+    }
+}
+
+#[cfg(not(windows))]
+fn to_sys_err(e: std::io::Error) -> SysError {
+    // Unix：raw_os_error 即 POSIX errno，冻结面 from_errno 直接正确（透传）。
+    SysError::from(e)
+}
+
 /// 持锁 guard 的停车位：undo（recover 路径）与显式 `MutexUnlock` 均可取走释放，幂等。
 type HeldLockSlot = Arc<tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
 
@@ -250,9 +324,9 @@ impl TokioExecutor {
             .create(flags.create)
             .truncate(flags.truncate)
             .create_new(flags.exclusive);
-        let file = o.open(path).await?;
+        let file = o.open(path).await.map_err(to_sys_err)?;
         // registry 簿记 token：try_clone 共享同一 OS 描述（真实工作对象在 executor 侧）。
-        let token = file.try_clone().await?;
+        let token = file.try_clone().await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::File(Arc::new(token)));
         self.files
             .insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
@@ -269,7 +343,7 @@ impl TokioExecutor {
         if let Some(m) = self.files.get(&fd) {
             let mut g = m.lock().await;
             let mut buf = vec![0u8; len];
-            let n = g.read(&mut buf).await?;
+            let n = g.read(&mut buf).await.map_err(to_sys_err)?;
             buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
         }
@@ -290,7 +364,7 @@ impl TokioExecutor {
             };
             // 成功与 I/O 错误均先恢复句柄再传播（blocker-3）。
             self.put_back(fd, ResourceHandle::PipeReader(arc), reg);
-            let n = n?;
+            let n = n.map_err(to_sys_err)?;
             buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
         }
@@ -307,8 +381,11 @@ impl TokioExecutor {
         if let Some(m) = self.files.get(&fd) {
             let mut g = m.lock().await;
             let file = &mut *g;
-            let pos = file.seek(std::io::SeekFrom::Current(0)).await?;
-            let orig_len = file.metadata().await?.len();
+            let pos = file
+                .seek(std::io::SeekFrom::Current(0))
+                .await
+                .map_err(to_sys_err)?;
+            let orig_len = file.metadata().await.map_err(to_sys_err)?.len();
             let undo = if orig_len < FULL_UNDO_MAX_BYTES {
                 // 写前读：读取将被覆盖区域（pos..pos+len），完整回滚（Full 策略）。
                 // 只写句柄（Windows 上读会 ACCESS_DENIED）→ 降级 BestEffort（undo=None）。
@@ -325,10 +402,12 @@ impl TokioExecutor {
                         }
                     }
                 }
-                file.seek(std::io::SeekFrom::Start(pos)).await?;
+                file.seek(std::io::SeekFrom::Start(pos))
+                    .await
+                    .map_err(to_sys_err)?;
                 if readable {
                     orig.truncate(filled);
-                    file.write_all(data).await?;
+                    file.write_all(data).await.map_err(to_sys_err)?;
                     // 写后必须 flush（R1 flaky 根因）：tokio::fs::File 的 write_all
                     // 是**异步落盘**——poll_write 把数据拷入内部缓冲后立即返回
                     // Ready(Ok(n))，OS 写经 spawn_mandatory_blocking 在后台完成。
@@ -340,7 +419,7 @@ impl TokioExecutor {
                     // （实测）；新回归测试 rev_write_effect_immediately_observable_via_sync_read
                     // 放大后 30 跑 13 跑触发。
                     // flush 使 Write 完成 ⇔ OS 已落盘（A4/A6 可观察性契约）。
-                    file.flush().await?;
+                    file.flush().await.map_err(to_sys_err)?;
                     // 撤销：恢复原区域 + 截断回写前长度（D15：仅捕获物理数据）。
                     // 审计 R1（对抗测试 rev_undo_restores_file_cursor）：A6 双态
                     // w;w̄ = 1 要求**全部可观察状态**复原——游标（经 Seek(Current)
@@ -361,13 +440,13 @@ impl TokioExecutor {
                     });
                     Some(undo)
                 } else {
-                    file.write_all(data).await?;
-                    file.flush().await?;
+                    file.write_all(data).await.map_err(to_sys_err)?;
+                    file.flush().await.map_err(to_sys_err)?;
                     None // 写前读失败（如只写句柄）→ 降级 BestEffort。
                 }
             } else {
-                file.write_all(data).await?;
-                file.flush().await?;
+                file.write_all(data).await.map_err(to_sys_err)?;
+                file.flush().await.map_err(to_sys_err)?;
                 None // BestEffort（pdr.md §11.2）：大文件（≥1MB）不撤销。
             };
             return Ok((Value::Unit, undo));
@@ -386,7 +465,7 @@ impl TokioExecutor {
                 wh.write_all(data).await
             };
             self.put_back(fd, ResourceHandle::PipeWriter(arc), reg);
-            r?;
+            r.map_err(to_sys_err)?;
             return Ok((Value::Unit, None));
         }
         // TCP 流（Write 对流的复用，轮换型；错误路径恢复句柄，blocker-3）。
@@ -403,7 +482,7 @@ impl TokioExecutor {
                 s.write_all(data).await
             };
             self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-            r?;
+            r.map_err(to_sys_err)?;
             return Ok((Value::Unit, None));
         }
         Err(SysError::NotFound)
@@ -423,12 +502,12 @@ impl TokioExecutor {
             std::io::SeekFrom::Current(_) => std::io::SeekFrom::Current(offset),
             std::io::SeekFrom::End(_) => std::io::SeekFrom::End(offset),
         };
-        let pos = g.seek(sf).await?;
+        let pos = g.seek(sf).await.map_err(to_sys_err)?;
         Ok((Value::U64(pos), None))
     }
 
     async fn op_stat(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
-        let meta = tokio::fs::metadata(path).await?;
+        let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
         // 自设计格式：List([len, is_dir, is_file])。
         Ok((
             Value::List(vec![
@@ -491,15 +570,17 @@ impl TokioExecutor {
         path: &Path,
         len: usize,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let meta = tokio::fs::metadata(path).await?;
+        let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
         let undo = if meta.len() < FULL_UNDO_MAX_BYTES {
-            let orig = tokio::fs::read(path).await?; // 写前读（Full 策略）。
+            let orig = tokio::fs::read(path).await.map_err(to_sys_err)?; // 写前读（Full 策略）。
             tokio::fs::OpenOptions::new()
                 .write(true)
                 .open(path)
-                .await?
+                .await
+                .map_err(to_sys_err)?
                 .set_len(len as u64)
-                .await?;
+                .await
+                .map_err(to_sys_err)?;
             let p = path.to_path_buf();
             let undo: UndoOp = Box::pin(async move {
                 // 恢复原内容与原长度（路径级撤销，仅捕获物理数据）。
@@ -519,16 +600,18 @@ impl TokioExecutor {
             tokio::fs::OpenOptions::new()
                 .write(true)
                 .open(path)
-                .await?
+                .await
+                .map_err(to_sys_err)?
                 .set_len(len as u64)
-                .await?;
+                .await
+                .map_err(to_sys_err)?;
             None // BestEffort（pdr.md §11.2）：大文件（≥1MB）不撤销。
         };
         Ok((Value::Unit, undo))
     }
 
     async fn op_unlink(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
-        tokio::fs::remove_file(path).await?;
+        tokio::fs::remove_file(path).await.map_err(to_sys_err)?;
         // undo=None：恢复需缓存原内容+元数据（BestEffort/Skip）；补偿挂钩由用户提供（RFC-05）。
         Ok((Value::Unit, None))
     }
@@ -538,7 +621,7 @@ impl TokioExecutor {
         from: &Path,
         to: &Path,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        tokio::fs::rename(from, to).await?;
+        tokio::fs::rename(from, to).await.map_err(to_sys_err)?;
         let (f, t) = (from.to_path_buf(), to.to_path_buf());
         // 逆操作：反向 Rename（Full 策略，路径级撤销）。
         let undo: UndoOp = Box::pin(async move {
@@ -552,7 +635,7 @@ impl TokioExecutor {
         path: &Path,
         mode: u32,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        tokio::fs::create_dir(path).await?;
+        tokio::fs::create_dir(path).await.map_err(to_sys_err)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -569,15 +652,15 @@ impl TokioExecutor {
     }
 
     async fn op_rmdir(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
-        tokio::fs::remove_dir(path).await?;
+        tokio::fs::remove_dir(path).await.map_err(to_sys_err)?;
         // undo=None：恢复目录内容不可行（BestEffort/Skip）；补偿挂钩由用户提供（RFC-05）。
         Ok((Value::Unit, None))
     }
 
     async fn op_read_dir(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
-        let mut rd = tokio::fs::read_dir(path).await?;
+        let mut rd = tokio::fs::read_dir(path).await.map_err(to_sys_err)?;
         let mut names = Vec::new();
-        while let Some(entry) = rd.next_entry().await? {
+        while let Some(entry) = rd.next_entry().await.map_err(to_sys_err)? {
             names.push(Value::Str(entry.file_name().to_string_lossy().into_owned()));
         }
         Ok((Value::List(names), None))
@@ -590,7 +673,7 @@ impl TokioExecutor {
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpListener(Arc::new(listener)));
         // undo=None：关闭由 Arc Drop 保证；Fd 表残留清理列入 RFC-05。
         Ok((Value::Fd(fd), None))
@@ -603,7 +686,7 @@ impl TokioExecutor {
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let handle = reg.lookup(listener).ok_or(SysError::NotFound)?;
         let (stream, peer) = match handle {
-            ResourceHandle::TcpListener(l) => l.accept().await?,
+            ResourceHandle::TcpListener(l) => l.accept().await.map_err(to_sys_err)?,
             _ => return Err(SysError::InvalidInput),
         };
         let fd = reg.allocate(ResourceHandle::TcpStream(Arc::new(stream)));
@@ -616,7 +699,7 @@ impl TokioExecutor {
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpStream(Arc::new(stream)));
         self.stream_fds.insert(fd, fd);
         Ok((Value::Fd(fd), None))
@@ -642,7 +725,7 @@ impl TokioExecutor {
             s.read(&mut buf).await
         };
         self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-        let n = n?;
+        let n = n.map_err(to_sys_err)?;
         buf.truncate(n);
         Ok((Value::Bytes(buf), None))
     }
@@ -666,7 +749,7 @@ impl TokioExecutor {
             s.write_all(data).await
         };
         self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-        r?;
+        r.map_err(to_sys_err)?;
         Ok((Value::Unit, None))
     }
 
@@ -691,10 +774,10 @@ impl TokioExecutor {
         // 失败时 std 句柄仍在手，可重新包装回 tokio 放回注册表。
         let std_stream = match stream.into_std() {
             Ok(s) => s,
-            Err(e) => return Err(SysError::from(e)), // 底层句柄失效，无法恢复（深边缘）。
+            Err(e) => return Err(to_sys_err(e)), // 底层句柄失效，无法恢复（深边缘）。
         };
         if let Err(e) = std_stream.set_nonblocking(true) {
-            let err = SysError::from(e);
+            let err = to_sys_err(e);
             return match tokio::net::TcpStream::from_std(std_stream) {
                 Ok(s) => {
                     self.put_back(fd, ResourceHandle::TcpStream(Arc::new(s)), reg);
@@ -704,7 +787,7 @@ impl TokioExecutor {
             };
         }
         if let Err(e) = std_stream.shutdown(*how) {
-            let err = SysError::from(e);
+            let err = to_sys_err(e);
             return match tokio::net::TcpStream::from_std(std_stream) {
                 Ok(s) => {
                     self.put_back(fd, ResourceHandle::TcpStream(Arc::new(s)), reg);
@@ -715,7 +798,7 @@ impl TokioExecutor {
         }
         let stream = match tokio::net::TcpStream::from_std(std_stream) {
             Ok(s) => s,
-            Err(e) => return Err(SysError::from(e)), // std 句柄被 from_std 消费，无法恢复。
+            Err(e) => return Err(to_sys_err(e)), // std 句柄被 from_std 消费，无法恢复。
         };
         self.put_back(fd, ResourceHandle::TcpStream(Arc::new(stream)), reg);
         Ok((Value::Unit, None))
@@ -728,7 +811,7 @@ impl TokioExecutor {
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let sock = UdpSocket::bind(addr).await?;
+        let sock = UdpSocket::bind(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::UdpSocket(Arc::new(sock)));
         Ok((Value::Fd(fd), None))
     }
@@ -744,7 +827,7 @@ impl TokioExecutor {
             _ => return Err(SysError::InvalidInput),
         };
         let mut buf = vec![0u8; len];
-        let (n, addr) = sock.recv_from(&mut buf).await?;
+        let (n, addr) = sock.recv_from(&mut buf).await.map_err(to_sys_err)?;
         buf.truncate(n);
         Ok((
             Value::List(vec![Value::Bytes(buf), Value::Addr(addr)]),
@@ -763,7 +846,7 @@ impl TokioExecutor {
             ResourceHandle::UdpSocket(s) => s,
             _ => return Err(SysError::InvalidInput),
         };
-        let _ = sock.send_to(data, addr).await?;
+        let _ = sock.send_to(data, addr).await.map_err(to_sys_err)?;
         // undo=None：UDP 发送不可逆（pdr.md §11.1）；补偿挂钩由用户提供。
         Ok((Value::Unit, None))
     }
@@ -813,7 +896,7 @@ impl TokioExecutor {
             }
         }
         // std::process::Command 的 stdio 配置 getter 尚未稳定，未迁移（注释）。
-        let child = tc.spawn()?;
+        let child = tc.spawn().map_err(to_sys_err)?;
         let pid = child.id().ok_or(SysError::InvalidInput)?;
         let fd = reg.allocate(ResourceHandle::Child(Arc::new(child)));
         self.children.insert(pid, fd);
@@ -851,7 +934,7 @@ impl TokioExecutor {
             Ok(s) => s,
             Err(e) => {
                 self.put_child_back(pid, arc, reg);
-                return Err(SysError::from(e));
+                return Err(to_sys_err(e));
             }
         };
         self.children.remove(&pid);
@@ -888,7 +971,7 @@ impl TokioExecutor {
                 // tokio `Child::start_kill` 仅支持 SIGKILL（跨平台）；其他信号 → ENOSYS。
                 Err(SysError::Other(38))
             } else {
-                child.start_kill().map_err(SysError::from)
+                child.start_kill().map_err(to_sys_err)
             }
         };
         self.put_child_back(pid, arc, reg);
@@ -921,7 +1004,7 @@ impl TokioExecutor {
         prot: &MmapProt,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
-        let mut bytes = tokio::fs::read(path).await?;
+        let mut bytes = tokio::fs::read(path).await.map_err(to_sys_err)?;
         // 按 len 截断（medium-7）：映射长度语义；文件短于 len 时返回实际长度。
         if bytes.len() > len {
             bytes.truncate(len);
@@ -1054,11 +1137,13 @@ impl TokioExecutor {
         let in_file = self.files.get(&input).ok_or(SysError::NotFound)?;
         let buf = {
             let mut g = in_file.lock().await;
-            g.seek(std::io::SeekFrom::Start(offset as u64)).await?;
+            g.seek(std::io::SeekFrom::Start(offset as u64))
+                .await
+                .map_err(to_sys_err)?;
             let mut buf = vec![0u8; len];
             let mut filled = 0usize;
             while filled < buf.len() {
-                let n = g.read(&mut buf[filled..]).await?;
+                let n = g.read(&mut buf[filled..]).await.map_err(to_sys_err)?;
                 if n == 0 {
                     break;
                 }
@@ -1070,7 +1155,7 @@ impl TokioExecutor {
         // 输出侧：文件 / TCP 流 / 管道写端。
         let written = if let Some(m) = self.files.get(&out) {
             let mut g = m.lock().await;
-            let n = g.write(&buf).await?;
+            let n = g.write(&buf).await.map_err(to_sys_err)?;
             // 写后必须 flush（D-039 对齐；R3c MEDIUM-1）：op_send_file 输出到
             // 文件与 op_write 同属**异步落盘**面——tokio::fs::File 的 write
             // 返回时 OS 写可能仍在飞（blocking 池后台完成），op 返回后立即
@@ -1081,7 +1166,7 @@ impl TokioExecutor {
             // 管道/TCP 输出无需 flush：其 write 是对端缓冲/socket 缓冲的
             // 投递语义，无“落盘”可观察面（同 op_write 管道路径不 flush
             // 的约定）。
-            g.flush().await?;
+            g.flush().await.map_err(to_sys_err)?;
             n
         } else if self.stream_fds.contains_key(&out) {
             let mut arc = self.take_tcp_stream(out, reg)?;
@@ -1097,7 +1182,7 @@ impl TokioExecutor {
                 s.write(&buf).await
             };
             self.put_back(out, ResourceHandle::TcpStream(arc), reg);
-            n?
+            n.map_err(to_sys_err)?
         } else if self.pipe_writer_fds.contains_key(&out) {
             let mut arc = self.take_pipe_writer(out, reg)?;
             let n = {
@@ -1111,7 +1196,7 @@ impl TokioExecutor {
                 w.write(&buf).await
             };
             self.put_back(out, ResourceHandle::PipeWriter(arc), reg);
-            n?
+            n.map_err(to_sys_err)?
         } else {
             return Err(SysError::NotFound);
         };
@@ -1442,5 +1527,84 @@ mod tests {
             arb.held(&Resource::Fd(7)),
             "disarm 后占坑应保留（防双释放）"
         );
+    }
+
+    /// RFC-10：Windows 原生错误码 → POSIX 语义归一化（`to_sys_err` 单测）。
+    /// std 的 decode_error_kind 已把 Win32/WSA 码解码为语义 kind（实测
+    /// raw=80→AlreadyExists、10048→AddrInUse、10061→ConnectionRefused），
+    /// 故 `from_raw_os_error` 构造的错误经 kind 优先路径命中；未映射码透传
+    /// （与修复前行为一致）。
+    #[cfg(windows)]
+    #[test]
+    fn to_sys_err_maps_windows_codes_to_posix_semantics() {
+        use std::io::Error;
+        // Win32：文件面
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(80)),
+            SysError::AlreadyExists,
+            "ERROR_FILE_EXISTS(80) → EEXIST(17)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(183)),
+            SysError::AlreadyExists,
+            "ERROR_ALREADY_EXISTS(183) → EEXIST(17)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(5)),
+            SysError::PermissionDenied,
+            "ERROR_ACCESS_DENIED(5) → EACCES(13)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(2)),
+            SysError::NotFound,
+            "ERROR_FILE_NOT_FOUND(2) → ENOENT(2)"
+        );
+        // WSA：网络面
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(10048)),
+            SysError::Other(98),
+            "WSAEADDRINUSE(10048) → EADDRINUSE(98)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(10061)),
+            SysError::ConnectionRefused,
+            "WSAECONNREFUSED(10061) → ECONNREFUSED(111)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(10054)),
+            SysError::ConnectionReset,
+            "WSAECONNRESET(10054) → ECONNRESET(104)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(10060)),
+            SysError::TimedOut,
+            "WSAETIMEDOUT(10060) → ETIMEDOUT(110)"
+        );
+        // 未映射码：透传（不改变既有行为）。
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(1234)),
+            SysError::Other(1234),
+            "未映射码透传"
+        );
+    }
+
+    /// RFC-10：`normalize_windows_errno` 原始码映射表（ErrorKind 未覆盖时的
+    /// 兜底路径，直接测码表本身）。
+    #[cfg(windows)]
+    #[test]
+    fn normalize_windows_errno_mapping_table() {
+        assert_eq!(normalize_windows_errno(80), 17);
+        assert_eq!(normalize_windows_errno(183), 17);
+        assert_eq!(normalize_windows_errno(5), 13);
+        assert_eq!(normalize_windows_errno(2), 2);
+        assert_eq!(normalize_windows_errno(3), 2);
+        assert_eq!(normalize_windows_errno(10035), 11);
+        assert_eq!(normalize_windows_errno(10048), 98);
+        assert_eq!(normalize_windows_errno(10049), 99);
+        assert_eq!(normalize_windows_errno(10053), 103);
+        assert_eq!(normalize_windows_errno(10054), 104);
+        assert_eq!(normalize_windows_errno(10060), 110);
+        assert_eq!(normalize_windows_errno(10061), 111);
+        assert_eq!(normalize_windows_errno(9999), 9999, "未映射码透传");
     }
 }

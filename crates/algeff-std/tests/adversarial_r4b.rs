@@ -23,9 +23,11 @@
 //! truncate 后长度 0 + 写入增长 + undo 复原的边界断言。
 //!
 //! Windows 端口预算：本文件合计 2 个 TCP 监听（串行复用同一端口），远低于
-//! 500 上限。平台差异：Windows 上 create_new 撞已存在文件返回
-//! ERROR_FILE_EXISTS(80)（未映射进 14 种 → `SysError::Other(80)`），Unix
-//! 返回 EEXIST(17) → `SysError::AlreadyExists`——断言按平台分支。
+//! 500 上限。平台差异（RFC-10 已修复）：修复前 Windows 上 create_new 撞已
+//! 存在文件返回 ERROR_FILE_EXISTS(80)（未映射进 14 种 → `SysError::Other(80)`）
+//! 、Unix 返回 EEXIST(17) → `SysError::AlreadyExists`，断言按平台分支；
+//! 修复后 A5 执行器层将 Windows 码归一化为 POSIX 语义，两平台均
+//! `AlreadyExists`（断言不再按平台分支）。
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -536,7 +538,7 @@ fn open_flags_8_combination_matrix_real_files() {
     let fd6 = fd_of(&v);
     assert!(p6.exists(), "(6) exclusive 创建新文件成功");
 
-    // (7) create+exclusive on existing → 必须失败（平台差异见文件头注释）
+    // (7) create+exclusive on existing → 必须失败（RFC-10 修复后两平台均 EEXIST）
     let p7 = dir.path().join("c7.txt");
     std::fs::write(&p7, b"keep").unwrap();
     let e = rt
@@ -554,17 +556,10 @@ fn open_flags_8_combination_matrix_real_files() {
             Action::Pure,
         ))
         .unwrap_err();
-    #[cfg(unix)]
     assert_eq!(
         e,
         SysError::AlreadyExists,
-        "(7) exclusive 撞已存在（EEXIST）"
-    );
-    #[cfg(windows)]
-    assert_eq!(
-        e,
-        SysError::Other(80),
-        "(7) Windows ERROR_FILE_EXISTS(80) → Other(80) 透传"
+        "(7) exclusive 撞已存在（EEXIST，RFC-10 归一化后跨平台一致）"
     );
     assert_eq!(std::fs::read(&p7).unwrap(), b"keep", "(7) 失败不改动原文件");
 
@@ -626,10 +621,11 @@ fn open_exclusive_existing_fails_no_state_poison() {
             Action::Pure,
         ))
         .unwrap_err();
-    #[cfg(unix)]
-    assert_eq!(e, SysError::AlreadyExists, "exclusive 撞已存在必须失败");
-    #[cfg(windows)]
-    assert_eq!(e, SysError::Other(80), "Windows ERROR_FILE_EXISTS(80) 透传");
+    assert_eq!(
+        e,
+        SysError::AlreadyExists,
+        "exclusive 撞已存在必须失败（RFC-10 归一化后跨平台一致）"
+    );
     assert_eq!(std::fs::read(&p).unwrap(), b"original", "失败不改动文件");
 
     // 失败不分配 fd、不产生 undo。
