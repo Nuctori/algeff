@@ -192,7 +192,10 @@ fn err_catch_handler_receives_exact_variant_and_recovers() {
             Value::Str(format!("caught:{expected}")),
             "Catch handler 收到与执行器返回完全相同的错误变体（含 Display）"
         );
-        assert!(rt.undo_stack().is_empty(), "Catch 不触碰撤销栈（错误无 undo）");
+        assert!(
+            rt.undo_stack().is_empty(),
+            "Catch 不触碰撤销栈（错误无 undo）"
+        );
     }
 }
 
@@ -275,22 +278,25 @@ fn fake_executor_drives_interpreter_values_and_undo_contract() {
             vec![],
             move |v| {
                 assert_eq!(v, Value::Fd(7), "Open 返回值原样进入 next");
-                syscall(
-                    DataOp::Read { fd: 7, len: 3 },
-                    vec![],
-                    move |v| {
-                        assert_eq!(v, Value::Bytes(b"XYZ".to_vec()), "Read 返回值原样进入 next");
-                        syscall(
-                            DataOp::Write { fd: 7, data: b"z".to_vec() },
-                            vec![],
-                            Action::Pure,
-                        )
-                    },
-                )
+                syscall(DataOp::Read { fd: 7, len: 3 }, vec![], move |v| {
+                    assert_eq!(v, Value::Bytes(b"XYZ".to_vec()), "Read 返回值原样进入 next");
+                    syscall(
+                        DataOp::Write {
+                            fd: 7,
+                            data: b"z".to_vec(),
+                        },
+                        vec![],
+                        Action::Pure,
+                    )
+                })
             },
         ))
         .unwrap();
-    assert_eq!(v, Value::U64(42), "链尾 Write 返回值透传到 run_blocking 结果");
+    assert_eq!(
+        v,
+        Value::U64(42),
+        "链尾 Write 返回值透传到 run_blocking 结果"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         3,
@@ -304,7 +310,11 @@ fn fake_executor_drives_interpreter_values_and_undo_contract() {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert_eq!(undo_runs.load(Ordering::SeqCst), 1, "recover 执行了假执行器的 undo");
+    assert_eq!(
+        undo_runs.load(Ordering::SeqCst),
+        1,
+        "recover 执行了假执行器的 undo"
+    );
     assert!(rt.undo_stack().is_empty(), "recover 后撤销栈空");
 }
 
@@ -336,21 +346,20 @@ fn two_runtimes_distinct_executors_isolated_and_parallel_fork() {
                     Value::Fd(f) => f,
                     other => panic!("期望 Fd，得到 {other:?}"),
                 };
-                syscall(
-                    DataOp::Read { fd, len: 1 },
-                    vec![],
-                    move |v| {
-                        assert_eq!(v, expect_read, "Read 值由执行器契约决定");
-                        syscall(
-                            DataOp::Write { fd, data: b"w".to_vec() },
-                            vec![],
-                            move |v| {
-                                assert_eq!(v, expect_final, "Write 值由执行器契约决定");
-                                Action::Pure(v)
-                            },
-                        )
-                    },
-                )
+                syscall(DataOp::Read { fd, len: 1 }, vec![], move |v| {
+                    assert_eq!(v, expect_read, "Read 值由执行器契约决定");
+                    syscall(
+                        DataOp::Write {
+                            fd,
+                            data: b"w".to_vec(),
+                        },
+                        vec![],
+                        move |v| {
+                            assert_eq!(v, expect_final, "Write 值由执行器契约决定");
+                            Action::Pure(v)
+                        },
+                    )
+                })
             },
         )
     };
@@ -360,7 +369,11 @@ fn two_runtimes_distinct_executors_isolated_and_parallel_fork() {
         .unwrap();
     assert_eq!(va, Value::U64(100), "A 的假执行器值流");
     let vb = rt_b
-        .run_blocking(blueprint(Value::Fd(999), Value::U64(9990), Value::U64(99900)))
+        .run_blocking(blueprint(
+            Value::Fd(999),
+            Value::U64(9990),
+            Value::U64(99900),
+        ))
         .unwrap();
     assert_eq!(vb, Value::U64(99900), "B 的假执行器值流");
 

@@ -164,12 +164,7 @@ fn open_seek_write_read(path: PathBuf, offset: u64, data: &'static [u8]) -> Acti
                                             len: data.len(),
                                         },
                                         vec![rd(fd)],
-                                        move |v| {
-                                            Action::Pure(Value::List(vec![
-                                                Value::Fd(fd),
-                                                v,
-                                            ]))
-                                        },
+                                        move |v| Action::Pure(Value::List(vec![Value::Fd(fd), v])),
                                     )
                                 },
                             )
@@ -230,14 +225,22 @@ fn multi_runtime_same_file_blueprint_isolated() {
         "A 撤销只回滚 A 的效果，B 的写仍在"
     );
     assert_eq!(rt_a.undo_stack().len(), 0, "A 的栈已清空");
-    assert_eq!(rt_b.undo_stack().len(), 1, "B 的 undo 栈不受 A 的 recover 影响");
+    assert_eq!(
+        rt_b.undo_stack().len(),
+        1,
+        "B 的 undo 栈不受 A 的 recover 影响"
+    );
 
     // B 再 recover → 全部恢复原状。
     rt_b.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert_eq!(std::fs::read(&p).unwrap(), b"0123456789", "B 撤销后完全复原");
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        b"0123456789",
+        "B 撤销后完全复原"
+    );
     assert!(rt_b.undo_stack().is_empty());
 }
 
@@ -270,11 +273,7 @@ fn multi_runtime_same_port_bind_isolated() {
 
     // B 绑定同一端口 → 必须失败（地址占用；错误码平台相关，仅断言失败语义）。
     let e = rt_b
-        .run_blocking(syscall(
-            DataOp::TcpBind { addr: p },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::TcpBind { addr: p }, vec![], Action::Pure))
         .unwrap_err();
     eprintln!("R4B 同端口：B 在 A 持有期间绑定 {p} 失败：{e:?}");
 
@@ -297,11 +296,7 @@ fn multi_runtime_same_port_bind_isolated() {
 
     // B 现可绑定同一端口：无跨执行器句柄泄漏占用端口。
     let v = rt_b
-        .run_blocking(syscall(
-            DataOp::TcpBind { addr: p },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::TcpBind { addr: p }, vec![], Action::Pure))
         .unwrap();
     let lfd_b = fd_of(&v);
     assert_eq!(lfd_b, 0, "B 的 fd 编号独立");
@@ -414,7 +409,11 @@ fn open_flags_8_combination_matrix_real_files() {
         ))
         .unwrap();
     let fd1 = fd_of(&v);
-    assert_eq!(read_back(&mut rt, fd1, 8), b"existing", "(1) 只读打开可读原内容");
+    assert_eq!(
+        read_back(&mut rt, fd1, 8),
+        b"existing",
+        "(1) 只读打开可读原内容"
+    );
 
     // (2) write-only + create on new
     let p2 = dir.path().join("c2.txt");
@@ -511,7 +510,11 @@ fn open_flags_8_combination_matrix_real_files() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(std::fs::read(&p5).unwrap(), b"HELLOXX", "(5) append 写入落在文件尾");
+    assert_eq!(
+        std::fs::read(&p5).unwrap(),
+        b"HELLOXX",
+        "(5) append 写入落在文件尾"
+    );
 
     // (6) create+exclusive on new → 成功
     let p6 = dir.path().join("c6.txt");
@@ -552,7 +555,11 @@ fn open_flags_8_combination_matrix_real_files() {
         ))
         .unwrap_err();
     #[cfg(unix)]
-    assert_eq!(e, SysError::AlreadyExists, "(7) exclusive 撞已存在（EEXIST）");
+    assert_eq!(
+        e,
+        SysError::AlreadyExists,
+        "(7) exclusive 撞已存在（EEXIST）"
+    );
     #[cfg(windows)]
     assert_eq!(
         e,
@@ -663,11 +670,14 @@ fn open_truncate_zeroes_len_then_write_grows_and_undo_restores() {
     std::fs::write(&p, b"HELLOWORLD").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
+    // read+write：保证 Write 的写前读成功（Full 撤销策略需可读句柄；只写
+    // 句柄会降级 BestEffort 无 undo，见 executor.rs op_write 注释）。
     let v = rt
         .run_blocking(syscall(
             DataOp::Open {
                 path: p.clone(),
                 flags: OpenFlags {
+                    read: true,
                     write: true,
                     truncate: true,
                     create: true,
@@ -698,7 +708,8 @@ fn open_truncate_zeroes_len_then_write_grows_and_undo_restores() {
     .unwrap();
     assert_eq!(std::fs::read(&p).unwrap(), b"abc", "truncate 后写入生效");
 
-    // Write 对 0 长文件也有 undo（原内容为空）→ recover 复原回长度 0。
+    // Write 对 0 长文件也有 undo（原内容为空，Full 策略）→ recover 复原回
+    // 长度 0。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
