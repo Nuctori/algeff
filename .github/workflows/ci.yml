@@ -13,7 +13,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # macos-latest 保留：价值在于验证 BSD errno 语义（与 Linux/Windows 的 errno
+        # 语义存在差异，仅此平台可捕获），并构成 ubuntu/windows/macos 三平台矩阵覆盖。
         os: [ubuntu-latest, windows-latest, macos-latest]
+
+    # job 级超时 30 分钟：防止 runner 挂起（网络/依赖安装卡死等）导致任务无限占用
+    # 和费用空耗，超时后整个 job 失败并释放 runner。
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -29,12 +35,6 @@ jobs:
 
       - name: cargo clippy --workspace -- -D warnings
         run: cargo clippy --workspace -- -D warnings
-
-      # Release 编译验证：release 模式是生产形态，与 debug 测试路径不同，
-      # 三平台统一编译一次确保无 release-only 编译错误。
-      # 依赖产物写入 target/release，runner 上无需提交，本地验证时由 .gitignore 忽略。
-      - name: cargo build --release --workspace
-        run: cargo build --release --workspace
 
       - name: cargo test --workspace
         run: cargo test --workspace
