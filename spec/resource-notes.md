@@ -47,6 +47,31 @@ pdr.md 公理 A7：动态资源获取采用「原子占坑 + 失败回滚 + 有�
 同步原语（如 `tokio::sync::Mutex`）的 `.lock().await` 会挂起等待，**不得**在
 解释器任务内直接使用，否则引入循环等待风险；一律走 try_lock + 回滚重试。
 
+### 强制规则：Fork 分支内的 `MutexLock` 必须声明对应资源（R-1 待办①，批 7）
+
+Fork 分支内使用 `DataOp::MutexLock { id }` 的蓝图，**必须**在分支的资源声明
+（`ResourceSet`，即 Fork 静态冲突检测的输入）中包含对应 `Resource::Fd(id)`
+（或等价声明——以同一互斥锁的独占声明表达）以触发静态冲突检测（§9.1 矩阵：
+Write 型互斥 → `can_parallel=false` → 降级顺序执行）。
+
+- **未声明的后果（死锁可达窗口）**：静态层不可见该互斥（`Fd(id)` 不在
+  `ResourceSet` 中），`can_parallel` 判定分支可并行 → D17 并行 Fork 路径触发；
+  两分支在共享执行器上对同一 `MutexLock { id }` 执行，物理层
+  `tokio::sync::Mutex::lock_owned` 阻塞等待（A5 批 5 接入前的现状，executor.rs
+  `op_mutex_lock`），无静态顺序化兜底 → 分支间「持有-等待」死锁可达窗口。
+  当前冻结语义下资源声明是蓝图作者责任（A4 线性检查同此边界）；G4 残余 R-1
+  已按「接受 + 待办」记录，见 spec/g4-closure.md §4。
+- **检测手段**：代码审查——Fork 分支含 `MutexLock { id }` 时核对资源声明包含
+  `Resource::Fd(id)`；测试——批 7 新增 `crates/algeff-core/tests/arbiter_mutex.rs`
+  （占坑-释放周期 / Read 共享 vs Write 独占 × tokio Mutex / 有限重试上界
+  WouldBlock 无残留）验证动态层语义；静态层顺序化覆盖由 `interpreter.rs` 的
+  `fork_conflict_sequential_execution`（同资源 Write×Write → 顺序降级）提供。
+- **A5 批 5 接入 arbiter 后的缓解**：`op_mutex_lock` 改为
+  `ResourceArbiter::try_claim` + 有限重试（D16 设计目标）后，未声明资源的蓝图
+  即使进入动态层，占坑失败也只返回 `WouldBlock`（bool false）并整体回滚、不
+  阻塞等待——死锁窗口转化为可检测的失败（见 §8「接入中（A5 批 5）」）；但静态
+  声明仍是首选路径：顺序化零等待、确定性最强。
+
 ## 3. Append 的 opt-in 语义
 
 pdr.md §9.1 与决策 D6：`Append∥Append` **默认视为不可并行**（返回 `false`），
@@ -76,7 +101,7 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
 | --- | --- | --- |
 | A3 冲突矩阵 | `conflict_matrix_exhaustive_4x4`（4×4 模式对 × 同/异资源）、`conflict_matrix_read_read_ok`、`conflict_matrix_write_blocks`、`append_parallel_needs_opt_in` | resource.rs |
 | A4 线性 | `linearity_write_then_own_legal`、`linearity_own_is_terminal`、`linearity_double_write_rejected`、`linearity_read_append_repeatable`、`clear_resets_linear_state_and_handles` | resource.rs |
-| A7 无死锁 | 静态层由上述冲突矩阵覆盖；动态层由 `arbiter.rs` 的 `try_claim` 原子回滚 / Read-Read 共享 / Read-Write 互斥 / 有限重试测试覆盖（ResourceArbiter） | resource.rs + tests/arbiter.rs |
+| A7 无死锁 | 静态层由上述冲突矩阵覆盖；动态层由 `arbiter.rs` 的 `try_claim` 原子回滚 / Read-Read 共享 / Read-Write 互斥 / 有限重试测试覆盖（ResourceArbiter）；批 7 增补 `arbiter_mutex.rs` 组合验证（占坑-释放周期 / Read 共享 vs Write 独占 × `tokio::sync::Mutex` 对应 / 有限重试上界 WouldBlock 无残留） | resource.rs + tests/arbiter.rs + tests/arbiter_mutex.rs |
 | §5.2.2 notify | `registry_sync_activation_sequence`、`registry_sync_multi_component_and_neutral`、`notify_states` | coeffects.rs |
 
 ## 6. 变更记录
@@ -96,6 +121,14 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   测试增补 proptest（随机 claim/release 交错序列：单调不减 / 失败原子性快照 /
   无泄漏三不变量）、同资源 4×4 互斥矩阵穷举、`is_clean` 全生命周期测试；
   §8 增补属性测试不变量说明与 `is_clean` 用法。
+- s7/a3：R-1 待办① 落地——§2 新增「强制规则」小节：Fork 分支内 `MutexLock { id }`
+  必须声明对应 `Resource::Fd(id)`（或等价声明）以触发静态顺序化；未声明的后果
+  （死锁可达窗口）、检测手段（代码审查 + 测试）、A5 批 5 接入 arbiter 后的缓解
+  （try_claim + 有限重试 → 返回 WouldBlock 而非死锁）；§8 增补 arbiter↔MutexLock
+  接入状态「接入中（A5 批 5）」；§5 A7 行补录批 7 测试；新增组合验证
+  `crates/algeff-core/tests/arbiter_mutex.rs`
+  （`claim_then_release_cycle` / `exclusive_vs_shared_mutex_semantics` /
+  `retry_upper_bound`，纯 core 无 IO）。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -175,6 +208,14 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 > 撰写对应关系；D14 的存在性需 CTO 澄清（见 RFC-A3-3）。
 
 ## 8. ResourceArbiter 与公理 A7 的映射（批 3 落地）
+
+> **接入状态（批 7 更新）**：arbiter ↔ `MutexLock`（`DataOp::MutexLock { id }`）
+> 的动态层接入为**接入中（A5 批 5）**：`op_mutex_lock` 将由阻塞 `lock_owned`
+> 改为 arbiter `try_claim` + 有限重试（D16 设计目标，G4 残余 R-1 待办②）。接入前，
+> Fork 分支内使用 `MutexLock { id }` 的蓝图必须声明对应 `Resource::Fd(id)` 以
+> 触发静态顺序化（强制规则，见 §2）。批 7 新增 core 侧组合验证
+> `tests/arbiter_mutex.rs`（占坑-释放周期 / Read 共享 vs Write 独占 × tokio
+> Mutex 对应 / 有限重试上界 WouldBlock 无残留），作为接入后行为契约的占坑侧预演。
 
 批 2 的 §2 给出了 A7 的工程分层建议；本批在 core 落地动态层原语
 `ResourceArbiter`（`crates/algeff-core/src/resource.rs`，测试 `tests/arbiter.rs`）。
