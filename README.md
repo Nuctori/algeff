@@ -29,14 +29,14 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 
 | 模块 | 状态 | 测试数 | 待办 |
 | --- | --- | --- | --- |
-| `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 87（单元 15 + 集成 72） | 无（契约冻结） |
-| `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器） | 已实现并合并（A5） | 23（adapters 5 + adapters_flow 6 + e2e 4 + executor 8） | 无 |
+| `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter + Fork 并行（D17）；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 90（单元 15 + 集成 75） | 无（契约冻结） |
+| `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器 + 错误路径句柄恢复） | 已实现并合并（A5） | 28（adapters 5 + adapters_flow 6 + e2e 4 + executor 13） | 无 |
 | `algeff-macro`（plan!/fork!/scope!/choose!） | 已实现并合并（A4） | 19 + 8 doc-test | 无（可选语法糖） |
 | 基准 benches（echo/parallel_reads/shared_read/append + algeff 对比臂） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 阶段 3 Fork 并行调度落地后刷新对比列 |
 | CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + feature 测试 + mdBook 构建 | — | — |
 | 文档（`docs/` mdBook + `spec/` 形式化） | 已齐备（G3 门禁） | — | — |
 
-- 测试合计：`cargo test --workspace` 137 个全绿（20 个测试二进制 + 3 个 doc-test 运行；129 个测试函数 + 8 个 doc-test）。
+- 测试合计：`cargo test --workspace` 151 个测试函数全绿（24 个测试二进制 + 3 个 doc-test 运行）。
 - 特性测试：`crates/algeff-core/tests/runtime_features.rs` 的 7 个测试由 `--features coeffects,virtual-clock` 门控，默认测试不含；CI 双平台补跑 `cargo test --workspace --features coeffects,virtual-clock` 覆盖。
 - 性能基线：`perf/baseline-2026-08-15.txt`（A7 批 2 + 批 3），含原生 tokio 参照列与 Algeff 对比列（echo 100.0%、parallel_reads 340.0%、shared_read 307.6%、append 29.4%），接入说明见 `crates/algeff-std/benches/README.md`。
 - 发布准备（G4 终验）：三个 crate 的 `cargo publish --dry-run --registry crates-io` 全部通过（RFC-1 已落地：`algeff-std` 的 path 依赖补 `version = 0.1.0`）。`algeff-std` 因依赖尚未真实发布的 `algeff-core`，需 `scripts/release.sh --allow-unpublished-deps`（以本地成员代偿 registry 存在性校验）——属 cargo 固有的发布顺序约束，先真实发布 core、镜像同步后 std 自然解除。
@@ -75,6 +75,7 @@ fn main() {
 ```
 
 > 说明：
+>
 > - `Action` 全部节点 CPS，递归字段一律 `Box<Action>`（契约 D2）；蓝图只依赖 `algeff-core`，可自由组合、缓存、重放，物理执行由 `algeff-std` 的 `TokioExecutor` 提供。
 > - `TokioExecutor::execute` 已实现全部 DataOp（A5 已合并）：含 `Syscall` 节点的蓝图直接由 tokio 后端驱动，`Runtime::run_blocking` 即可运行。
 > - pdr.md §14 示例风格为 `use algeff::prelude::*`（统一 façade crate，随发布提供）；当前工作区以 `algeff-core` / `algeff-macro` 名义发布。
