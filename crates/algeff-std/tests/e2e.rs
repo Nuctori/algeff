@@ -46,7 +46,7 @@ fn fd_of(v: &Value) -> u64 {
 fn syscall(
     op: DataOp,
     resources: Vec<ResourceUsage>,
-    next: impl FnOnce(Value) -> Action + 'static,
+    next: impl FnOnce(Value) -> Action + Send + 'static,
 ) -> Action {
     Action::Syscall {
         op,
@@ -108,20 +108,31 @@ fn e2e_file_write_read_undo() {
     // 文件内容恢复原样；撤销栈清空；registry 句柄仍在，且可继续 interpret 读回。
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(rt.undo_stack().is_empty());
-    assert!(rt.registry().lookup(fd).is_some());
+    // D10（A2 批 4 对齐）：Replace = recover + reg.clear() —— 句柄与线性标记全部放弃。
+    assert!(rt.registry().lookup(fd).is_none(), "Replace 清空 registry 句柄");
     let v = rt
         .run_blocking(syscall(
-            DataOp::Seek {
-                fd,
-                offset: 0,
-                whence: std::io::SeekFrom::Start(0),
+            DataOp::Open {
+                path: path.clone(),
+                flags,
             },
-            vec![rd(fd)],
-            move |_| {
+            vec![wr_path(path.clone())],
+            move |v| {
+                let fd2 = fd_of(&v);
                 syscall(
-                    DataOp::Read { fd, len: orig_len },
-                    vec![rd(fd)],
-                    Action::Pure,
+                    DataOp::Seek {
+                        fd: fd2,
+                        offset: 0,
+                        whence: std::io::SeekFrom::Start(0),
+                    },
+                    vec![rd(fd2)],
+                    move |_| {
+                        syscall(
+                            DataOp::Read { fd: fd2, len: orig_len },
+                            vec![rd(fd2)],
+                            Action::Pure,
+                        )
+                    },
                 )
             },
         ))

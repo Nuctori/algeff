@@ -37,7 +37,7 @@ fn wr_path(path: PathBuf) -> ResourceUsage {
 fn syscall(
     op: DataOp,
     resources: Vec<ResourceUsage>,
-    next: impl FnOnce(Value) -> Action + 'static,
+    next: impl FnOnce(Value) -> Action + Send + 'static,
 ) -> Action {
     Action::Syscall {
         op,

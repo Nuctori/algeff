@@ -208,7 +208,7 @@ pub fn sleep(duration: Duration) -> Action {
 /// Sequential 先完整执行 `current` 子树，再将其最终值交付给 `next`，与 CPS
 /// 接续语义等价。fd 等中间值经闭包词法捕获贯穿整条链（TCP 客户端蓝图
 /// 示例见 `tests/adapters_flow.rs` 的 `tcp_client_blueprint`）。
-pub fn and_then(prev: Action, f: impl FnOnce(Value) -> Action + 'static) -> Action {
+pub fn and_then(prev: Action, f: impl FnOnce(Value) -> Action + Send + 'static) -> Action {
     match prev {
         Action::Pure(v) => f(v),
         other => Action::Sequential {

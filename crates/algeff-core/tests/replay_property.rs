@@ -154,29 +154,56 @@ fn arb_fork() -> impl Strategy<Value = Bp> {
 /// 记账：叶子成本 1；Replace 起步成本 2（自身 1 + target ≥1）；Seq/Choose/Fork
 /// 起步成本 3（自身 1 + 两子树 ≥1 / Fork 3）——budget 不足时对应选项不提供，
 /// 维持 Invariant：子树成本 ≤ 子树 budget（children 预算和为 B-1，各 ≥1）。
+/// `with_replace=false` 时排除 Replace 节点（用于断言线性标记在 recover 后保留的属性——
+/// Replace 按 D10 会清空 registry，语义不同）。
 fn arb_bp(depth: u32, budget: u32) -> impl Strategy<Value = Bp> {
+    arb_bp_impl(depth, budget, true)
+}
+
+fn arb_bp_no_replace(depth: u32, budget: u32) -> impl Strategy<Value = Bp> {
+    arb_bp_impl(depth, budget, false)
+}
+
+fn arb_bp_impl(depth: u32, budget: u32, with_replace: bool) -> impl Strategy<Value = Bp> {
     let leaf = prop_oneof![arb_pure(), arb_syscall()];
     if depth == 0 || budget <= 1 {
         leaf.boxed()
     } else if budget == 2 {
         // 一元 composite 起步成本 2：仅 Replace + 叶子。
-        let composite = arb_bp(depth - 1, budget - 1).prop_map(|t| Bp::Replace(Box::new(t)));
+        let composite = if with_replace {
+            arb_bp_impl(depth - 1, budget - 1, with_replace)
+                .prop_map(|t| Bp::Replace(Box::new(t)))
+                .boxed()
+        } else {
+            leaf.clone().boxed()
+        };
         prop_oneof![leaf, composite].boxed()
     } else {
         let rest = budget - 1;
         let half = rest / 2;
         let composite = prop_oneof![
-            (arb_bp(depth - 1, half), arb_bp(depth - 1, rest - half))
+            (
+                arb_bp_impl(depth - 1, half, with_replace),
+                arb_bp_impl(depth - 1, rest - half, with_replace)
+            )
                 .prop_map(|(a, b)| Bp::Seq(Box::new(a), Box::new(b))),
             (
                 any::<bool>(),
-                arb_bp(depth - 1, half),
-                arb_bp(depth - 1, rest - half)
+                arb_bp_impl(depth - 1, half, with_replace),
+                arb_bp_impl(depth - 1, rest - half, with_replace)
             )
                 .prop_map(|(c, a, b)| Bp::Choose(c, Box::new(a), Box::new(b))),
             arb_fork(),
-            arb_bp(depth - 1, rest).prop_map(|t| Bp::Replace(Box::new(t))),
         ];
+        let composite = if with_replace {
+            prop_oneof![
+                composite,
+                arb_bp_impl(depth - 1, rest, with_replace).prop_map(|t| Bp::Replace(Box::new(t)))
+            ]
+            .boxed()
+        } else {
+            composite.boxed()
+        };
         prop_oneof![leaf, composite].boxed()
     }
 }
@@ -421,7 +448,7 @@ proptest! {
     /// 保留，当前实现如此，注释断言）；全新 registry 上重放 → 轨迹一致。
     #[test]
     fn prop_linearity_marker_survives_recover(
-        bp in arb_bp(3, 11),
+        bp in arb_bp_no_replace(3, 11),
         r in 0u64..3,
     ) {
         let res = Resource::Fd(r + 1);

@@ -37,7 +37,7 @@ fn fd_of(v: &Value) -> u64 {
 fn syscall(
     op: DataOp,
     resources: Vec<ResourceUsage>,
-    next: impl FnOnce(Value) -> Action + 'static,
+    next: impl FnOnce(Value) -> Action + Send + 'static,
 ) -> Action {
     Action::Syscall {
         op,
