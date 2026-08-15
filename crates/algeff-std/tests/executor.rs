@@ -484,6 +484,54 @@ fn mutex_claim_released_on_timeout_cancel() {
     assert_eq!(rt.run_blocking(again).unwrap(), Value::Unit);
 }
 
+// ── g5. Timeout 取消压力 50 轮（A5 批 9：Drop 内 async panic 修复，集成侧）──
+// 审计处方备选构造：高并发多任务 MutexLock 同 id + Timeout 混合压力。每轮 8 个
+// 并发任务（短 Timeout 2ms），取消与完成（undo 释放）路径交错；断言全程无 panic
+// （join 不 err）且轮末同 id 可重新获取（无占坑泄漏/永久 WouldBlock 毒化）。
+// 真正的「drop × 仲裁临界区重叠」由 executor.rs 内部确定性测试覆盖（std Mutex
+// 直接持锁构造 + is_clean 断言）。
+
+#[tokio::test]
+async fn mutex_lock_timeout_stress_50_rounds_no_panic() {
+    let ex = std::sync::Arc::new(tokio::sync::Mutex::new(TokioExecutor::new()));
+    for round in 0..50u64 {
+        let id = 8000 + round;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let ex = ex.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut reg = ResourceRegistry::new();
+                let mut g = ex.lock().await;
+                // 短 Timeout（2ms）包裹 execute：竞争（WouldBlock）与取消混合。
+                let res = tokio::time::timeout(
+                    Duration::from_millis(2),
+                    g.execute(&DataOp::MutexLock { id }, &mut reg),
+                )
+                .await;
+                // 成功路径立即执行 undo（释放占坑与物理锁），保证轮末无残留。
+                if let Ok(Ok((_v, Some(undo)))) = res {
+                    undo.await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await
+                .expect("任务 panic（取消 × 完成交错不得 panic/abort）");
+        }
+        // 轮末：同 id 必须可重新获取（任何取消泄漏 → 永久 WouldBlock）。
+        let mut reg = ResourceRegistry::new();
+        let mut g = ex.lock().await;
+        let (_v, undo) = g
+            .execute(&DataOp::MutexLock { id }, &mut reg)
+            .await
+            .expect("轮末应能重新获取锁（无占坑泄漏）");
+        drop(g);
+        if let Some(u) = undo {
+            u.await;
+        }
+    }
+}
+
 // ── h. 子进程退出码 ────────────────────────────────────────────────────
 
 #[tokio::test]
