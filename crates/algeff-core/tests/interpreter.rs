@@ -1,9 +1,10 @@
 //! A2 解释器集成测试（contracts.md §任务 A2；pdr.md §2.1 / §4 / §5.1）。
 //!
-//! 说明：`interpret` 的 future 因冻结签名 `&mut dyn SyscallExecutor`（trait 无
-//! `Send` 超 trait）而**非 Send**；`Runtime` 自持 tokio reactor（D9），`Runtime::new`
-//! 在 tokio 上下文内会 panic。因此全部测试用普通 `#[test]` + 本地 current-thread
-//! runtime 驱动（`drive`），不在 `#[tokio::test]` 中嵌套 `Runtime::new`。
+//! 说明：`interpret` 的递归 future 经非 Send 的本地 Box 包装（`LocalBoxFuture`）
+//! 而**非 Send**（`SyscallExecutor` 的 `Send` 超 trait 已落地，决策 D19）；
+//! `Runtime` 自持 tokio reactor（D9），`Runtime::new` 在 tokio 上下文内会 panic。
+//! 因此全部测试用普通 `#[test]` + 本地 current-thread runtime 驱动（`drive`），
+//! 不在 `#[tokio::test]` 中嵌套 `Runtime::new`。
 //!
 //! 另：`Runtime::run_blocking` 与 `Runtime::virtual_clock()`（feature 开启时）为
 //! 本文件新增的运行时入口/访问器，测试通过公开 API 驱动解释器。
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use algeff_core::action::{Action, DataOp, OpenFlags, Value};
+use algeff_core::action::{Action, DataOp, OpenFlags, PipeFlags, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::{
     AccessMode, Resource, ResourceHandle, ResourceRegistry, ResourceUsage,
@@ -101,9 +102,9 @@ impl SyscallExecutor for MockExecutor {
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
-            // Open：由注册表分配全局唯一 fd（D1），不产生 undo（简化，同
+            // Open/PipeOpen：由注册表分配全局唯一 fd（D1），不产生 undo（简化，同
             // concurrency_stress.rs 的 MockExecutor）。
-            if matches!(op, DataOp::Open { .. }) {
+            if matches!(op, DataOp::Open { .. } | DataOp::PipeOpen { .. }) {
                 let fd =
                     registry.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
                 return Ok((Value::Fd(fd), None));
@@ -863,6 +864,165 @@ fn fork_parallel_undo_merge() {
         "LIFO：right 的 undo 先弹出，left 的后（观察序一致）"
     );
     assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
+}
+
+/// F1 修复（blocker）：Fork 并行路径**两分支都分配新 fd** 的真实碰撞测试。
+/// 左分支 Open、右分支 PipeOpen（MockExecutor 对两者都分配 fd）—— 修复前两
+/// 分支同源于父 `next_fd`，会得到**相同 fd**（merge 时 `HashMap::extend` 静默
+/// 覆盖丢弃左分支句柄，executor 内部轮换映射同样碰撞）；修复后右分支经
+/// `offset_next_fd(1<<48)` 预分割 fd 区间，merge 后两 fd 不同且都能 lookup
+/// 到各自句柄，父 `next_fd` 归一化后继续分配不冲突。
+#[test]
+fn fork_parallel_both_branches_allocate_fds_disjoint() {
+    let ex = MockExecutor::new();
+    let got = Arc::new(Mutex::new(None::<(u64, u64)>));
+    let got2 = Arc::clone(&got);
+    let mut rt = Runtime::new(Box::new(ex));
+
+    // 异资源（Path /left 与 /right-pipe）→ can_parallel=true → 真并行路径。
+    let action = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/left"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(Resource::Path("/left".to_string()), AccessMode::Read)],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            vec![usage(
+                Resource::Path("/right-pipe".to_string()),
+                AccessMode::Read,
+            )],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::Fd(lfd), Value::Fd(rfd)) => {
+                *got2.lock().unwrap() = Some((lfd, rfd));
+                Action::Pure(Value::Unit)
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let v = rt.run_blocking(action);
+    assert_eq!(v, Ok(Value::Unit), "Fork 并行执行成功");
+    let (lfd, rfd) = got.lock().unwrap().expect("combine 捕获两分支 fd");
+    assert_ne!(lfd, rfd, "两分支分配的 fd 不得相同（F1 fd 区间预分割）");
+    assert!(
+        rt.registry().lookup(lfd).is_some(),
+        "左分支句柄经 merge 以原 fd 可见（不得被右分支覆盖丢弃）"
+    );
+    assert!(
+        rt.registry().lookup(rfd).is_some(),
+        "右分支句柄经 merge 以原 fd 可见"
+    );
+    // 合并后父 next_fd = max 归一化（D1 单调）：继续分配不冲突、不复用。
+    let nfd = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+    assert!(
+        nfd > lfd && nfd > rfd,
+        "合并后父 next_fd 归一化，新分配不冲突"
+    );
+}
+
+/// F2 修复（high）：冲突型 Fork（同资源 Write×Write → can_parallel=false →
+/// 顺序路径）执行后**同样 merge 回父** —— 分支的线性标记（Write 消费）经 merge
+/// 保留，父级对该资源再次 Write 被公理 A4 拒绝（修复前 l_reg/r_reg 被丢弃，
+/// 父级同资源 Write 被错误放行）。
+#[test]
+fn fork_conflict_merge_keeps_linear_marks() {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let mut reg = ResourceRegistry::new();
+    let mut ex = MockExecutor::new();
+    ex.respond("write:1", MockOutcome::Value(Value::U64(10)));
+
+    let w = usage(Resource::Fd(1), AccessMode::Write);
+    let action = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xAA],
+            },
+            vec![w.clone()],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xBB],
+            },
+            vec![w.clone()],
+        )),
+        combine: Box::new(|l, r| match (l, r) {
+            (Value::U64(a), Value::U64(b)) => Action::Pure(Value::U64(a + b)),
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+    assert_eq!(v, Ok(Value::U64(20)), "冲突 Fork 顺序执行，combine 正确");
+    assert_eq!(ex.ops(), vec!["write:1", "write:1"], "left→right 顺序执行");
+
+    // 分支的 Write 消费已随 merge 并入父：父级对该资源再次 Write 被拒（F2）
+    assert_eq!(
+        reg.check_linear(&w),
+        Err(SysError::InvalidInput),
+        "冲突型 Fork 后父级同资源 Write 应被 A4 拒绝（线性标记经 merge 保留）"
+    );
+}
+
+/// F1 修复在顺序路径的落地：冲突型 Fork（顺序执行）两分支都 Open 时，右分支
+/// 同样经 fd 区间预分割 —— merge 后两分支 fd 不同且都能 lookup（修复前顺序
+/// 路径丢弃 l_reg/r_reg，本测试同时覆盖 F2 的 merge 行为）。
+#[test]
+fn fork_sequential_both_branches_allocate_fds_disjoint() {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let mut reg = ResourceRegistry::new();
+    let mut ex = MockExecutor::new();
+
+    let got = Arc::new(Mutex::new(None::<(u64, u64)>));
+    let got2 = Arc::clone(&got);
+    // Direct 通道（interpret）：Fork 恒走顺序路径（D14 阶段 1），与冲突无关。
+    let action = Action::Fork {
+        left: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/seq-l"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(
+                Resource::Path("/seq-l".to_string()),
+                AccessMode::Read,
+            )],
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Open {
+                path: PathBuf::from("/seq-r"),
+                flags: OpenFlags::default(),
+            },
+            vec![usage(
+                Resource::Path("/seq-r".to_string()),
+                AccessMode::Read,
+            )],
+        )),
+        combine: Box::new(move |l, r| match (l, r) {
+            (Value::Fd(lfd), Value::Fd(rfd)) => {
+                *got2.lock().unwrap() = Some((lfd, rfd));
+                Action::Pure(Value::Unit)
+            }
+            _ => Action::Pure(Value::Unit),
+        }),
+    };
+    let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+    assert_eq!(v, Ok(Value::Unit), "顺序 Fork 执行成功");
+    let (lfd, rfd) = got.lock().unwrap().expect("combine 捕获两分支 fd");
+    assert_ne!(
+        lfd, rfd,
+        "顺序路径两分支分配的 fd 不得相同（F1 区间预分割）"
+    );
+    assert!(reg.lookup(lfd).is_some(), "左分支句柄经 merge 以原 fd 可见");
+    assert!(reg.lookup(rfd).is_some(), "右分支句柄经 merge 以原 fd 可见");
 }
 
 /// D10 对齐：Replace 分支先 recover 再 `reg.clear()` —— handles 与线性标记

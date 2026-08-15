@@ -107,9 +107,11 @@ pub struct Runtime {
     pub context: Context,
     undo_stack: UndoStack,
     resource_registry: ResourceRegistry,
-    /// 共享执行器（CTO 批准方向，D14 阶段 3）：公开 API `Runtime::new(Box<dyn>)`
+    /// 共享执行器（CTO 批准方向，D14 阶段 3 + D19）：公开 API `Runtime::new(Box<dyn>)`
     /// 不变，内部以 `Arc<Mutex>` 包装 —— Fork 并行分支各持 Arc 克隆，经锁
     /// 互斥串行化执行器调用（锁仅保护执行器内部状态，物理 IO 本身异步）。
+    /// `SyscallExecutor: Send` 超 trait（D19）使 `Mutex<T>: Sync` 成立，
+    /// 编译期强制 executor Send，无需 unsafe 包装。
     executor: SharedExecutor,
     /// 余效应上下文（可选 feature `coeffects`，pdr.md §5.2）。
     #[cfg(feature = "coeffects")]
@@ -124,12 +126,12 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(executor: Box<dyn SyscallExecutor>) -> Self {
+    pub fn new(executor: Box<dyn SyscallExecutor + Send>) -> Self {
         Self {
             context: Context::new(),
             undo_stack: UndoStack::new(),
             resource_registry: ResourceRegistry::new(),
-            executor: Arc::new(tokio::sync::Mutex::new(SendExecutor(executor))),
+            executor: Arc::new(tokio::sync::Mutex::new(executor)),
             #[cfg(feature = "coeffects")]
             dependency_table: Some(CoeffectStore::new()),
             #[cfg(feature = "coeffects")]
@@ -209,9 +211,11 @@ impl Runtime {
     ///   （D14 阶段 3，pdr.md §2.1「并发分叉」/ §19.2「Fork→spawn 合法」）：
     ///   两分支各自持有 registry/context 隔离副本（D13）+ 独立 UndoStack，经
     ///   共享执行器 Arc<Mutex> 通道在独立阻塞线程上并发驱动，完成后合并回父
-    ///   （registry `merge`：handles/consumed/owned_consumed 并集 + next_fd=max；
+    ///   （registry `merge`：handles/consumed/owned_consumed 并集 + next_fd=max
+    ///   归一化；F1 修复：spawn 前右分支预分割 fd 区间避免两分支撞 fd；
     ///   undo：right 先、left 后，保持 LIFO 与观察序）；can_parallel=false
-    ///   保持顺序执行（left→right→combine）；
+    ///   保持顺序执行（left→right→combine），完成后同样 merge 回父（F2 修复：
+    ///   分支 fd 与线性标记不泄漏）；
     /// - `Replace`：**先 `recover()` + `reg.clear()`**（LIFO 执行全部累积逆操作
     ///   并清空撤销栈与 registry 句柄/线性标记，next_fd 保留 D1）再执行 target，
     ///   以其结果结束（D10，安全默认：资源不泄漏）；
@@ -220,8 +224,8 @@ impl Runtime {
     /// - `Catch`：仅处理错误值，不触碰撤销栈（recover 语义在 Replace/recover 路径）；
     /// - `WatchSignal`/`Invoke`：委托执行器，默认 ENOSYS（`Other(38)`）原样透传。
     ///
-    /// 注意：`interpret` 的 future 非 `Send`（冻结签名 `&mut dyn SyscallExecutor`
-    /// 无 Send 超 trait），直接 `.await` 时需在非 Send 要求上下文中进行
+    /// 注意：`interpret` 的递归 future 经非 Send 的 `LocalBoxFuture` 包装，
+    /// 直接 `.await` 时需在非 Send 要求上下文中进行
     /// （如 `run_blocking`）；Fork 并行子任务在 `spawn_blocking` 线程内以
     /// current-thread runtime 驱动（`drive`，同 `tests/concurrency_stress.rs`）。
     pub async fn run(&mut self, action: Action) -> Result<Value, SysError> {
@@ -259,11 +263,11 @@ impl Runtime {
     }
 }
 
-/// 子 Action 递归用的非 Send future。
+/// 子 Action 递归用的本地 future 包装。
 ///
-/// 不能复用 syscall.rs 的 `BoxFuture`（强制 `+ Send`）：冻结签名
-/// `&mut dyn SyscallExecutor` 的 trait 对象无 `Send` 超 trait，
-/// 因此 `interpret` 及其递归 future 均非 `Send`。
+/// 保留非 `Send` 的 `Pin<Box<dyn Future>>` 别名（区别于 syscall.rs 的
+/// `BoxFuture` 强制 `+ Send`）：虽 `SyscallExecutor: Send`（D19）后 `&mut dyn`
+/// 已可 Send，但保持最小改动，不把递归 future Send 化（Send 化留待后续）。
 type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// 递归执行子 Action（async fn 不可直接自递归，统一 `Box::pin`）。
@@ -282,32 +286,7 @@ fn run_sub_impl<'a>(
 /// `Arc<tokio::sync::Mutex<…>>` 包装执行器（公开 API `Runtime::new(Box<dyn>)`
 /// 不变）；Fork 并行子任务各持 Arc 克隆，经锁互斥串行化执行器调用（锁仅
 /// 保护执行器内部状态，物理 IO 本身异步）。
-type SharedExecutor = Arc<tokio::sync::Mutex<SendExecutor>>;
-
-/// 执行器 Send 包装（「公开 API 不变、内部包装」的落地）：冻结契约 D3 的
-/// `SyscallExecutor` 无 `Send` 超 trait，而共享互斥设计要求跨线程传递
-/// `Arc<Mutex<…>>`（`spawn_blocking` 闭包须 `Send`，`Mutex<T>: Sync` 需
-/// `T: Send`）。
-///
-/// 安全性论证：执行器**只在** `Mutex` 独占锁内以 `&mut` 访问（`exec_via` 等
-/// 每调用加锁，`Runtime::run`/`run_blocking` 不持有跨调用锁），跨线程表现为
-/// 单线程串行语义 —— 与 `Mutex<T: Send>` 的保守界等价。
-struct SendExecutor(Box<dyn SyscallExecutor>);
-
-unsafe impl Send for SendExecutor {}
-
-impl std::ops::Deref for SendExecutor {
-    type Target = Box<dyn SyscallExecutor>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for SendExecutor {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+type SharedExecutor = Arc<tokio::sync::Mutex<Box<dyn SyscallExecutor + Send>>>;
 
 /// 执行器访问通道（运行时内部）：
 /// - `Direct`：冻结公共签名 `interpret(action, ..., ex: &mut dyn SyscallExecutor)`
@@ -433,17 +412,28 @@ pub fn fork_conflict(reg: &ResourceRegistry, left: &Action, right: &Action) -> b
     !reg.can_parallel(&l_res, &r_res)
 }
 
+/// Fork 分支 fd 预分割偏移（F1 审查修复）：左右分支都克隆自父（同源
+/// `next_fd`），若都分配新 fd 会得到**相同 fd** —— merge 时 `HashMap::extend`
+/// 静默覆盖丢弃一侧句柄，执行器内部轮换映射同样碰撞。修复：右分支在远离
+/// 父/左分支的高位区间（偏移大常数）分配，左分支沿用父基线，两区间互不
+/// 重叠（fd 身份保留：分支返回值携带的 Fd 与 merge 后 registry 中句柄一致）。
+/// 嵌套 Fork 每层相对当前基线再偏移一次，区间依然不相交（`N + k·2^48`）。
+const FORK_FD_REGION_OFFSET: u64 = 1 << 48;
+
 /// Fork 并行分支执行（D14 阶段 3，CTO 批准方向）：
 ///
 /// 两分支各自持有 registry/context 隔离副本（D13：Clone）+ 独立 UndoStack，
 /// 经共享执行器通道（Arc<Mutex>，每 Syscall 调用互斥 —— 锁仅保护执行器内部
 /// 状态，物理 IO 本身异步）在**独立阻塞线程**上以 current-thread runtime 并发
-/// 驱动（interpret future 非 Send，参考 concurrency_stress.rs 的 drive 模式；
-/// pdr.md §19.2「Fork → tokio::spawn 合法」/ 支柱三结构相似性）。
+/// 驱动（参考 concurrency_stress.rs 已验证的 drive 模式；外层 tokio::spawn N +
+/// 内层 spawn_blocking 驱动 current-thread runtime）。
 ///
 /// 完成后合并回父：
 /// - registry：子 handles 以原 fd 并入 + consumed/owned_consumed 并集 +
-///   `next_fd = max`（`ResourceRegistry::merge`，RFC-A3-2 / D13「合并回父」）；
+///   `next_fd = max` 归一化（`ResourceRegistry::merge`，RFC-A3-2 / D13「合并
+///   回父」）；F1 修复：spawn 前右分支 `offset_next_fd(1<<48)` 预分割 fd 区间，
+///   两分支分配互不冲突，合并后父 `next_fd = max(父, 左, 右)`（= 全部已分配
+///   fd 最大值 + 1，D1 单调不复用）;
 /// - undo：并入顺序为 left 后 right（栈序与顺序路径一致）—— LIFO recover
 ///   先执行 right 的逆操作再执行 left 的（right 的效果后发生、先撤销，
 ///   与「left 先执行」的观察序一致）。
@@ -463,6 +453,9 @@ async fn run_fork_parallel(
     let mut r_ctx = ctx.clone();
     let mut l_reg = reg.clone();
     let mut r_reg = reg.clone();
+    // F1 修复：spawn 前预分割 fd 区间 —— 右分支 next_fd 偏移大常数，两分支
+    // 分配互不重叠（见 `FORK_FD_REGION_OFFSET` 注释）。
+    r_reg.offset_next_fd(FORK_FD_REGION_OFFSET);
     let mut l_undo = UndoStack::new();
     let mut r_undo = UndoStack::new();
     let l_shared = shared.clone();
@@ -495,7 +488,8 @@ async fn run_fork_parallel(
     let (r_res, r_reg, r_undo) = r_task.await.expect("Fork 并行右分支任务 panic");
 
     // 合并回父（D13「完成后合并回父」/ RFC-A3-2）：
-    // fd 不冲突（D1 单调：子从父 clone 的 next_fd 起算，合并时父 next_fd = max）。
+    // fd 不冲突（F1：右分支区间预分割 + D1 单调，子分配 ≥ 自身 next_fd
+    // 且两分支区间不相交；合并时父 next_fd = max 归一化 = 全部已分配 fd + 1）。
     reg.merge(l_reg);
     reg.merge(r_reg);
     // undo：先并入 left 再并入 right —— 栈序 [left, right] 与顺序路径一致
@@ -519,7 +513,8 @@ async fn run_fork_parallel(
 /// - `Fork`：D14 阶段 3 —— 静态冲突检测（`fork_conflict`）；`can_parallel=true`
 ///   且为 `Shared` 通道时真并行（`run_fork_parallel`：registry/ctx 隔离 + 独立
 ///   UndoStack + 共享执行器，完成后合并回父），否则顺序执行（left→right→combine，
-///   阶段 1 语义保持）；
+///   阶段 1 语义保持）；两条路径完成后均 merge 回父（F2：顺序路径不丢分支 fd/
+///   线性标记），且右分支均预分割 fd 区间（F1：两分支不撞 fd）；
 /// - `Scope`：cwd 压栈/弹栈（inner 出错时同样恢复）；
 /// - `Replace`：先 `recover()`（清空撤销栈）+ `reg.clear()`（释放 handles 与
 ///   线性标记，next_fd 保留 D1），再执行 target，以其结果结束（D10）；
@@ -587,13 +582,22 @@ async fn interpret_impl(
                 let conflict = fork_conflict(reg, &left, &right);
                 let parallel = !conflict && matches!(&access, ExecAccess::Shared(_));
                 if !parallel {
-                    // 顺序路径（阶段 1 语义保持）：分支 registry 隔离（D13 Clone），
-                    // 共享同一 undo 栈与 ctx（left 先、right 后，观察序即压栈序）。
+                    // 顺序路径（阶段 1 语义保持 + F1/F2 修复）：分支 registry 隔离
+                    // （D13 Clone），共享同一 undo 栈与 ctx（left 先、right 后，观察序
+                    // 即压栈序）；完成后**同样 merge 回父**（left 先、right 后，merge
+                    // 顺序与观察序一致）—— 分支新分配的 fd 与线性标记（Write 消费 /
+                    // Own 终结）并入父，修复分支 fd 泄漏与「冲突型 Fork 后父级同资源
+                    // Write 被 A4 错误放行」（F2）。右分支同样 `offset_next_fd` 预分割
+                    // fd 区间（两分支同源父 next_fd，若都分配新 fd 会撞 fd，F1）。
+                    // 成功/失败均合并（同并行路径「子任务错误仍合并」）。
                     let mut l_reg = reg.clone();
                     let mut r_reg = reg.clone();
-                    let lv = run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow()).await?;
-                    let rv = run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow()).await?;
-                    let na = combine(lv, rv);
+                    r_reg.offset_next_fd(FORK_FD_REGION_OFFSET);
+                    let lv = run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow()).await;
+                    let rv = run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow()).await;
+                    reg.merge(l_reg);
+                    reg.merge(r_reg);
+                    let na = combine(lv?, rv?);
                     (Value::Unit, na)
                 } else {
                     // 并行路径：子任务隔离副本 + 共享执行器，完成后合并回父。
