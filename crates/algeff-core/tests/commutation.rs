@@ -23,8 +23,8 @@
 //! `Fd(1)/Fd(2)` 静态声明的**纯资源隔离**场景，不依赖运行时 fd 分配区间语义
 //! （不新分配 fd、无子 registry 句柄并入父的区间交互），因此修复前后断言均不受影响。
 //!
-//! 工程约束（同 execution_axioms.rs）：`interpret` 的 future 因冻结签名
-//! `&mut dyn SyscallExecutor`（trait 无 `Send` 超 trait）而**非 Send**，用普通
+//! 工程约束（同 execution_axioms.rs）：`interpret` 的 future 经非 Send 的
+//! `LocalBoxFuture` 包装（runtime.rs，递归子 Action 刻意保留非 Send）而**非 Send**，用普通
 //! `#[test]` + 本地 current-thread runtime 驱动（`drive`）；`Runtime::new` 须在
 //! tokio 上下文之外调用（D9）。命名含公理编号属任务强制命名，故文件级允许
 //! non_snake_case。

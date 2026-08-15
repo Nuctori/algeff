@@ -93,7 +93,7 @@ b.iter(|| rt.block_on(runtime.run(algeff_action_chain())));
 Open 成本仍在 iter 计时内。
 
 **批 4 实测**：366%（vs 批 3 D14 顺序 340%，无实质改善）。D17 并行路径已触发但读仍
-串行化——执行器互斥锁（`Arc<Mutex<SendExecutor>>`）在 `exec_via` 中对整个
+串行化——执行器互斥锁（`Arc<Mutex<Box<dyn SyscallExecutor + Send>>>`）在 `exec_via` 中对整个
 `execute`（含物理 IO await）持锁，跨分支 Syscall 全部串行。锁边界收窄属 A2 域
 （runtime.rs），A7 不改；复测目标回归 pdr §16 ~100%。
 

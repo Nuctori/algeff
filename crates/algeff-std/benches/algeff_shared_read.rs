@@ -10,7 +10,7 @@
 //!
 //! **A7 批 4 实测（D17 并行后）**：并行路径确实被触发（分支线程并发、读-读无冲突），
 //! 但读**无并行收益**，归因两层串行化：
-//! 1. 执行器互斥锁（`ExecAccess::Shared` 的 `Arc<Mutex<SendExecutor>>`）在
+//! 1. 执行器互斥锁（`ExecAccess::Shared` 的 `Arc<Mutex<Box<dyn SyscallExecutor + Send>>>`）在
 //!    `exec_via` 中对整个 `execute`（含物理 IO await）持锁 → 跨分支 Syscall
 //!    全部串行；
 //! 2. 同一 fd 的游标读共用 `files[fd]` 的文件互斥锁与游标（`op_read` 按序
