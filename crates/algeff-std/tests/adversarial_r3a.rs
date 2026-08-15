@@ -115,11 +115,7 @@ fn open_fd(rt: &mut Runtime, path: PathBuf) -> u64 {
 
 /// 确定的错误 syscall：Read 不存在 fd → NotFound（无 undo、无副作用）。
 fn read_missing(fd: u64) -> Action {
-    syscall(
-        DataOp::Read { fd, len: 1 },
-        vec![rd(fd)],
-        Action::Pure,
-    )
+    syscall(DataOp::Read { fd, len: 1 }, vec![rd(fd)], Action::Pure)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -160,11 +156,12 @@ fn catch_keeps_undo_and_registry_intact() {
         })
         .unwrap();
     assert_eq!(v, Value::U64(7), "handler 返回值");
-    assert_eq!(rt.undo_stack().len(), 1, "Catch 不触碰撤销栈（Write undo 保留）");
-    assert!(
-        rt.registry().lookup(fd).is_some(),
-        "Catch 不释放注册表句柄"
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "Catch 不触碰撤销栈（Write undo 保留）"
     );
+    assert!(rt.registry().lookup(fd).is_some(), "Catch 不释放注册表句柄");
     assert_eq!(std::fs::read(&pa).unwrap(), b"Xeep-original", "写已生效");
 
     // 错误捕获后 Replace：先前 Write 的 undo 仍可完整恢复。
@@ -268,11 +265,7 @@ fn catch_nested_inner_handled_outer_skipped_then_inner_handler_errors() {
                 handler: Box::new(|_| read_missing(888_888)),
             }),
             handler: Box::new(|e| {
-                assert_eq!(
-                    e,
-                    SysError::NotFound,
-                    "内层 handler 的新错误被外层捕获"
-                );
+                assert_eq!(e, SysError::NotFound, "内层 handler 的新错误被外层捕获");
                 Action::Pure(Value::U64(22))
             }),
         })
@@ -332,7 +325,11 @@ fn catch_inside_timeout_and_timeout_error_caught() {
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
-    assert_eq!(std::fs::read(&pa).unwrap(), b"tc-original", "Timeout+Catch 后撤销链完整");
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"tc-original",
+        "Timeout+Catch 后撤销链完整"
+    );
 
     // (b) Catch 包 Timeout：Sleep(10s) 被 50ms 超时打断 → on_timeout 的
     //     Read(777777) 出错 → Timeout 返回 Err → 外层 Catch 捕获。
@@ -474,7 +471,10 @@ fn scope_inner_replace_restores_cwd_and_state() {
         .unwrap();
     assert_eq!(v, Value::U64(1), "Scope next 在退出后执行");
     assert_eq!(rt.context().cwd, before, "Scope 内 Replace 后 cwd 恢复");
-    assert!(rt.undo_stack().is_empty(), "Scope 内 Replace 已 recover 清栈");
+    assert!(
+        rt.undo_stack().is_empty(),
+        "Scope 内 Replace 已 recover 清栈"
+    );
     assert_eq!(
         std::fs::read(&pa).unwrap(),
         b"sc-original",
@@ -574,11 +574,7 @@ fn fork_branch_scope_error_cwd_restored_effects_merged() {
                         combine: Box::new(|_, _| Action::Pure(Value::Unit)),
                     }),
                     handler: Box::new(|e| {
-                        assert_eq!(
-                            e,
-                            SysError::NotFound,
-                            "左分支 Scope 内错误传播到外层 Catch"
-                        );
+                        assert_eq!(e, SysError::NotFound, "左分支 Scope 内错误传播到外层 Catch");
                         Action::Pure(Value::U64(5))
                     }),
                 }
@@ -728,8 +724,16 @@ fn undo_same_file_two_fds_lifo_recover_inverse_order() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(std::fs::read(&pa).unwrap(), b"XY3DEFGH", "两写叠加生效（硬链接同 inode）");
-    assert_eq!(rt.undo_stack().len(), 2, "同文件两条 undo（不同 fd 各一次）");
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"XY3DEFGH",
+        "两写叠加生效（硬链接同 inode）"
+    );
+    assert_eq!(
+        rt.undo_stack().len(),
+        2,
+        "同文件两条 undo（不同 fd 各一次）"
+    );
 
     // LIFO：第二写 undo 先执行（→"123DEFGH"），第一写 undo 后执行（→"ABCDEFGH"）。
     rt.run_blocking(Action::Replace {
