@@ -40,7 +40,7 @@ jobs:
         run: cargo test --workspace
 
       # 特性测试：crates/algeff-core/tests/runtime_features.rs 的 7 个测试
-      # 由 coeffects/virtual-clock 特性门控，默认测试不含，此处双平台补跑。
+      # 由 coeffects/virtual-clock 特性门控，默认测试不含，此处三平台补跑。
       - name: cargo test --workspace --features coeffects,virtual-clock
         run: cargo test --workspace --features coeffects,virtual-clock
 
