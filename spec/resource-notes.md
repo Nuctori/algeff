@@ -219,6 +219,7 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 `ResourceArbiter::try_claim(set)` 对 set 中每个资源原子占坑——先在副本上
 模拟全部占坑，全部可占才提交，任一失败**整体回滚**（自身状态完全不变，
 无部分占坑残留）。调用方在失败后执行已累积逆操作并**有限重试**（如指数退避
+
 - 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
 `.lock().await` 不得在解释器任务内直接使用（会挂起等待，引入循环等待风险，
 见 §2）。
@@ -429,3 +430,7 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 风暴 8 分支 × 30 轮下可观察）。记录（阶段 3+ 优化）：退避移出锁内（先释放
 仲裁锁再 sleep，或仲裁器内部异步退避队列）。对正确性无影响（退避有界、无
 死锁，A7 成立），纯性能放大。
+
+### RFC-10：Windows 原生错误码未映射至 POSIX 语义（R4b 对抗发现）
+
+`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
