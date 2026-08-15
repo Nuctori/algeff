@@ -340,9 +340,10 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 不选择「放弃」：pdr.md §9.2 与命题 P3 明确将 make_mut 列为物理载体，阶段 3
 并行写需要它。不选择「立即实施」：冻结面内无测试暴露缺口，性价比不足。
 
-## 10. R2 审计已知缺陷登记（RFC-06 / RFC-07）
+## 10. R2 审计已知缺陷登记（RFC-06 / RFC-07 / RFC-08）
 
-> R2 对抗审计（`crates/algeff-std/tests/adversarial_r2.rs`）新确认的两项已知缺陷。
+> R2 对抗审计（`crates/algeff-std/tests/adversarial_r2.rs`）新确认的已知缺陷（RFC-06/07/08，
+> 含 RFC-06 的 D1 边界影响小节）。
 > 均不在冻结面（runtime.rs / executor.rs / resource.rs）允许的最小修复范围内，
 > 以「断言偏差可复现」测试记录，阶段 3+ 修复。
 
@@ -371,8 +372,7 @@ registry 经 D13 Clone 做分支隔离时，`ResourceHandle::PipeReader/PipeWrit
 Arc<Mutex> 覆盖管道半端，或 §9 的 make_mut + 代际标记），executor 属 A5 域，
 冻结面外。§9.3.1「无测试暴露其缺失」已被本项修正。
 
-测试记录：`adversarial_r2.rs` 分支冲突负载改用文件（`fd_1000_conflict_forks_region_*`
-`、`fd_region_quadratic_growth_*`），保留 fd 分配属性覆盖；修复后可将负载改回管道。
+测试记录：`adversarial_r2.rs` 分支冲突负载改用文件（`fd_1000_conflict_forks_region_*`、`fd_region_quadratic_growth_*`），保留 fd 分配属性覆盖；修复后可将负载改回管道。
 
 ### RFC-08：Timeout 内并行 Fork 的孤儿分支副作用不可撤销（P4/A6 义务边界反例）
 

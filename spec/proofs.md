@@ -37,7 +37,7 @@
 
 ## P2：资源不相交的并行组合满足交换律
 
-**陈述**：若 `Δ(a) ∩ Δ(b) = ∅` 且 combine `f` 对称（`Sym(f) := ∀x,y. f(x,y)=f(y,x)`），则 `Fork(a,b,f) ≡ Fork(b,a,f)`（R2 数学审计：陈述已并入 Sym 前提与 Δ-覆盖前提，与 axioms.md A3 同步）。
+**陈述**：若 `Δ(a) ∩ Δ(b) = ∅` 且 combine `f` 对称（`Sym(f) := ∀x,y. f(x,y)=f(y,x)`）且 Δ-覆盖（`Cov(Δ)`：a 的每个效果只读写 Δ(a) 内资源），则 `Fork(a,b,f) ≡ Fork(b,a,f)`（R2 数学审计：陈述已并入 Sym 与 Δ-覆盖前提，与 axioms.md A3 同步）。
 
 **证明**
 
