@@ -34,7 +34,7 @@
 
 | 义务 | 陈述 | 证明位置 | 测试证据 | 审计结论 |
 | --- | --- | --- | --- | --- |
-| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 | ✅ 有效（R1：演绎链严格，隐含前提由执行级测试补足） |
+| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 + adversarial_r4c.rs（1000 节点平链规模证据） | ✅ 有效（R1/R4：演绎链严格，规模证据；**范围前提（R5 审查）**：深度守卫阈值 96 下结合律在深度 ≤96 内成立——同链长右结合形式先触及阈值，边界处两种结合形式行为可不对称，超限行为不在结合律承诺内） |
 | P2 交换律 | Δ(a)∩Δ(b)=∅ ∧ Sym(f) ∧ Cov(Δ) ⇒ Fork(a,b,f)≡Fork(b,a,f) | spec/proofs.md（R2 修正 + R3 静态可见性前提） | commutation.rs + a3_can_parallel_symmetric + adversarial_r3b.rs 盲区实证 | ✅ 有效（附声明前提）（R2 收敛 + R3：盲区前提入依赖清单，工程应用范围限定） |
 | P3 分支写隔离 | Choose/Fork 写隔离 | spec/proofs.md（R3：make_mut 文本同步为范围声明） | fork_same_fd_write + branch_isolation.rs（4 测试）+ adversarial_r3a.rs（Fork 内 Scope cwd 恢复/双分支 undo 合并/8 文件 LIFO 撤销栈压力） | ⚠️ 部分→**有效（附范围声明）**（R3 升级：语义层证据充分；物理层 make_mut 阶段 3 推迟有完整裁决） |
 | P4 撤销双态 | w;w̄ 状态恢复 | spec/proofs.md（R3：trackΓ+Full 限定 + RFC-08/09 例外） | exec_A6 + e2e undo + adversarial_r1.rs + r3a.rs（catch 组合/撤销栈压力） | ⚠️ 部分（R1/R3：证明有效、边界完整；范围例外 RFC-05/08/09 登记，句柄活性反例未闭环——RFC-05） |

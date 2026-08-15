@@ -36,7 +36,7 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 | CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + feature 测试 + mdBook 构建 | — | — |
 | 文档（`docs/` mdBook + `spec/` 形式化） | 已齐备（G3 门禁） | — | — |
 
-- 测试合计：`cargo test --workspace` 273 个测试函数全绿（36 个测试二进制 + 3 个 doc-test 运行）。
+- 测试合计：`cargo test --workspace` 276 个测试函数全绿（39 个测试二进制 + 3 个 doc-test 运行）。
 - 特性测试：`crates/algeff-core/tests/runtime_features.rs` 的 7 个测试由 `--features coeffects,virtual-clock` 门控，默认测试不含；CI 双平台补跑 `cargo test --workspace --features coeffects,virtual-clock` 覆盖。
 - 性能基线：`perf/baseline-2026-08-15.txt`（A7 批 2-4），含原生 tokio 参照列与 Algeff 对比列（D17 并行 Fork 后复测：echo 103.1%、parallel_reads 366.2%、shared_read 570.9%、append 24.3%；批 3 D14 顺序基线保留为历史对照），接入说明见 `crates/algeff-std/benches/README.md`。
 - 发布准备（G4 终验）：三个 crate 的 `cargo publish --dry-run --registry crates-io` 全部通过（RFC-1 已落地：`algeff-std` 的 path 依赖补 `version = 0.1.0`）。`algeff-std` 因依赖尚未真实发布的 `algeff-core`，需 `scripts/release.sh --allow-unpublished-deps`（以本地成员代偿 registry 存在性校验）——属 cargo 固有的发布顺序约束，先真实发布 core、镜像同步后 std 自然解除。
