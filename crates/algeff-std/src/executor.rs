@@ -251,6 +251,10 @@ impl TokioExecutor {
                     orig.truncate(filled);
                     file.write_all(data).await?;
                     // 撤销：恢复原区域 + 截断回写前长度（D15：仅捕获物理数据）。
+                    // 审计 R1（对抗测试 rev_undo_restores_file_cursor）：A6 双态
+                    // w;w̄ = 1 要求**全部可观察状态**复原——游标（经 Seek(Current)
+                    // 可观察）也必须回到写前位置。修复：恢复内容与长度后 seek 回
+                    // `pos`（此前游标停留在 pos+orig.len()，破坏撤销双态）。
                     let undo_file = m.clone();
                     let undo: UndoOp = Box::pin(async move {
                         let mut g = undo_file.lock().await;
@@ -259,6 +263,7 @@ impl TokioExecutor {
                         }
                         let _ = g.write_all(&orig).await;
                         let _ = g.set_len(orig_len).await;
+                        let _ = g.seek(std::io::SeekFrom::Start(pos)).await;
                     });
                     Some(undo)
                 } else {
