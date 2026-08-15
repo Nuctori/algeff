@@ -34,10 +34,14 @@ pub enum Value {
     List(Vec<Value>),
 }
 
-pub type NextFn = Box<dyn FnOnce(Value) -> Action>;
-pub type CondFn = Box<dyn FnOnce(&Value) -> bool>;
-pub type CombineFn = Box<dyn FnOnce(Value, Value) -> Action>;
-pub type HandlerFn = Box<dyn FnOnce(SysError) -> Action>;
+/// 蓝图 CPS 闭包（D18 契约修订，CTO 裁决）：Fork 线程级并行
+/// （pdr.md §19.2「Fork → tokio::spawn 合法」）要求 `Action` 可跨线程
+/// （`spawn_blocking` 闭包须 `Send`），四类闭包统一加 `+ Send`；
+/// 捕获数据须为 `Send`（仓库内全部现有蓝图闭包捕获均 Send，已验证）。
+pub type NextFn = Box<dyn FnOnce(Value) -> Action + Send>;
+pub type CondFn = Box<dyn FnOnce(&Value) -> bool + Send>;
+pub type CombineFn = Box<dyn FnOnce(Value, Value) -> Action + Send>;
+pub type HandlerFn = Box<dyn FnOnce(SysError) -> Action + Send>;
 
 /// Open 的访问标志（手写结构体，不引入 bitflags 依赖）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

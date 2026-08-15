@@ -257,6 +257,21 @@ impl ResourceRegistry {
         self.owned_consumed.clear();
     }
 
+    /// 合并另一个注册表的状态（决策 D13「完成后合并回父」，RFC-A3-2 / A1
+    /// 审计偏差-1 落地）：`other` 的全部句柄按**原 fd** 直接插入（fd 不冲突由
+    /// D1 单调性保证：`other` 克隆自 `self` 或其子，新分配的 fd 均 ≥ 自身
+    /// `next_fd`，与自身已有句柄互不重叠）、`consumed`/`owned_consumed` 取
+    /// 并集、`next_fd = max(self.next_fd, other.next_fd)`。
+    ///
+    /// 由 A2 解释器在 Fork 并行分支完成后调用（D14 升级）；本方法为加法
+    /// API，不改变任何既有方法签名。
+    pub fn merge(&mut self, other: Self) {
+        self.handles.extend(other.handles);
+        self.consumed.extend(other.consumed);
+        self.owned_consumed.extend(other.owned_consumed);
+        self.next_fd = self.next_fd.max(other.next_fd);
+    }
+
     /// 公理 A4 线性检查（运行时断言）：
     /// - Write：每资源至多一次（重复 Write 拒绝）；
     /// - Own：终结操作（Own 之后该资源任何 usage —— Read/Write/Append/Own —— 都拒绝）；
@@ -590,6 +605,72 @@ mod tests {
             .check_linear(&usage(r.clone(), AccessMode::Write))
             .is_ok());
         assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+    }
+
+    #[test]
+    fn merge_preserves_fd_identity() {
+        // D13 合并（RFC-A3-2）：子注册表句柄以**原 fd** 直接并入父，fd 身份保留
+        // （区别于 take+allocate 值迁移的 fd 重分配 workaround）。
+        let mut parent = ResourceRegistry::new();
+        let p1 = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        let mut child = parent.clone();
+        let c1 = child.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert!(parent.lookup(c1).is_none(), "合并前父不可见子句柄");
+        parent.merge(child);
+        assert!(parent.lookup(p1).is_some(), "父原有句柄保留");
+        assert!(
+            parent.lookup(c1).is_some(),
+            "合并后父以原 fd 可见子句柄（fd 身份保留）"
+        );
+    }
+
+    #[test]
+    fn merge_unions_consumed() {
+        // 子路径的线性消费（Write 至多一次 + Own 终结）随 merge 并入父：
+        // 合并后父侧同键检查与子侧一致（spec/axioms.md 提示的 consumed 合并）。
+        let mut parent = ResourceRegistry::new();
+        let mut child = parent.clone();
+        let r = Resource::Fd(1);
+        assert!(child
+            .check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok());
+        assert!(child
+            .check_linear(&usage(r.clone(), AccessMode::Own))
+            .is_ok());
+        // 合并前父对该键无消费记录（Read 通过）
+        assert!(parent
+            .check_linear(&usage(r.clone(), AccessMode::Read))
+            .is_ok());
+        parent.merge(child);
+        // 合并后：Write 已消费（再 Write 拒绝）+ Own 已终结（任何 usage 拒绝）
+        assert_eq!(
+            parent.check_linear(&usage(r.clone(), AccessMode::Write)),
+            Err(SysError::InvalidInput),
+            "子路径 Write 消费记录应并入父"
+        );
+        assert_eq!(
+            parent.check_linear(&usage(r.clone(), AccessMode::Read)),
+            Err(SysError::InvalidInput),
+            "子路径 Own 终结记录应并入父"
+        );
+    }
+
+    #[test]
+    fn merge_advances_next_fd() {
+        // 子侧分配的 fd 高于父 next_fd：merge 后父 next_fd = max，
+        // 父继续分配不会与子侧 fd 冲突（D1 单调 + 无重复 fd）。
+        let mut parent = ResourceRegistry::new();
+        let p1 = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        let mut child = parent.clone();
+        let c1 = child.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        let c2 = child.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert!(c1 > p1 && c2 > c1, "子新 fd 应高于父已有全部 fd");
+        parent.merge(child);
+        let n = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert!(
+            n > c2 && n > p1,
+            "合并后父 next_fd = max，新分配不冲突（n={n} > c2={c2}）"
+        );
     }
 
     #[test]
