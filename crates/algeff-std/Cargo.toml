@@ -2,6 +2,7 @@
 name = "algeff-std"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Algeff 标准适配层：tokio 物理后端（DataOp 执行器 + 预包装适配器）"
 
 [dependencies]
