@@ -92,6 +92,10 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   release、held；Read 共享 / Write·Own·Append 互斥）；配套测试
   `crates/algeff-core/tests/arbiter.rs`（原子回滚、模式矩阵、释放重占、有限重试
   不变量）；新增 §8「ResourceArbiter 与 A7 的映射」。
+- s4/a3：arbiter 属性测试强化——新增 `ResourceArbiter::is_clean`（泄漏检测原语）；
+  测试增补 proptest（随机 claim/release 交错序列：单调不减 / 失败原子性快照 /
+  无泄漏三不变量）、同资源 4×4 互斥矩阵穷举、`is_clean` 全生命周期测试；
+  §8 增补属性测试不变量说明与 `is_clean` 用法。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -216,3 +220,28 @@ MutexLock 执行时先 `registry.lookup(fd)` 取物理句柄（A5 执行器 `try
 跨任务互斥），arbiter 记录本仲裁域的占坑并提供 set 级原子性与失败回滚的可重试
 性。`can_parallel`（静态）负责 Fork 级并行判定，arbiter（动态）负责 MutexLock
 级占坑——两层职责正交，互不依赖。
+
+**属性测试强化（批 4，A7 不变量）**：`tests/arbiter.rs` 新增 proptest
+`random_claim_release_keeps_invariants`，对随机 (resource, mode) 集合 × 随机
+claim/release 交错序列断言三条不变量：
+
+1. **单调不减**：每次 `try_claim` 返回 `true` 后，held 集 = 本次集合 ∪ 之前持有
+   （占坑只增不减，直到 `release` 才缩小）；
+2. **原子性快照**：`try_claim` 返回 `false` 后，arbiter 状态与调用前完全一致
+   （对资源池逐资源做布尔 held 快照断言，无部分占坑残留——对应 A7「原子占坑 +
+   失败回滚」）；
+3. **无 panic / 无泄漏**：随机序列全程不 panic；测试维护一个与实现同编码的独立
+   参照模型（Read 计数累加 / `usize::MAX` 独占标记）作为 oracle，每步交叉校验
+   arbiter 与模型的布尔 held 状态一致；结束时按模型释放全部占坑，断言
+   `is_clean()` 为 `true`（claims 表空）——任何计数漂移（如 Read 多计）都会在此
+   泄漏检测中暴露。
+
+**`is_clean` 用法**：`ResourceArbiter::is_clean(&self) -> bool` 是仲裁表空检测
+原语（`claims` 为空即无任何占坑），供泄漏检测与「全部释放后复位」断言使用：
+新建时干净、持有时不干净、失败的 `try_claim` 不改变干净度、全部 `release` 后
+恢复干净（测试 `is_clean_tracks_full_lifecycle` 验证全生命周期）。
+
+**动态层互斥矩阵穷举**：`arbiter_mutex_matrix_exhaustive_4x4` 对同资源 4×4
+模式对穷举（第一方任意模式首占成功，第二方仅 Read×Read 可共享），与 §9.1
+冲突矩阵一致：Read-Read 可、Read-Write 不可、Write-Write 不可、Own×任意不可、
+Append×Append 保守不可（对齐决策 D6，opt-in 由静态层 `can_parallel_with` 表达）。
