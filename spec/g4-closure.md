@@ -61,7 +61,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 
 | 条件 | 批 5 状态 | 批 6 复核（代码/测试证据） | 结论 |
 | --- | --- | --- | --- |
-| **C1（偏差-1）** D13「完成后合并回父」 | 保持开放 | `resource.rs::merge`（:268，RFC-A3-2 语义：原 fd 直接插入 + consumed/owned_consumed 并集 + `next_fd=max`，doc 注明「偏差-1 落地」）已实现，接入 `runtime.rs::run_fork_parallel`（完成两子分支后 `reg.merge(l_reg); reg.merge(r_reg);`，undo 按 left→right append 保持 LIFO）；测试：`interpreter.rs::fork_parallel_true_path`（子句柄原 fd 并入父、父 next_fd=max 不冲突）、`fork_parallel_undo_merge`（recover 先 right 后 left，与顺序路径观察序一致）、`resource.rs::merge_preserves_fd_identity`、`merge_unions_consumed`、`merge_advances_next_fd` | ✅ **核销**（代码级，A2 批 4） |
+| **C1（偏差-1）** D13「完成后合并回父」 | 保持开放 | `resource.rs::merge`（:268，RFC-A3-2 语义：原 fd 直接插入 + consumed/owned_consumed 并集 + `next_fd=max`，doc 注明「偏差-1 落地」）已实现，接入 `runtime.rs::run_fork_parallel`（完成两子分支后 `reg.merge(l_reg); reg.merge(r_reg);`，undo 按 left→right append 保持 LIFO）；测试：`interpreter.rs::fork_parallel_true_path`（子句柄原 fd 并入父、父 next_fd=max 不冲突）、`fork_parallel_undo_merge`（recover 先 right 后 left，与顺序路径观察序一致）、`resource.rs::merge_preserves_fd_identity`、`merge_unions_consumed`、`merge_advances_next_fd`。**A2 批 5（38bca67）复核**：fd 区间预分割（右分支 `offset_next_fd(1<<48)`）+ 合并归一化（fork_region 游标收敛）消除双分支 fd 碰撞；顺序路径同样 merge（left 先 right 后）；新增测试：并行双分支分配（左 Open 右 PipeOpen，fd 不同+双 lookup）、冲突型 Fork 后父级 Write 被 A4 拒绝、顺序路径双分支 fd 不冲突 | ✅ **核销**（代码级，A2 批 4 + 批 5 复核） |
 | **C2（偏差-2）** Replace 调 `reg.clear()` | 保持开放 | `runtime.rs` Replace 分支：`undo.recover().await; reg.clear();`（先 recover 清撤销栈、再释放 handles/线性标记，next_fd 保留 D1 单调）；测试：`interpreter.rs::replace_clears_registry`（句柄清空 + 线性复位可重写 + fd 单调不复用）、`e2e.rs::e2e_file_write_read_undo`（Replace 清空 registry 句柄后仍可重新 Open/Seek/Read）；集成修复 `2f612f9` 使 `replay_property.rs` 排除 Replace、e2e 对齐 D10 清空语义 | ✅ **核销**（代码级，A2 批 4） |
 | **C3（契约补录）** D15 + ResourceArbiter 入表 | 部分核销 | `contracts.md` §3 决策表已含 **D15**（undo 闭包捕获边界，`d356368`）、**D16**（ResourceArbiter，`d356368` + 措辞修正「接入待 C4 裁决」`6cb3de9`）、**D17**（Fork 并行路径）、**D18**（闭包 +Send，`ed84a3c`）；代码侧 `executor.rs` D15 注释（:7/:216）、`resource.rs:385 ResourceArbiter`、`runtime.rs` SharedExecutor/`run_fork_parallel`、`action.rs:41-44` 四闭包 `+ Send` 均已落地 | ✅ **核销**（文档级） |
 | **C4（观察项）** `op_mutex_lock` 阻塞 `lock_owned` vs try_lock | 新增观察 | `executor.rs::op_mutex_lock`（:855）仍 `m.lock_owned().await`（阻塞），未接 arbiter `try_claim`/try_lock；arbiter 本身已作为独立原语闭环（§1 A7）。D16 决策表明示「接入待 C4 裁决」 | ⚠️ **保持观察项**（裁决建议见 §4 残余-1） |
@@ -88,16 +88,17 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 | # | 残余项 | 现状 | 裁决建议 |
 | --- | --- | --- | --- |
 | **R-1（C4 延续）** | D16 arbiter ↔ `op_mutex_lock` 接入：执行器仍用阻塞 `lock_owned`，未走 arbiter `try_claim`/try_lock | 无死锁可达性论证成立：①静态层 `fork_conflict` 在 Fork 分支声明同资源时强制顺序化；②D14 顺序路径下同一 Runtime 无并发任务；③`concurrent_arbiter_claims` 已验证 arbiter 原语无死锁。**但**并行 Fork 已落地（D17），若蓝图在 Fork 分支内对**同一** MutexLock id 未声明 `Resource::Fd(id)` 资源，静态冲突检测不可见 → 第二分支持共享执行器锁阻塞 `lock_owned`，存在死锁可达窗口 | **接受**（当前冻结语义下：资源声明是蓝图作者责任，A4 线性同此边界；D16 已如实注明「接入待 C4 裁决」）。**待办**（低优先，A7/A5）：①在 resource-notes §2 补「Fork 分支内 MutexLock 必须声明对应资源以触发静态串行化」的强制记录；②后续可将 `op_mutex_lock` 改为 arbiter `try_claim` + 有限重试（D16 设计目标） |
-| **R-2** | A3 执行级 left∥right 与 right∥left 双序 commutation 测试未单列 | 静态对称性（`a3_can_parallel_symmetric`）+ 执行级调度双路径（并行 `fork_parallel_true_path` / 顺序 `fork_conflict_sequential_execution`）已覆盖；双序等价测试为「建议强化」非缺口 | **待办**（A6，随 A7 批 4 复测期）：补对称 combine 下双调度序执行级等价断言 |
+| **R-2** | A3 执行级 left∥right 与 right∥left 双序 commutation 测试未单列 | **已补录（A3 批 6，`tests/commutation.rs` 3 测试）**：静态对称性 proptest + 执行级双路径（Direct 顺序断言序列反转 / Shared 并行断言多重集合相等）+ 纯节点双序 combine 一致 | ✅ **核销**（G4 条件-2） |
 | **R-3** | `Arc::make_mut` 物理 COW 未实现（A5/P3 物理层） | registry Clone 层隔离已闭环（consumed/owned_consumed 独立）；物理 Arc 共享句柄下子分支破坏性操作（Close）无拒绝路径测试 | **接受**（阶段 3 并行化载体，final-audit §6 判定维持；语义层闭环满足 G4 判据「公理被测试覆盖」的执行级） |
-| **R-4** | A7 批 4 性能复测数据未合并 | 并行 Fork 载体已合入（A2 批 4）；`perf/baseline-2026-08-15.txt` 仍为批 3 D14 顺序基线（parallel_reads 340%、shared_read 307.6%） | **待办**（A7，G4 条件-1）：新基线数据合入 perf/ 后确认回归 ~100% 或记录 CTO 裁决 |
-| **R-5** | `unsafe impl Send for SendExecutor`（runtime.rs:297） | 带完整安全性论证（执行器仅在 Mutex 独占锁内 `&mut` 访问；D18 否决的是对 Action 的 unsafe impl，此为内部包装层的保守等价） | **接受**（单点、低风险、有论证；G2/G4 审计均已记录） |
+| **R-4** | A7 批 4 性能复测数据未合并 | **已合并（A7 批 4，`88e70e0`）**：D17 并行路径已触发但 executor 锁串行化 IO（`exec_via` 持 `Arc<Mutex>` 跨物理 IO await）→ parallel_reads 366.2%（vs 批 3 340%）、shared_read 570.9%（vs 307.6%）、echo 103.1%（达标）、append 24.3%（D6 串行） | **接受**（CTO 裁决：锁串行化为 pdr §17 自认已知局限「动态资源仲裁的锁竞争 → 工程缓解」，非缺陷；~100% 目标需 executor 锁粒度重构，归阶段 3+） |
+| **R-5** | `unsafe impl Send for SendExecutor`（runtime.rs:297） | **已修复（A2 批 5，`38bca67` + D19）**：`SyscallExecutor: Send` 超 trait + `Runtime::new(Box<dyn SyscallExecutor + Send>)`，unsafe 包装删除，编译期强制 | ✅ **核销**（D19 已入 contracts.md） |
+| **R-6** | executor 锁串行化（并行 Fork 下 IO 无并发） | A7 批 4 实测：parallel_reads 366%/shared_read 571%，未达 pdr §16 ~100% | **接受**（pdr §17 已知局限；工程缓解归阶段 3+，见 R-4 裁决） |
 
 ---
 
 ## 5. 结论：G4 放行建议
 
-**建议：条件放行（G4 闭环收敛可放行，附 2 项条件；条件均为数据/测试补录级，无代码/契约变更需求）。**
+**建议：放行（G4 闭环收敛达成；残余项 R-1/R-3/R-6 均为「接受+阶段 3 待办」，无 blocker；R-2/R-4/R-5 已核销）。**
 
 **放行依据（pdr §19.2 闭环收敛三条件逐条判定）**：
 
