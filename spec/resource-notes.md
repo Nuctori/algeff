@@ -47,30 +47,12 @@ pdr.md 公理 A7：动态资源获取采用「原子占坑 + 失败回滚 + 有�
 同步原语（如 `tokio::sync::Mutex`）的 `.lock().await` 会挂起等待，**不得**在
 解释器任务内直接使用，否则引入循环等待风险；一律走 try_lock + 回滚重试。
 
-### 强制规则：Fork 分支内的 `MutexLock` 必须声明对应资源（R-1 待办①，批 7）
-
-Fork 分支内使用 `DataOp::MutexLock { id }` 的蓝图，**必须**在分支的资源声明
-（`ResourceSet`，即 Fork 静态冲突检测的输入）中包含对应 `Resource::Fd(id)`
-（或等价声明——以同一互斥锁的独占声明表达）以触发静态冲突检测（§9.1 矩阵：
-Write 型互斥 → `can_parallel=false` → 降级顺序执行）。
-
-- **未声明的后果（死锁可达窗口）**：静态层不可见该互斥（`Fd(id)` 不在
-  `ResourceSet` 中），`can_parallel` 判定分支可并行 → D17 并行 Fork 路径触发；
-  两分支在共享执行器上对同一 `MutexLock { id }` 执行，物理层
-  `tokio::sync::Mutex::lock_owned` 阻塞等待（A5 批 5 接入前的现状，executor.rs
-  `op_mutex_lock`），无静态顺序化兜底 → 分支间「持有-等待」死锁可达窗口。
-  当前冻结语义下资源声明是蓝图作者责任（A4 线性检查同此边界）；G4 残余 R-1
-  已按「接受 + 待办」记录，见 spec/g4-closure.md §4。
-- **检测手段**：代码审查——Fork 分支含 `MutexLock { id }` 时核对资源声明包含
-  `Resource::Fd(id)`；测试——批 7 新增 `crates/algeff-core/tests/arbiter_mutex.rs`
-  （占坑-释放周期 / Read 共享 vs Write 独占 × tokio Mutex / 有限重试上界
-  WouldBlock 无残留）验证动态层语义；静态层顺序化覆盖由 `interpreter.rs` 的
-  `fork_conflict_sequential_execution`（同资源 Write×Write → 顺序降级）提供。
-- **A5 批 5 接入 arbiter 后的缓解**：`op_mutex_lock` 改为
-  `ResourceArbiter::try_claim` + 有限重试（D16 设计目标）后，未声明资源的蓝图
-  即使进入动态层，占坑失败也只返回 `WouldBlock`（bool false）并整体回滚、不
-  阻塞等待——死锁窗口转化为可检测的失败（见 §8「接入中（A5 批 5）」）；但静态
-  声明仍是首选路径：顺序化零等待、确定性最强。
+**强制记录（R-1 待办①，批 5 落地）**：Fork 分支内使用 `DataOp::MutexLock { id }`
+必须同时声明对应资源 `Resource::Fd(id)`（占用模式任取互斥模式），以触发静态层
+`can_parallel` 冲突检测并降级串行；若未声明，静态层对该互斥不可见，动态层 arbiter
+是唯一防线——批 5 已由 A5 `TokioExecutor` 将 `op_mutex_lock` 接入 `ResourceArbiter`
+（`try_claim` 原子占坑 + 8×1ms 有限重试，超限返回 `WouldBlock`，不阻塞等待；
+详见 §8 末与 §9 前言）。
 
 ## 3. Append 的 opt-in 语义
 
@@ -121,14 +103,13 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   测试增补 proptest（随机 claim/release 交错序列：单调不减 / 失败原子性快照 /
   无泄漏三不变量）、同资源 4×4 互斥矩阵穷举、`is_clean` 全生命周期测试；
   §8 增补属性测试不变量说明与 `is_clean` 用法。
-- s7/a3：R-1 待办① 落地——§2 新增「强制规则」小节：Fork 分支内 `MutexLock { id }`
-  必须声明对应 `Resource::Fd(id)`（或等价声明）以触发静态顺序化；未声明的后果
-  （死锁可达窗口）、检测手段（代码审查 + 测试）、A5 批 5 接入 arbiter 后的缓解
-  （try_claim + 有限重试 → 返回 WouldBlock 而非死锁）；§8 增补 arbiter↔MutexLock
-  接入状态「接入中（A5 批 5）」；§5 A7 行补录批 7 测试；新增组合验证
-  `crates/algeff-core/tests/arbiter_mutex.rs`
-  （`claim_then_release_cycle` / `exclusive_vs_shared_mutex_semantics` /
-  `retry_upper_bound`，纯 core 无 IO）。
+- s7/a5：D16 落地——`TokioExecutor::op_mutex_lock` 接入 `ResourceArbiter`（MutexLock
+  id → `Resource::Fd(id)` × Write 独占占坑 + 8×1ms 有限重试，超限 `WouldBlock`；
+  undo 与显式 `MutexUnlock` 均同步释放占坑，`release` 幂等无需标志位）；§2 补
+  「Fork 分支内 MutexLock 必须声明对应资源」强制记录（R-1 待办①）；测试
+  `crates/algeff-std/tests/executor.rs` 新增 `mutex_lock_arbiter_contention` /
+  `mutex_unlock_releases_arbiter`，`mutex_lock_exclusion` 断言同步更新为
+  WouldBlock 快速失败；新增 §9「make_mut 物理 COW 评估」（R-3 预研，裁决：推迟）。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -286,3 +267,73 @@ claim/release 交错序列断言三条不变量：
 模式对穷举（第一方任意模式首占成功，第二方仅 Read×Read 可共享），与 §9.1
 冲突矩阵一致：Read-Read 可、Read-Write 不可、Write-Write 不可、Own×任意不可、
 Append×Append 保守不可（对齐决策 D6，opt-in 由静态层 `can_parallel_with` 表达）。
+
+**MutexLock 级接入（批 5，D16 落地）**：A5 `TokioExecutor` 的 `op_mutex_lock` 已接入
+本原语——`MutexLock { id }` 映射为 `Resource::Fd(id)` × `AccessMode::Write` 独占占坑
+（Write 与 Own 在仲裁器同为独占，选 Write 表达「共享互斥锁」而非「终结所有权」）；
+`try_claim` 失败 → 8 次 × 1ms 退避有限重试 → 超限 `Err(SysError::WouldBlock)`
+（A7：不阻塞等待）；undo 闭包与显式 `MutexUnlock` 均释放占坑，`release` 幂等
+（未占坑资源 no-op）故无需标志位。测试：`algeff-std/tests/executor.rs`
+`mutex_lock_exclusion`（竞争 WouldBlock 快速失败）/ `mutex_lock_arbiter_contention`
+（双任务至多一个持有，不挂死）/ `mutex_unlock_releases_arbiter`（unlock 释放占坑
+后可重锁）。
+
+## 9. make_mut 物理 COW 评估（R-3 预研，批 5）
+
+> 对应 G4 残余 R-3 与 pdr.md §9.2 / 命题 P3「工程上通过 `Arc::make_mut`（延迟复制）
+> 实现」。本批仅做接入点 / 成本 / 决策分析，**不实施**（裁决建议见 9.4）。
+
+### 9.1 目标与现状
+
+pdr.md §9.2 的「Fork 内存行为」：ReadOnly 分支共享 `Arc<[u8]>`（引用计数零拷贝）；
+Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_data()`。命题 P3 的工程
+载体是 `Arc::make_mut`：strong_count > 1 时先深拷贝再 `&mut`（整块复制换跨平台
+一致性），否则原地借用。
+
+现状：A5 语义层已闭环——registry 经 D13 Clone 隔离（consumed/owned_consumed 独立，
+`fork_same_fd_write`/`parallel_runs_isolated_state` 已验证）；物理层共享的只是
+`ResourceHandle` 的 Arc（File/TcpStream/管道半端等），`make_mut` **未接入**。
+
+### 9.2 接入点分析
+
+`Arc::make_mut` 的正确用法要求 `Arc<T>` 是唯一可变访问路径。对 Algeff 的
+`ResourceRegistry` + `TokioExecutor`：
+
+1. **句柄存储**：registry 持有的是**不可变** Arc（`ResourceHandle::File(Arc<File>)`
+   等），而 tokio 的 AsyncRead/AsyncWrite 只对 `&mut T` 实现——这正是 executor 侧
+   用 `Arc<tokio::sync::Mutex<File>>` 工作对象、registry 侧放簿记 token 的双表结构
+   原因（RFC-05）。若引入 `make_mut`，可把双表收敛为 registry 单一 Arc 所有权，
+   子分支首次破坏性操作前 `make_mut` 私有化副本。
+2. **Close 拒绝路径（R-3 原文缺口）**：registry 层经 D13 Clone 已隔离（子分支
+   take/remove 只影响克隆体），但物理工作对象在共享 executor 的 `files` 表中——
+   Fork 并行（D17）下子分支 `Close` 会移除共享工作对象，父分支后续 IO 受影响，
+   当前无拒绝路径、无测试。`make_mut` 语义下应改为：子分支破坏性操作前先
+   `make_mut` 得到私有副本，Close 只终结副本；无法私有化时新增拒绝路径。
+3. **与 Dup 的语义冲突（关键障碍）**：File 的 `try_clone` 提供廉价「簿记 token」
+   共享同一 OS 描述，Dup 契约是**真共享**（游标/描述共享，`dup_shares_handle`
+   测试依赖）。`make_mut` 的深拷贝无法在不破坏 Dup 契约的前提下区分「Fork 隔离
+   需要复制」与「Dup 需要共享」——必须引入额外的分支/克隆代际标记。
+
+### 9.3 成本
+
+1. **语义成本**：A4 线性状态已由 registry Clone 精确隔离，物理复制是语义层的
+   **冗余第二道保险**——当前无任何测试暴露其缺失（R-3 原文亦注明「无拒绝路径
+   测试」），实施前必须先行补契约测试。
+2. **实现成本**：改动 registry 句柄存储结构（影响 D1/D13/D17 冻结面）、executor
+   双表结构（RFC-05 关联）、`op_close`/`op_truncate` 等破坏性操作与全部共享路径
+   测试；另需处理 9.2-3 的代际标记——属冻结面外设计，需 RFC + CTO 裁决。
+3. **运行成本**：破坏性分支付出整块复制代价（与 §9.2「整块复制换一致性」一致），
+   而阶段 1 顺序 / 受限并行路径下分支间物理写冲突本就不可达。
+
+### 9.4 CTO 决策建议
+
+**建议：推迟（随阶段 3 并行化一并实施，G4 批 5 判定维持不变）**，理由：
+
+1. 语义层已闭环（D13 Clone 隔离 + D17 合并回父），当前阶段不产生分支间物理写
+   冲突，物理 COW 是阶段 3「并行 Fork 真并发写」的前置载体而非当前缺陷；
+2. make_mut 与 Dup 真共享语义冲突（9.2-3）需要专门设计，仓促接入破坏冻结面；
+3. 实施前置条件：先补「分支内破坏性操作（Close/Truncate）」契约测试（R-3 原文
+   缺失项），作为阶段 3 验收前置。
+
+不选择「放弃」：pdr.md §9.2 与命题 P3 明确将 make_mut 列为物理载体，阶段 3
+并行写需要它。不选择「立即实施」：冻结面内无测试暴露缺口，性价比不足。
