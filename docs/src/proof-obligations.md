@@ -28,6 +28,7 @@ pdr.md §四 公理 A1–A7 与 §六 命题 P1–P5 的每一条形式化声明
 | R3 | ✅ 完成（adversarial_r3{a,b,c}.rs 共 28 测试：r3a 11 Catch/Scope/撤销栈 + r3b 9 Alloc/确定性/用户责任 + r3c 8 网络/R2 回归）；发现：闭包盲区实证、SendFile flush 缺口（已修）、锁饥饿（RFC-09）、退避串行化（LOW） | ✅ 完成（formal-convergence）：P3/P5 升级「有效（附范围声明）」；盲区=系统性（链长≥2 仅首 op 可见）→ 前提入 spec 三处；A6/P4 范围限定句（trackΓ+RFC-08/09）落地；P2 闭环确认 | RFC-09（Timeout 锁饥饿）、盲区实证（2 测试）、SendFile flush（D-039 扩展，3922bf6） | 5 处登记级修正已落地（A6/P4 限定句、盲区前提、P3 文本同步、义务表收口、README 计数） |
 | R4 | ✅ 完成（adversarial_r4{a,b,c}.rs 共 32 测试：组合态深挖/多 Runtime 隔离·错误透传·Open 矩阵/规模栈深）；发现：RFC-10（Windows 错误码）、RFC-11（递归栈溢出 HIGH，已修复） | ✅ 完成（formal-convergence）：P1 有效（1000 链规模证据）、P2 有效附声明前提（16 路）、P3/P5 有效附范围声明、P4 收敛中；6 处极小性修正已落地 | RFC-10（Windows errno 映射）、RFC-11（深度守卫，阈值 96，已修） | 收口完成：README 300、A4 证据引用、make_mut 残留清零、RFC-A3-3 核销 |
 | R5 | ✅ 完成（r5a 8 + r5b 16 测试，945eb52/1ce734c）：五连回归/边界 95/96/97/50 轮风暴/修复点交互；Invoke 假执行器 5 面/错误恢复长链/Fork×Scope 隔离/Timeout 三层链/蓝图复用 | ✅ 完成（formal-convergence 终轮）：P1/P2/P3/P5 = 有效（附声明）终判；P4 = 部分（RFC-05 未闭环——唯一开放差距，阶段 3+ 已裁决）；极小性收口（RFC-05 补录、README 300/292/40、A1 深度注记） | 守卫边界 95/96/97；五连回归；Invoke 正向语义首证；蓝图 4 路复用；跨 Runtime 别名 undo 非恒等偏差（文档化） | **5 轮收官**：P1/P2/P3/P5 有效（附声明），P4 部分（明确差距 RFC-05）；A1-A7 终态齐备 |
+| R6（进行中） | ⏳ 进行中（对抗审计待执行） | ⏳ 进行中（数学审计待执行） | 待填 | 待填 |
 
 ## 义务明细
 
