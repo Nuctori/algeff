@@ -132,3 +132,16 @@ Init/Next 与不变式检查（不动 `Spec` 本身）。活性 `Progress` 一�
 | `ExclusiveHold` | `ResourceRegistry::check_linear` + 注册表持有语义（pdr.md §2.3） |
 | `retries[t]` 有限重试 | 运行时调度循环的重试上限（实现细节，阶段 2） |
 | `NoCircularWait` | 静态部分由本模型验证；阶段 2 以 `Runtime::run` 并发压力测试佐证 |
+
+### 6.1 执行级测试（Rust）与模型的关系
+
+本模型验证的是**调度策略**（原子占坑 / 无环等待）；`crates/algeff-core/tests/execution_axioms.rs`
+（A6 批 3，interpret 合并后的执行级公理测试）验证的是**解释器对该策略及幺半群 / 线性 / 撤销语义
+的实现**。二者互补，共同支撑 pdr.md §七「验证方式」的工程落地：
+
+| 模型元素 | 执行级测试（`crates/algeff-core/tests/execution_axioms.rs`） |
+| --- | --- |
+| `ExclusiveHold`（互斥持有） | `exec_A4_linearity_runtime`：同资源二次 Write 在解释器 `check_linear` 处被运行时拒绝 |
+| `Claim` 顺序化（阶段 1，D14） | `exec_fork_conflict_static`：同资源 Write×Write → `can_parallel=false` → 顺序执行 + combine |
+| 撤销（recoverΓ） | `exec_A6_undo_roundtrip` / `exec_D10_replace_order`：LIFO 逆序 + 栈清空 |
+| 幺半群结构（P1） | `exec_A1_associativity` / `exec_A2_identity`：结合律与单位元的执行 trace 等价 |
