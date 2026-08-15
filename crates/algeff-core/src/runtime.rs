@@ -575,7 +575,6 @@ async fn wait_timeout<'a>(
         }
     }
 }
-}
 /// 墙钟 Timeout 取消传播实现（RFC-08/09/12 残余统一修复）。
 ///
 /// 独立 async fn（非解释器状态机内联）：取消协议的局部状态（watch 通道、
