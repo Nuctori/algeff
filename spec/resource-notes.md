@@ -212,7 +212,7 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 `ResourceArbiter::try_claim(set)` 对 set 中每个资源原子占坑——先在副本上
 模拟全部占坑，全部可占才提交，任一失败**整体回滚**（自身状态完全不变，
 无部分占坑残留）。调用方在失败后执行已累积逆操作并**有限重试**（如指数退避
-+ 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
+- 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
 `.lock().await` 不得在解释器任务内直接使用（会挂起等待，引入循环等待风险，
 见 §2）。
 
@@ -371,5 +371,28 @@ registry 经 D13 Clone 做分支隔离时，`ResourceHandle::PipeReader/PipeWrit
 Arc<Mutex> 覆盖管道半端，或 §9 的 make_mut + 代际标记），executor 属 A5 域，
 冻结面外。§9.3.1「无测试暴露其缺失」已被本项修正。
 
-测试记录：`adversarial_r2.rs` 分支冲突负载改用文件（`fd_1000_conflict_forks_region_*
+测试记录：`adversarial_r2.rs` 分支冲突负载改用文件（`fd_1000_conflict_forks_region_*`
 `、`fd_region_quadratic_growth_*`），保留 fd 分配属性覆盖；修复后可将负载改回管道。
+
+### RFC-08：Timeout 内并行 Fork 的孤儿分支副作用不可撤销（P4/A6 义务边界反例）
+
+`Action::Timeout{action=Fork{...}, ...}` 超时触发时，inner future 被
+`tokio::time::timeout` 丢弃——已 spawn 的并行分支任务（spawn_blocking 线程上
+current-thread runtime 驱动）**继续执行**：其物理副作用（如 Open 创建文件）发生、
+undo 栈为空（分支 undo 未合并）、`Replace`/`recover` 无法恢复 → w;w̄=1 在
+Timeout+Fork 组合边界**不成立**（部分可撤销性反例）。对 P5/A7 无影响（孤儿独立
+完成、无等待链，属资源泄漏非死锁）。A6/P4 陈述建议加范围限定「仅运行时已追踪
+（trackΓ）的操作」——R2 数学审计建议（编号修正：R2 语境曾误称本项为 RFC-07，
+正式登记为 RFC-08）。
+
+测试记录：`adversarial_r2.rs::time_timeout_parallel_fork_orphan_effects_unrecoverable`
+（断言孤儿 Open 副作用物理发生；修复方向 = 超时传播/分支取消协议，阶段 3+）。
+
+### RFC-06 的 D1 边界影响（R2 数学审计）
+
+release 下 u64 回绕 → fd 复用 = D1「单调不复用」**违反**（debug 下 catch_unwind
+panic）。数学核验：Σ_{k=1..n} k·2^48 ≥ 2^64 ⟺ n≈362 轮。模型承诺（D1）无界，
+故非 pdr §17 类固有局限，而是 merge 归一化的实现缺陷——已登记（§10 RFC-06），
+建议 D1 契约行加边界注（承诺范围为不溢出前缀）或提升修复优先级（阶段 3+ 中
+优先）。对 P2/P3 语义本体无直接证伪（交换律/隔离是 trace 语义命题，与 fd 值域
+无关）。

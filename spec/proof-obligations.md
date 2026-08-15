@@ -11,6 +11,7 @@
 | --- | --- | --- | --- | --- |
 | R0（基线） | 既有 25 二进制测试 | proofs.md P1-P5 数学证明 | 见下 | 初始状态 |
 | R1 | ✅ 完成（adversarial_r1.rs 17 测试，5d24166）：游标撤销修复 + Replace 旧 fd 可写反例 + 12 项声称验证 | ✅ 完成（formal-convergence）：P1 有效、P2 有缺口（combine 对称未入 A3 陈述）、P3/P4/P5 部分（证据补足中/句柄反例/映射修正） | 游标恢复（A6 新维度证据）；旧 fd 句柄活性反例（D10/P4 未闭环） | 4 处未收敛点 → 派发修复（A6 批8 隔离测试 / proofs·axioms 修正 / 登记表更新） |
+| R2 | ✅ 完成（adversarial_r2.rs 19 测试，2eb7312）：fd 区间压力/arbiter 争用/R1 回归/错误路径/时间面/资源计数 + RFC-06/07/08 登记 + flaky 修复（写后 flush，Write 返回⇔OS 落盘可观察性契约 D-039） | ✅ 完成（formal-convergence）：P2 收敛为「有效（附声明前提）」；A3 陈述已并入 Sym(f)+Δ-覆盖；RFC-06→D1 边界反例、RFC-08→P4/A6 部分可撤销反例；axioms 总表死信息清除 | RFC-06（fd 二次增长 u64 溢出）、RFC-07（管道半端）、RFC-08（Timeout 孤儿分支） | 3 处登记级未收敛点已修（A3 陈述/P2 同步、总表刷新、RFC-08 编号） |
 
 ## 义务明细
 

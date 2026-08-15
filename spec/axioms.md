@@ -79,10 +79,11 @@
 **形式化陈述**
 
 ```
-∀ a, b.  Δ(a) ∩ Δ(b) = ∅
-      ⇒  a ∥ b = b ∥ a
+∀ a, b, f.  Δ(a) ∩ Δ(b) = ∅  ∧  Sym(f)
+      ⇒  Fork(a,b,f) ≡ Fork(b,a,f)
 ```
-（注：数学审计 M1——「不存在 Write/Own 模式重叠」为冗余合取：`Δ(a)∩Δ(b)=∅` 已蕴含无共享键，模式重叠无从谈起；保留 pdr.md 原文措辞于此，工程判定以 Δ 不相交为准。）
+（注 1：数学审计 M1——「不存在 Write/Own 模式重叠」为冗余合取：`Δ(a)∩Δ(b)=∅` 已蕴含无共享键，模式重叠无从谈起；保留 pdr.md 原文措辞于此，工程判定以 Δ 不相交为准。
+注 2：数学审计 R2——`Sym(f) := ∀x,y. f(x,y) = f(y,x)`（combine 对称）为 R1 发现的隐含前提，现并入形式化陈述；proofs.md P2 已同步。另含 Δ-覆盖前提：a 的每个效果只读写 Δ(a) 内资源。）
 
 注意（pdr.md §四 A3 原文）：Append 并行虽然 OS 保证原子追加，但追加顺序不确定，违反确定性原则；Append∥Append 仅在结果对顺序不敏感时允许，否则降级顺序执行。
 
@@ -221,7 +222,7 @@ Fork  ：子任务通过 COW 隔离（ReadOnly 共享、Mutable 延迟复制、O
 | 层 | 文件 : 符号 | 说明 |
 | --- | --- | --- |
 | 冲突判定（静态降级） | `resource.rs::ResourceRegistry::can_parallel_with` | 静态冲突 → 顺序执行（P5 机制 1，无等待） |
-| 占坑/回滚（动态） | `runtime.rs::interpret` 的 Fork/动态资源路径（A2 交付）+ `resource.rs::ResourceRegistry`（A3 交付） | 原子占坑 + 失败回滚 + 有限重试；**当前骨架未实现**（`interpret` 为 `todo!`） |
+| 动态占坑 | `resource.rs::ResourceArbiter`（try_claim/release，A3 交付）+ `executor.rs::op_mutex_lock`（A5 批 7-9 接入：try_claim + 8×1ms 有限重试 + WouldBlock） | 原子占坑 + 失败回滚 + 有限重试（R2 数学审计 M4 修正：已交付） |
 | 模型 | `tla/scheduler.tla`（A6 交付，契约 §5） | 原子占坑+回滚重试，无循环等待的模型验证 |
 | 契约 | `contracts.md` §5 A2/A6 任务 / pdr.md §四 A7、§六 P5 | — |
 
@@ -243,10 +244,10 @@ Fork  ：子任务通过 COW 隔离（ReadOnly 共享、Mutable 延迟复制、O
 
 | 公理 | 主载体（文件 : 函数） | 契约引用 | 当前状态 |
 | --- | --- | --- | --- |
-| A1 | `runtime.rs::interpret`（Sequential） | §2 Action / §5 A2 | 骨架（todo!） |
-| A2 | `action.rs::Action::Pure` + `interpret` | §2 Value | 骨架（todo!） |
-| A3 | `resource.rs::ResourceRegistry::can_parallel(_with)` | D6 / §9.1 | ✅ 已实现+单测 |
+| A1 | `runtime.rs::interpret`（Sequential） | §2 Action / §5 A2 | ✅ 已实现+执行级测试（exec_A1_associativity） |
+| A2 | `action.rs::Action::Pure` + `interpret` | §2 Value | ✅ 已实现+执行级测试（exec_A2_identity） |
+| A3 | `resource.rs::ResourceRegistry::can_parallel(_with)` | D6 / §9.1 | ✅ 已实现+单测+commutation 双序 |
 | A4 | `resource.rs::ResourceRegistry::check_linear` | §2 / §四 A4 | ✅ 已实现+单测 |
-| A5 | `resource.rs::ResourceRegistry::clone`（D13）+ `ResourceHandle`(Arc) | D13（待补录）/ §9.2 | 部分（clone 有，make_mut 待 A2/A3） |
-| A6 | `syscall.rs::UndoOp`/`SyscallExecutor::execute` + `runtime.rs::UndoStack` | D4 / §11.2 | 类型就绪，解释器待 A2 |
-| A7 | `tla/scheduler.tla` + `interpret` 动态资源路径 | §5 A2/A6 | ❌ 未实现（最大风险项） |
+| A5 | `resource.rs::ResourceRegistry::clone`（D13）+ `ResourceHandle`(Arc) | D13 / §9.2 | ✅ 语义层（registry 副本隔离+读隔离测试）；make_mut 物理 COW 归阶段 3（§9 评估） |
+| A6 | `syscall.rs::UndoOp`/`SyscallExecutor::execute` + `runtime.rs::UndoStack` | D4 / §11.2 | ✅ 已实现+执行级+端到端（内容/游标/落盘三维度） |
+| A7 | `resource.rs::ResourceArbiter` + `executor.rs` 接入 + `tla/scheduler.tla` | D16 / §5 A2/A6 | ✅ 模型/原语/执行器三层已交付（R2 数学审计 M4） |
