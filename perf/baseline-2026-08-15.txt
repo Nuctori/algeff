@@ -1,0 +1,72 @@
+================================================================================
+Algeff A7 性能基线（原生 tokio 参照列）— 批 2（G3 数据 + 文档）
+================================================================================
+日期:       2026-08-15 18:27 (本地时区)
+生成方式:   逐 bench 独立运行（scripts/perf.sh 同款流程，见文件尾部命令清单）
+对应文档:   pdr.md §16 性能预期表（原生 tokio = 100% 列）
+             contracts.md §4 G3 门禁（bench 可运行 + 文档齐备）
+
+--------------------------------------------------------------------------------
+环境信息
+--------------------------------------------------------------------------------
+cargo:       cargo 1.96.0 (30a34c682 2026-05-25)
+rustc:       rustc 1.96.0 (ac68faa20 2026-05-25)
+OS:          Windows 10 Pro 19045（MINGW64_NT-10.0-19045 x86_64, Msys2 shell）
+CPU:         AMD Ryzen 9 5950X 16-Core Processor
+内存:        64 GiB
+criterion:   0.5（plotters 后端；Gnuplot 未安装，不影响测量）
+tokio:       1.x（workspace 特性：fs/net/io-util/sync/process/signal/time/
+             rt-multi-thread/macros）
+TCP 端口池:  Windows 动态端口范围 1024–15000（13977 个），TIME_WAIT 保留约 120s
+             —— echo 基准的连接预算必须远低于该池（见 echo 备注）。
+
+--------------------------------------------------------------------------------
+基准结果（中位数 = criterion 点估计，方括号为 95% 置信区间）
+--------------------------------------------------------------------------------
+
+[1] echo/tokio_native_100conns_x1000rtt_1KB
+    场景:   本地 TCP echo（127.0.0.1），每测量样本 100 个连接 × 每连接
+             1000 次「发送 1KB → 读回 1KB」往返（pdr.md §16「网络 Echo」）
+    参数:   sample_size=30, measurement_time=3s（样本内单次 iter 约 6.4s，
+             故每样本恰 1 iter；criterion 提示可放宽测量时间，属良性）
+    结果:   time: [6.2961 s 6.3986 s 6.5043 s]   （中位 6.3986 s / iter）
+    备注:   批 2 首跑原设计（30×1000 连接）在本机 Windows 端口池下必然失败
+             （WSAEADDRINUSE 10048，见 issues）；CTO 裁决改为 100 连接 × 1000
+             往返，单次 bench 总连接数 ≈ 3.1k，实测峰值 TIME_WAIT 2447，
+             远低于池上限。负载性质不变（1KB 负载、万级往返）。
+
+[2] parallel_reads/tokio_join_10x1MB
+    场景:   tokio::join! 并行读 10 个不同文件，各 1MB（零冲突，
+             pdr.md §16「并行读取 10 个不同文件」）
+    参数:   sample_size=10, measurement_time=3s, setup 不计时
+    结果:   time: [4.3727 ms 4.5676 ms 4.7630 ms]   （中位 4.5676 ms）
+    备注:   20% 样本为 high mild 离群（2/10，IO 抖动），未剔除。
+
+[3] shared_read/arc_file_8tasks_8MB
+    场景:   8 任务并发位置读同一 8MB 文件（Arc<File> + read_at/seek_read，
+             零锁零偏移竞争，pdr.md §16「并行读取同一文件（只读共享）」）
+    参数:   sample_size=10, measurement_time=3s, setup 不计时
+    结果:   time: [1.9558 ms 2.2445 ms 2.8355 ms]   （中位 2.2445 ms）
+
+[4] append/tokio_10tasks_x32KB
+    场景:   10 任务以 O_APPEND 并行追加同一文件，每任务 32 × 1KB
+             （顺序无关，pdr.md §16「并行追加同一文件」）
+    参数:   sample_size=10, measurement_time=3s, setup 不计时
+    结果:   time: [6.6122 ms 7.1652 ms 8.2622 ms]   （中位 7.1652 ms）
+    备注:   10% 样本为 high mild 离群（1/10），未剔除。
+
+--------------------------------------------------------------------------------
+本次执行命令清单（exit code 均为 0）
+--------------------------------------------------------------------------------
+cargo bench --bench echo -- --test                                  # 冒烟
+cargo bench --bench echo          # 正式（新参数，约 3.5 分钟）
+cargo bench --bench parallel_reads
+cargo bench --bench shared_read
+cargo bench --bench append
+cargo test --workspace            # G3 回归门禁（提交前验证）
+
+已知限制：
+- echo 首版参数（30×1000 连接）在 Windows 端口池下不可运行，已按 CTO 裁决
+  修改 bench（连接预算 100×1000 往返）；本文件为修改后基线。
+- 所有数值为原生 tokio 参照列；Algeff 对比列待 A5(TokioExecutor)+A2(interpret)
+  合并后补测，接入计划见 crates/algeff-std/benches/README.md。
