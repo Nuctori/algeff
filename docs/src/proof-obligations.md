@@ -39,7 +39,7 @@ pdr.md §四 公理 A1–A7 与 §六 命题 P1–P5 的每一条形式化声明
 | A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence + adversarial_r1.rs:lin_fork_conflict_double_write_then_parent_blocked（冲突 Fork 后父级拦截）+ lin_stale_fd_write_after_replace_succeeds（Replace 后线性标记清空但句柄残留反例） | 轮 R1 ✅ | ⚠️ 部分（R1：线性标记维度闭环；句柄活性反例→RFC-05 登记） |
 | A5 分支隔离 | 左 Write 不影响右 Read | spec/proofs.md | concurrency_stress.rs:fork_same_fd_write（registry 副本隔离）；branch_isolation.rs:exec_P3_fork_left_write_right_read_isolated（读隔离，A6 批8 已合并） | 轮 R1 ✅ | ⚠️ 部分→语义层闭环（R1：证据-义务不匹配已识别；A6 批8 读隔离测试补足；make_mut 物理 COW 归阶段 3——§9 评估） |
 | A6 撤销双态 | w;w̄=1 | spec/proofs.md | execution_axioms.rs:exec_A6_undo_roundtrip + adversarial_r1.rs:rev_undo_restores_file_cursor（游标维度新证据） | 轮 R1 ✅ | ⚠️ 部分（R1：内容+游标维度闭环；句柄活性维度有反例——Replace 后旧 fd 仍可写，RFC-05） |
-| A7 无死锁 | 无循环等待链 | spec/proofs.md + tla/ | arbiter.rs:finite_retry_eventually_succeeds + arbiter_mutex.rs（R-1 强制） | 轮 R1 | ⚠️ 部分→已收敛（R1：模型/原语/执行器三层已交付，运行时载体为「冲突→顺序+分支不相交+单执行器锁」——axioms.md M4 修正后分层如实） |
+| A7 无死锁 | 无循环等待链 | spec/proofs.md + tla/ | arbiter.rs:finite_retry_eventually_succeeds + arbiter_mutex.rs（R-1 强制） | 轮 R1/R2 ✅ | ⚠️ 部分→已收敛（R1：模型/原语/执行器三层已交付，运行时载体为「冲突→顺序+分支不相交+单执行器锁」——axioms.md M4 修正后分层如实） |
 
 ### 命题层（pdr.md §六）
 
