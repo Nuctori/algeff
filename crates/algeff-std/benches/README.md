@@ -2,13 +2,12 @@
 
 A7 Integration & Perf 交付物（contracts.md §5 任务 A7 / pdr.md §19.4 工具链：criterion）。
 
-本目录 4 个 criterion 基准（`harness = false`，自带 `criterion_main`）当前实现的是
-**原生 tokio 参照列**（pdr.md §16 性能预期表中的「原生 tokio = 100%」列），是后续
-Algeff 对比测量的基线。Algeff 对比列（`Runtime::new(TokioExecutor)` + `interpret`
-执行 Action 链）待 A5（TokioExecutor）与 A2（interpret）合并后接入，接入计划见下文
-§4。
+本目录 8 个 criterion 基准（`harness = false`，自带 `criterion_main`）：4 个**原生 tokio
+参照列**（pdr.md §16 性能预期表的「原生 tokio = 100%」列，批 2）+ 4 个 **Algeff 对比列**
+（`Runtime::new(TokioExecutor)` + `interpret` 执行 Action 链，批 3 交付；批 4 在 D17
+Fork 并行化后完成复测）。对比列的实现与现状见 §4。
 
-正式基线数据：`perf/baseline-2026-08-15.txt`（由 `scripts/perf.sh` 生成）。
+正式基线数据：`perf/baseline-2026-08-15.txt`（由 `scripts/perf.sh` 生成，批 4 已刷新）。
 
 ---
 
@@ -59,88 +58,60 @@ scripts/perf.sh          # 冒烟（echo --test）→ 4 个 bench 逐个完整�
 逐 bench 独立运行可单独执行：`cargo bench --bench echo|parallel_reads|shared_read|append`。
 `--test` 后缀为 criterion 单次冒烟（不产生统计数据）。
 
-## 4. Algeff 对比列接入计划（A5 + A2 合并后）
+## 4. Algeff 对比列（批 3 交付，批 4 D17 复测现状）
 
-前置条件：A5 的 `TokioExecutor`（`crates/algeff-std/src/executor.rs`，实现
-`SyscallExecutor`，Full 撤销策略）与 A2 的 `interpret`（`crates/algeff-core`，
-`Runtime::run` 已存在）合并入 `main`；`adapters.rs` 预包装函数
-（`open_tcp`/`read`/`write`/`close` 等）就绪。
-
-接入骨架（每个 bench 一个 `tokio_native_*` 对照 + 一个 `algeff_*` 项）：
+前置条件（已满足）：A5 的 `TokioExecutor`（`crates/algeff-std/src/executor.rs`）与
+A2 的 `interpret`/`Runtime`（`crates/algeff-core`）已合并入 main；每个对比 bench 为
+一个 `tokio_native_*` 参照臂 + 一个 `algeff_*` 臂（同 setup、同参数、同 runtime 线程池
+配置）。通用形态：
 
 ```rust,ignore
-// 伪代码：对比项通用形态
+// 对比项通用形态（伪代码）
 let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 let mut runtime = algeff_core::Runtime::new(Box::new(algeff_std::TokioExecutor::new()));
 b.iter(|| rt.block_on(runtime.run(algeff_action_chain())));
 ```
 
-### 4.1 echo —— Action 链草图
+### 4.1 echo（无 Fork，与并行化无关）
 
-每连接一次往返对应一个 `Syscall` 节点链（`next` 闭包把上一步结果传入下一步），
-100 次连接 + 1000 次往返在同一 Action 链上展开（或外层用 `Sequential` 循环）：
+每连接恰 1 次 1KB 往返（A4 资源线性使多次往返不可表达，CTO 裁决等负载双对比项）：
+`TcpConnect → TcpWrite → TcpRead(读满 1KB) → TcpClose` 链，N 连接经 `Sequential` 串接。
+被测路径：`TcpConnect/TcpWrite/TcpRead/TcpClose` → `TokioExecutor::execute`
+（解释器 trampoline + 资源检查 + Undo 记录）。批 4 复测 103.1%（pdr 预期 ~103%，批 3
+为 100.0%，每样本 1 iter 的 ±10% 噪声内无回归）。
 
-```rust,ignore
-// 单连接单次往返（1KB）：
-let chain = open_tcp(addr)                                    // TcpConnect{addr}
-    .then(|fd| write(fd, bytes!(1KB)))                        // TcpWrite{fd, data}
-    .then(|_| read(fd, 1024))                                 // TcpRead{fd, len}
-    .then(|_| close(fd));                                     // TcpClose{fd}
+### 4.2 parallel_reads（D17 并行路径 + 预开模式）
 
-// 1000 次往返：Sequential 链重复上述片段（next 闭包拼接）
-// 100 连接：外层再包一层 Sequential / 或 Fork 并行（见 §4.2）
-let echo_chain = repeat(1000, |_| roundtrip_chain)
-    .then(|_| connect_again());   // 示意：连接数为 100
-```
+10 个不同文件零冲突 → `Action::Fork`（平衡二叉 Fork 树，combine 汇总字节数），
+`fork_conflict` 判定 can_parallel=true → D17 `run_fork_parallel` 真并行（线程级）。
 
-被测路径：`TcpConnect/TcpWrite/TcpRead/TcpClose` DataOp → `TokioExecutor::execute`
-（预期额外开销 = 解释器 trampoline + 资源检查 + Undo 记录，对应 pdr ~103%）。
+**批 4 蓝图调整（fd 分配碰撞）**：D17 并行分支各自从父 registry 的 `next_fd` 克隆
+分配 fd 号，而共享执行器（`TokioExecutor`）的 `files` 等句柄映射以 fd 为键——分支内
+各自 Open 会分配相同 fd 并互相覆盖（读错文件/EOF，功能断言失败）。故 Algeff 臂改为：
+父 registry **顺序预开** 10 文件 → Fork 内每叶 `Read(fd_i, 1MB) → Close(fd_i)`
+（不同 fd，互不覆盖）；被测负载不变（10 个不同文件的并发读，零锁零共享），预开的
+Open 成本仍在 iter 计时内。
 
-### 4.2 parallel_reads —— Action 链草图
+**批 4 实测**：366%（vs 批 3 D14 顺序 340%，无实质改善）。D17 并行路径已触发但读仍
+串行化——执行器互斥锁（`Arc<Mutex<SendExecutor>>`）在 `exec_via` 中对整个
+`execute`（含物理 IO await）持锁，跨分支 Syscall 全部串行。锁边界收窄属 A2 域
+（runtime.rs），A7 不改；复测目标回归 pdr §16 ~100%。
 
-10 个不同文件互不冲突，可用 `Fork` 并行（combine 汇总字节数）：
+### 4.3 shared_read（同 fd 游标读，D17 并行无收益）
 
-```rust,ignore
-let fork10 = fork!(
-    read_file("file_0.bin"), read_file("file_1.bin"), ..., read_file("file_9.bin"),
-    combine = |vals: Vec<Value>| sum_bytes(vals),
-);
-// 每路 read_file = Open{path, read} → Read{fd, 1MB} → Close{fd}
-```
+只读共享同一文件：`Open{read}` 后 Fork 8 路 `Read(fd, 1MB)`（读-读冲突矩阵兼容 →
+can_parallel=true）。批 4 实测 571%（vs 批 3 D14 顺序 308%，**回归**）：并行路径触发
+但两层串行化——执行器互斥锁（同 4.2）+ 同 fd 游标读共用 `files[fd]` 文件互斥锁与
+游标（`op_read` 按序推进；即使锁边界收窄也不并行，需位置读原语——执行器层/A5 域
+待办）。spawn + current-thread runtime 创建开销叠加，实测反超 D14 顺序基线。
 
-被测路径：`Open/Read/Close`（不同资源）→ 资源检查应零锁（pdr「~100%（零锁）」）；
-`Fork` 调度 + combine。
+### 4.4 append（D6 串行路径）
 
-### 4.3 shared_read —— Action 链草图
-
-只读共享同一文件：所有分支声明 `Read` 同一资源（读-读可并行）：
-
-```rust,ignore
-let fork8 = fork!(
-    read_region(shared_fd, 0..1MB), read_region(shared_fd, 1MB..2MB), ..., // 8 路
-    combine = sum_bytes,
-);
-// 每路 read_region = Seek{fd} + Read{fd, 1MB}（或多次 Read）
-```
-
-被测路径：同一资源多路 `Read` 的并行调度 + 冲突矩阵判定（读-读无冲突）。
-
-### 4.4 append —— Action 链草图
-
-顺序无关的并行追加：A3 冲突矩阵中 `Append∥Append` 默认串行（契约 D6），
-需要调用方显式声明顺序无关（或 Algeff 侧仍走串行路径测量——预期 ~100%/~105%）：
-
-```rust,ignore
-// 方案 A（顺序无关 opt-in，D6）：
-let fork10 = fork!(
-    append_chunk(shared_path, 32KB), ... ×10,
-    combine = count_ok, // 结果顺序无关
-);
-// 每路 append_chunk = Open{path, append} → Write{fd, 32KB} → Close{fd}
-```
-
-被测路径：`Open/Write/Close` + 追加模式；对比原生 tokio 的 O_APPEND 直写，
-Algeff 需在 `TokioExecutor::execute(Open{append})` 映射到同一 O_APPEND。
+顺序无关的并行追加：A3 冲突矩阵 `Append∥Append` 默认串行（契约 D6），Algeff 臂走
+D6 默认串行路径（`Open{append} → Write → Close` × 10 任务顺序展开，CTO 批准）。
+批 4 复测 24.3%（批 3 为 29.4%，无回归）——小负载下串行追加显著快于原生 10 路
+并行追加（tokio::spawn + 同步开销主导）。opt-in 并行
+（`can_parallel_with append_order_insensitive`）留待后续基准驱动。
 
 ### 4.5 接入注意事项
 
@@ -149,6 +120,8 @@ Algeff 需在 `TokioExecutor::execute(Open{append})` 映射到同一 O_APPEND。
 - 计算方式：`对比百分比 = algeff_median / tokio_native_median × 100%`，
   对照 pdr.md §16 预期列；超出预期则报回归（A7 介入优化）。
 - echo 对比项同样受 §5 连接预算约束（总连接数 ≤ 数千级）。
+- **D17 并行蓝图注意**：并行分支内不要 Open（fd 分配碰撞，见 4.2）；需要分支内
+  独立打开资源的场景待 A2/A5 解决（fd 分配去冲突 / 位置读）。
 
 ## 5. Windows 端口池约束（echo 连接预算，CTO 裁决记录）
 

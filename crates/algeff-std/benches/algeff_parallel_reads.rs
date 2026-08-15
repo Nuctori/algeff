@@ -3,17 +3,23 @@
 //! 对照 pdr.md §16「并行读取 10 个不同文件」：原生 tokio = 100%，
 //! Algeff 静态路径预期 ~100%（零锁）。
 //!
-//! ## 实施说明（D14 顺序 Fork）
-//! Algeff 臂用 `Action::Fork` 10 路（平衡二叉 Fork 树，combine 汇总字节数），
-//! 每路 = Open{read} → Read(1MB) → Close。契约决策 D14：Fork 阶段 1 语义 =
-//! 静态冲突检测（`fork_conflict`，此处 10 文件互不冲突 → 检测通过）+ **顺序执行**
-//! （left → right → combine）。因此实测耗时 ≈ 10 × 单文件读，显著高于原生
-//! `tokio::join!`——**预期差距归因 D14 顺序 Fork**，并行化属阶段 3 待办
-//! （pdr §16 的 ~100% 是并行化后的目标值）。诚实数据，不修饰。
+//! ## 实施说明（D17 Fork 并行 + 预开文件）
+//! Algeff 臂用 `Action::Fork` 10 路（平衡二叉 Fork 树，combine 汇总字节数）。
+//! 契约 D17（A2 批 4）：Fork 无冲突（`fork_conflict`，此处 10 文件互不冲突 →
+//! can_parallel=true）且为 `Runtime` 的 Shared 执行器通道时**真并行**
+//! （`run_fork_parallel`：spawn_blocking × 2 + current-thread runtime，逐层递归）。
 //!
-//! 对比基准：本文件内建 `tokio_native_10x1MB` 同参数参照臂（与批 2 相同的
-//! 10 × 1MB + `tokio::join!`），百分比 = algeff/原生 × 100%。
-//! 批 2 的 4.5676 ms 保留在基线文件作为历史参照。
+//! **D17 并行分支 fd 分配限制（A7 批 4 实测发现）**：并行分支各自从父 registry
+//! 的 `next_fd` 克隆分配 fd 号（D13 隔离 registry），而共享执行器
+//! （`TokioExecutor`）的 `files` 等句柄映射以 fd 为键 —— 两分支同时 Open 会
+//! 分配**相同 fd 号并互相覆盖映射**（读错文件/EOF），功能断言必败。故本臂
+//! 把 Open 移出 Fork：先在父 registry 顺序预开 10 个文件（fd 单调无冲突），
+//! Fork 内每叶仅 `Read(fd_i, 1MB) → Close(fd_i)`（不同 fd，互不覆盖）。
+//! 被测负载不变（10 个不同文件的并发读，零锁零共享），与原生臂 `tokio::join!`
+//! 同构；预开的 Open 成本仍在 iter 计时内（链的一部分）。
+//!
+//! 批 3（D14 顺序 Fork）实测 340% 的历史对照见 perf/baseline-2026-08-15.txt；
+//! 本批（D17 并行）应回归 pdr §16 的 ~100%。
 
 use std::path::{Path, PathBuf};
 
@@ -106,33 +112,20 @@ async fn native_join(paths: &[PathBuf]) -> usize {
         + j.expect("read9").len()
 }
 
-// ── Algeff 臂：Fork 10 路读（Open→Read→Close）────────────────────────
+// ── Algeff 臂：预开 10 文件 → Fork 10 路读（Read→Close）────────────────
 
-/// 单文件读叶子：Open{read} → Read(fd, 1MB) → Close → Pure(U64(字节数))。
-fn read_file_leaf(path: PathBuf) -> Action {
-    let usage = use_read_path(path.clone());
+/// 单文件读叶子：Read(fd, 1MB) → Close → Pure(U64(字节数))。
+/// 叶子不 Open（D17 并行分支内分配 fd 会与另一分支碰撞，见头注释）。
+fn read_close_leaf(fd: Fd) -> Action {
     syscall(
-        DataOp::Open {
-            path,
-            flags: OpenFlags {
-                read: true,
-                ..Default::default()
-            },
-        },
-        vec![usage],
+        DataOp::Read { fd, len: FILE_SIZE },
+        vec![use_read_fd(fd)],
         Box::new(move |v| {
-            let fd = fd_of(v);
+            let n = bytes_len(v) as u64;
             syscall(
-                DataOp::Read { fd, len: FILE_SIZE },
-                vec![use_read_fd(fd)],
-                Box::new(move |v| {
-                    let n = bytes_len(v) as u64;
-                    syscall(
-                        DataOp::Close { fd },
-                        vec![use_own_fd(fd)],
-                        Box::new(move |_| Action::Pure(Value::U64(n))),
-                    )
-                }),
+                DataOp::Close { fd },
+                vec![use_own_fd(fd)],
+                Box::new(move |_| Action::Pure(Value::U64(n))),
             )
         }),
     )
@@ -146,14 +139,43 @@ fn fork_sum(left: Action, right: Action) -> Action {
     }
 }
 
-/// 平衡二叉 Fork 树（10 叶；D14 阶段 1 = 静态检测 + 顺序执行）。
-fn fork_tree(paths: &[PathBuf], lo: usize, hi: usize) -> Action {
+/// 平衡二叉 Fork 读树（10 叶；can_parallel=true → D17 真并行）。
+fn fork_read_tree(fds: &[Fd], lo: usize, hi: usize) -> Action {
     if hi - lo == 1 {
-        read_file_leaf(paths[lo].clone())
+        read_close_leaf(fds[lo])
     } else {
         let mid = (lo + hi) / 2;
-        fork_sum(fork_tree(paths, lo, mid), fork_tree(paths, mid, hi))
+        fork_sum(fork_read_tree(fds, lo, mid), fork_read_tree(fds, mid, hi))
     }
+}
+
+/// 预开链：顺序 Open 全部文件（父 registry 单调分配 fd，无 D17 并行冲突）
+/// → 全部就绪后进入 Fork 读树。
+fn open_all(paths: Vec<PathBuf>, idx: usize, fds: Vec<Fd>) -> Action {
+    if idx == paths.len() {
+        return fork_read_tree(&fds, 0, fds.len());
+    }
+    let path = paths[idx].clone();
+    let usage = use_read_path(path.clone());
+    syscall(
+        DataOp::Open {
+            path,
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+        },
+        vec![usage],
+        Box::new(move |v| {
+            let mut fds = fds;
+            fds.push(fd_of(v));
+            open_all(paths, idx + 1, fds)
+        }),
+    )
+}
+
+fn parallel_reads_chain(paths: Vec<PathBuf>) -> Action {
+    open_all(paths, 0, Vec::new())
 }
 
 fn bench_parallel_reads(c: &mut Criterion) {
@@ -179,7 +201,7 @@ fn bench_parallel_reads(c: &mut Criterion) {
         let mut runtime = Runtime::new(Box::new(TokioExecutor::new()));
         // 功能验证（setup 内、不计时）：10 路读应汇总 10MB。
         {
-            let chain = fork_tree(&paths, 0, paths.len());
+            let chain = parallel_reads_chain(paths.clone());
             let v = runtime.run_blocking(chain).expect("fork 读链执行失败");
             assert_eq!(
                 v,
@@ -188,7 +210,7 @@ fn bench_parallel_reads(c: &mut Criterion) {
             );
         }
         b.iter(|| {
-            let chain = fork_tree(&paths, 0, paths.len());
+            let chain = parallel_reads_chain(paths.clone());
             let v = runtime
                 .run_blocking(chain)
                 .expect("fork 读链执行失败（测量中）");
