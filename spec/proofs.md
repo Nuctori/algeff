@@ -175,7 +175,7 @@ recover ∘ track(wₙ) ∘ ⋯ ∘ track(w₁)(γ₀, id) = (γ₀, id)
 **边界与风险**
 
 - 无死锁 ≠ 无活锁：有限重试只保证重试次数有界，不保证一定成功；竞争激烈时任务以错误终止（回滚上抛）——这是有意的设计（pdr.md §十七"动态资源仲裁的锁竞争"）。
-- A7/P5 目前**无实现载体**（`interpret` 为 `todo!`，`tla/scheduler.tla` 未交付）。G2 门禁（契约 §4）前必须由 A2 实现占坑/回滚/重试、A6 完成模型检测。
+- A7/P5 的**模型层载体已交付**：`tla/scheduler.tla`（A6 批 1，TLC 通过 4 不变式 + 1 时序属性），映射细节见下方「P5 ↔ TLA 模型对照」小节。**执行层载体由 A2 交付**（`interpret` 动态占坑/回滚/重试）；G2 门禁（契约 §4）前需完成执行级闭环（A2 解释器已合并 main `003acd7`）。
 - 用户隐瞒依赖（不声明 `ResourceSet`）可导致 `can_parallel` 误判为可并行——由 pdr.md §18 划为用户责任，不在此命题保证范围内。
 
 **Rust 测试映射（A6 建议）**
@@ -186,6 +186,58 @@ recover ∘ track(wₙ) ∘ ⋯ ∘ track(w₁)(γ₀, id) = (γ₀, id)
 | `prop_p5_bounded_retry_all_complete` | 同上（压力测试：N 任务 / M 资源，M < N） | 全部任务在有限步内完成或返回错误；重试次数 ≤ B；无任务永久挂起（= `axiom_a7_bounded_retry_progress`） |
 | `prop_p5_placeholder_rollback_no_leak` | 同上 | 占坑失败后 registry 无残留占坑登记（回滚完整性） |
 | `prop_p5_no_circular_wait` | `tla/scheduler.tla` + Apalache | 模型检测：所有可达状态无"持有-等待"环（= `axiom_a7_no_circular_wait_tla`） |
+
+---
+
+## P5 ↔ TLA 模型对照（`tla/scheduler.tla` 状态机映射）
+
+> 本节把 P5 的形式化论证逐条映射到 A6 交付的 `tla/scheduler.tla`（TLC 通过
+> `TypeOK`/`ExclusiveHold`/`ExactHold`/`NoCircularWait` 4 不变式 + `Progress` 1 时序
+> 属性，见 `tla/README.md §3`）。映射是双向的：证明中每个机制在模型里有对应动作
+> /不变式；模型的状态约束反过来划定了实现不得退化的边界。
+
+### 1. 证明机制 → 模型动作映射
+
+| P5 机制 | 模型动作 | 模型语义 | 对应实现承诺 |
+| --- | --- | --- | --- |
+| **原子占坑（claim）** | `Claim(t)` | 单步原子动作：`requested[t]` 全部空闲 → 一举持有全部资源并 `status[t] := "running"`；无「持有部分资源」中间态 | 动态资源获取一次性登记全部资源（全有或全无），成功前不持有任何锁 |
+| **失败回滚（abort）** | `ClaimFail(t)` | 任一所需资源被占 → 什么都不持有（原子性本身就是回滚，无需部分释放）；`retries[t] := retries[t]+1`；达到 `MaxRetries` → `status[t] := "failed"` 永久放弃 | 占坑失败撤销全部登记，registry 无残留（`prop_p5_placeholder_rollback_no_leak`） |
+| **有限重试（retry）** | `ClaimFail(t)` 的 `retries[t]+1` 且回 `"idle"` 分支 | 未达上限时 `status[t]` 回到 `"idle"` 允许再次 `TryClaim`；上限 `MaxRetries` 为常量（`ASSUME MaxRetries \in Nat`） | 重试次数 ≤ B，超限上抛错误，不无限等待（`prop_p5_bounded_retry_all_complete`） |
+| 执行完毕释放 | `Finish(t)` | `status[t] := "done"`，释放全部占坑 | 任务结束释放全部持有资源 |
+
+注：模型把「逐资源获取 + 失败回滚」压缩为单个原子动作 `Claim`/`ClaimFail`——这正是
+A7「原子占坑」的语义承诺（半占状态不存在，故无需建模回滚序列；`tla/README.md §5` 已记录该简化）。
+
+### 2. 「无循环等待」不变式在模型中的表述
+
+模型用**通用 waits-for 图**定义不变式 `NoCircularWait`（不依赖原子性假设）：
+
+```
+WaitsFor(t) == { u \in T : u /= t /\ \E r \in requested[t] : u \in holders[r] }
+NoCircularWait == ~\E S \in SUBSET T :
+                     S /= {} /\ \A t \in S : \E u \in S : u \in WaitsFor(t)
+```
+
+- `WaitsFor(t)`：t 等待 u，当 u 持有 t 所需的某个资源（排除自等待）——即 P5 论证中的等待边 `Tᵢ → Tᵢ₊₁`。
+- `NoCircularWait`：不存在非空任务子集 S，其中每个任务都等待 S 内另一任务——「循环等待链
+  不存在」（Coffman 条件 4 不成立）的集合论等价刻画。
+- **非平凡性**：该不变式定义在通用图上，不假设占坑原子性。若实现退化为「逐资源增量占坑 +
+  持久持有」（任务 A 占 r1 等 r2、任务 B 占 r2 等 r1），2-环立即违反 `NoCircularWait`，TLC 会
+  报告反例——模型因此持续守住 P5 的结构性前提，而非只验证「当前策略下没环」。
+
+### 3. 静态 `can_parallel`（A3）与动态占坑（A7）在 P5 中的分工
+
+| 层 | 机制 | 在 P5 证明中的角色 | 在模型中的位置 |
+| --- | --- | --- | --- |
+| **静态**（A3 交换律检测） | `ResourceRegistry::can_parallel` / `can_parallel_with`（冲突矩阵，D6/§9.1） | P5 机制 1：蓝图期判定冲突 → 降级**顺序执行**，任务间不存在「等待资源」状态，循环等待链无从构造（消灭等待） | 不在状态机内：静态可判定的冲突任务根本不进入 `TryClaim` 竞争（模型只建模动态路径）；`requested[t]` 可视作静态过滤后「仍需动态仲裁」的资源集 |
+| **动态**（A7） | 原子占坑 + 失败回滚 + 有限重试 | P5 机制 2：原子占坑破坏 Coffman 条件 2（持有并等待）——任务要么持有全部所需资源，要么什么都不持有，不可能「持有部分、等待其余」（消灭半占） | `Claim`/`ClaimFail`/`Finish` + 不变式 `ExactHold`（running 任务恰好持有 `requested[t]`，不多不少）与 `NoCircularWait` |
+
+- 静态层是 P5 的**第一道防线**：能静态判定的冲突根本不进入等待/重试路径；动态层只处理
+  静态无法判定的运行期竞争（如 `MutexLock`）。
+- 模型 `ExclusiveHold`（任一资源至多被一任务持有）对应动态互斥语义；`ExactHold` 对应
+  「占坑 = 一次拿全」的原子性约束，防止实现偷偷退化为部分占坑。
+- 工程结论：只要实现保持 (i) 静态冲突串行降级、(ii) 动态占坑全有或全无、(iii) 重试有界，
+  TLC 对 `NoCircularWait` 的验证结果即对 Rust 实现成立（模型 ↔ 实现映射另见 `tla/README.md §6`）。
 
 ---
 
