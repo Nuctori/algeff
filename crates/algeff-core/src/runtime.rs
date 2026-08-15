@@ -559,7 +559,7 @@ async fn wait_timeout<'a>(
     let sleep = tokio::time::sleep(duration);
     tokio::pin!(sleep);
     tokio::select! {
-        r = &mut inner => return (false, r),
+        r = &mut inner => (false, r),
         _ = &mut sleep => {
             // 广播取消：并行 Fork 分支检查后快速返回（join 见下）。
             let _ = cancel_tx.send(true);
@@ -567,8 +567,8 @@ async fn wait_timeout<'a>(
             let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
             tokio::pin!(grace);
             tokio::select! {
-                r = &mut inner => return (true, r),
-                _ = &mut grace => return (true, Err(CANCELLED_ERR)),
+                r = &mut inner => (true, r),
+                _ = &mut grace => (true, Err(CANCELLED_ERR)),
             }
         }
     }
@@ -579,6 +579,7 @@ async fn wait_timeout<'a>(
 /// CancelToken、线性快照）若留在 `interpret_impl` 的 match 臂内，会撑大
 /// **每层递归**的状态机帧（RFC-11 深度守卫 95/96/97 边界实测会栈溢出）——
 /// 提取后解释器帧只持一个 BoxFuture 指针。VC 路径见 `run_virtual_timeout`。
+#[allow(clippy::too_many_arguments)]
 async fn run_wall_timeout<'a>(
     inner: Action,
     on_timeout: Action,
