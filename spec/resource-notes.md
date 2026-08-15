@@ -545,3 +545,9 @@ AlreadyExists），跨平台一致。
   同路径 Write 模式重开成功 → 重开后可写（物理生效）→ 二写仍被 A4 拦截；
 - 回归：r4b 异路径毒化测试 `open_exclusive_existing_fails_no_state_poison` 不变，
   `cargo test --workspace` 全绿。
+
+**残余缺口（审查登记，RFC-08/09 同族，阶段 3+）**：回滚只覆盖 **exec 返回 Err** 路径；
+若含 Write/Own 的 Syscall future 被 `Action::Timeout` **丢弃**（超时取消，不经 exec 返回），
+预插入的线性标记不触发回滚（同 RFC-08「Timeout 取消 ⇒ 孤儿副作用」族）。无测试覆盖
+「Timeout 取消飞行中的 Write」；修复方向 = 取消传播协议（RFC-08/09 同路径）。「恢复同路径
+可重试语义」的承诺范围 = exec 失败路径，Timeout 丢弃路径不在承诺内。
