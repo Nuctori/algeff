@@ -28,8 +28,8 @@ pub mod prelude {
     };
     pub use crate::error::SysError;
     pub use crate::resource::{
-        AccessMode, AppendOnly, Owned, ReadOnly, TypedResource, Resource, ResourceHandle,
-        ResourceInner, ResourceRegistry, ResourceSet, ResourceUsage, WriteOnly,
+        AccessMode, AppendOnly, Owned, ReadOnly, TypedResource, Resource, ResourceArbiter,
+        ResourceHandle, ResourceInner, ResourceRegistry, ResourceSet, ResourceUsage, WriteOnly,
     };
     pub use crate::runtime::{Context, Runtime, UndoStack};
     pub use crate::syscall::{SyscallExecutor, UndoOp};
