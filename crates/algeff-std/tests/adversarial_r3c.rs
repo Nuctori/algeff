@@ -40,8 +40,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use algeff_core::{
-    AccessMode, Action, DataOp, OpenFlags, Owned, ReadOnly, Resource, ResourceHandle,
-    ResourceInner, ResourceUsage, Runtime, SysError, TypedResource, Value, WriteOnly,
+    Action, DataOp, OpenFlags, Owned, ReadOnly, ResourceHandle, ResourceInner, ResourceUsage,
+    Runtime, SysError, TypedResource, Value, WriteOnly,
 };
 use algeff_std::TokioExecutor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -62,14 +62,6 @@ fn rd_path(path: PathBuf) -> ResourceUsage {
 }
 fn wr_path(path: PathBuf) -> ResourceUsage {
     TypedResource::<WriteOnly>::new_write(ResourceInner::Path(path)).into_usage()
-}
-
-/// 线性绕过（pdr §18：类型状态包装不能完全阻止绕过，运行时拦截是防线）。
-fn wu(fd: u64) -> ResourceUsage {
-    ResourceUsage {
-        resource: Resource::Fd(fd),
-        mode: AccessMode::Write,
-    }
 }
 
 fn fd_of(v: &Value) -> u64 {
@@ -215,10 +207,7 @@ fn spawn_client(
                 let mut buf = vec![0u8; expect];
                 let mut got = 0usize;
                 while got < expect {
-                    let n = s
-                        .read(&mut buf[got..])
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let n = s.read(&mut buf[got..]).await.map_err(|e| e.to_string())?;
                     if n == 0 {
                         return Err(format!("EOF（读到 {got}/{expect}）"));
                     }
@@ -326,11 +315,9 @@ fn accept_echo_loop(listener: u64, remaining: usize) -> Action {
                                 },
                                 vec![rd(sfd)],
                                 move |_| {
-                                    syscall(
-                                        DataOp::Close { fd: sfd },
-                                        vec![ow(sfd)],
-                                        move |_| accept_echo_loop(listener, remaining - 1),
-                                    )
+                                    syscall(DataOp::Close { fd: sfd }, vec![ow(sfd)], move |_| {
+                                        accept_echo_loop(listener, remaining - 1)
+                                    })
                                 },
                             )
                         },
@@ -461,26 +448,33 @@ fn net_tcp_shutdown_half_close_read_alive_write_fails() {
     let client = spawn_client_halfclose(addr);
     let v = rt.run_blocking(half_close_server_chain(lfd)).unwrap();
     let (sfd, pong) = match &v {
-        Value::List(l) if l.len() == 2 => (fd_of(&l[0]), match &l[1] {
-            Value::Bytes(b) => b.clone(),
-            other => panic!("期望 Bytes，得到 {other:?}"),
-        }),
+        Value::List(l) if l.len() == 2 => (
+            fd_of(&l[0]),
+            match &l[1] {
+                Value::Bytes(b) => b.clone(),
+                other => panic!("期望 Bytes，得到 {other:?}"),
+            },
+        ),
         other => panic!("期望 List([Fd, Bytes])，得到 {other:?}"),
     };
-    assert_eq!(pong, b"pong", "shutdown(Write) 后读半端仍可用（收到客户端上行）");
+    assert_eq!(
+        pong, b"pong",
+        "shutdown(Write) 后读半端仍可用（收到客户端上行）"
+    );
     let (ping, eof) = client.join().unwrap().unwrap();
     assert_eq!(ping, b"PING", "客户端收到 shutdown(Write) 前的数据");
     assert!(eof, "客户端在 PING 之后观察到 EOF（FIN 已发送）");
 
-    // 写半端必须真实关闭：shutdown(Write) 后再写必须失败（wu 绕过 A4，
-    // 隔离到 socket 层失败，而非线性检查拦截）。
+    // 写半端必须真实关闭：shutdown(Write) 后再写必须失败。资源声明留空
+    // （pdr §18 用户责任边界）——绕过 A4 线性拦截，把错误来源隔离到 socket 层
+    // （链内首个 TcpWrite 已消费 wr(sfd)，再声明 Write 会被 A4 拒绝）。
     let e = rt
         .run_blocking(syscall(
             DataOp::TcpWrite {
                 fd: sfd,
                 data: b"PONG".to_vec(),
             },
-            vec![wu(sfd)],
+            vec![],
             Action::Pure,
         ))
         .unwrap_err();
@@ -615,9 +609,7 @@ fn reset_server_first(listener: u64) -> Action {
                             how: Shutdown::Both,
                         },
                         vec![rd(sfd)],
-                        move |_| {
-                            syscall(DataOp::Close { fd: sfd }, vec![ow(sfd)], Action::Pure)
-                        },
+                        move |_| syscall(DataOp::Close { fd: sfd }, vec![ow(sfd)], Action::Pure),
                     )
                 }),
             }
@@ -693,7 +685,11 @@ fn net_conn_reset_reconnect_same_blueprint_succeeds() {
     let c2 = spawn_client(addr, b"req2".to_vec(), 4);
     rt.run_blocking(reset_server_second(lfd)).unwrap();
     let echo = c2.join().unwrap().unwrap();
-    assert_eq!(echo, b"REP2".to_vec(), "错误不毒化：同蓝图重连成功且收到回包");
+    assert_eq!(
+        echo,
+        b"REP2".to_vec(),
+        "错误不毒化：同蓝图重连成功且收到回包"
+    );
 
     rt.run_blocking(syscall(
         DataOp::Close { fd: lfd },
@@ -721,6 +717,7 @@ fn r2_flush_regression_parallel_double_write_64_rounds() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
     // 一次 Open 两个文件（父级），此后每轮经并行 Fork 双写。
+    let pb_in = pb.clone();
     let v = rt
         .run_blocking(syscall(
             DataOp::Open {
@@ -732,10 +729,10 @@ fn r2_flush_regression_parallel_double_write_64_rounds() {
                 let fda = fd_of(&v);
                 syscall(
                     DataOp::Open {
-                        path: pb.clone(),
+                        path: pb_in.clone(),
                         flags: rw_flags(),
                     },
-                    vec![wr_path(pb.clone())],
+                    vec![wr_path(pb_in.clone())],
                     move |v| Action::Pure(Value::List(vec![Value::Fd(fda), v])),
                 )
             },
@@ -745,7 +742,7 @@ fn r2_flush_regression_parallel_double_write_64_rounds() {
 
     for i in 0..64u8 {
         let pay_a = [b'A' + (i % 26); 4];
-        let pay_b = [b'B' + ((i * 7) % 26); 4];
+        let pay_b = [b'B' + (((i as u32 * 7) % 26) as u8); 4];
         // 并行 Fork：左右分支各自 Seek(0)+Write 不同文件（资源不相交 → 真
         // 并行，两路 OS 写并发压 blocking pool —— R1 单写顺序组合的加强版）。
         rt.run_blocking(Action::Fork {
@@ -949,11 +946,7 @@ fn arb_round(id: u64, dur_ms: u64, sleep_ms: u64) -> Action {
     Action::Catch {
         action: Box::new(Action::Timeout {
             action: Box::new(Action::Sequential {
-                current: Box::new(syscall(
-                    DataOp::MutexLock { id },
-                    vec![],
-                    Action::Pure,
-                )),
+                current: Box::new(syscall(DataOp::MutexLock { id }, vec![], Action::Pure)),
                 next: Box::new(move |_| Action::Sequential {
                     current: Box::new(Action::Sleep {
                         duration: Duration::from_millis(sleep_ms),
@@ -977,9 +970,7 @@ fn arb_round(id: u64, dur_ms: u64, sleep_ms: u64) -> Action {
 fn arb_branch(id: u64, rounds: usize, seed: u64) -> Action {
     fn go(id: u64, remaining: usize, acc: [u64; 4], seed: u64) -> Action {
         if remaining == 0 {
-            return Action::Pure(Value::List(
-                acc.iter().map(|&x| Value::U64(x)).collect(),
-            ));
+            return Action::Pure(Value::List(acc.iter().map(|&x| Value::U64(x)).collect()));
         }
         let s1 = xorshift(seed);
         let dur_ms = 1 + s1 % 3; // 1..=3
@@ -1036,13 +1027,15 @@ fn add_count_lists(l: Value, r: Value) -> Value {
 /// N 路并行 Fork（平衡合并，combine 相加计数）。分支资源全空 → 无冲突 →
 /// 真并行。
 fn fork_n(branches: Vec<Action>) -> Action {
-    fn rec(actions: Vec<Action>) -> Action {
+    fn rec(mut actions: Vec<Action>) -> Action {
         if actions.len() == 1 {
-            return actions.into_iter().next().unwrap();
+            return actions.pop().unwrap();
         }
+        // Action 非 Clone：经 split_off 所有权切分（不可索引切片克隆）。
         let mid = actions.len() / 2;
-        let l = rec(actions[..mid].to_vec());
-        let r = rec(actions[mid..].to_vec());
+        let right = actions.split_off(mid);
+        let l = rec(actions);
+        let r = rec(right);
         Action::Fork {
             left: Box::new(l),
             right: Box::new(r),
@@ -1076,7 +1069,11 @@ fn r2_arbiter_8x30_mixed_timeout_storm_no_poison() {
         "R3C arbiter 风暴：ok={ok} blocked={blocked} timed_out={timed_out} err={err} undo_len={}",
         rt.undo_stack().len()
     );
-    assert_eq!(ok + blocked + timed_out + err, 8 * 30, "全部轮次有明确结果（无悬挂/丢失）");
+    assert_eq!(
+        ok + blocked + timed_out + err,
+        8 * 30,
+        "全部轮次有明确结果（无悬挂/丢失）"
+    );
     assert_eq!(err, 0, "不允许出现 WouldBlock 之外的错误");
     assert!(timed_out >= 1, "超时压力必须实际触发（随机 Timeout 生效）");
     assert!(
@@ -1122,6 +1119,7 @@ fn r2_sendfile_file_target_visibility() {
     std::fs::write(&dst, b"0000000000").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
+    let dst_in = dst.clone();
     let v = rt
         .run_blocking(syscall(
             DataOp::Open {
@@ -1133,10 +1131,10 @@ fn r2_sendfile_file_target_visibility() {
                 let sfd = fd_of(&v);
                 syscall(
                     DataOp::Open {
-                        path: dst.clone(),
+                        path: dst_in.clone(),
                         flags: rw_flags(),
                     },
-                    vec![wr_path(dst.clone())],
+                    vec![wr_path(dst_in.clone())],
                     move |v| Action::Pure(Value::List(vec![Value::Fd(sfd), v])),
                 )
             },
@@ -1161,18 +1159,22 @@ fn r2_sendfile_file_target_visibility() {
             Action::Pure,
         ))
         .unwrap();
-        // 立即同步读目标尾部（第 i 次拷贝落在 [4i, 4i+4)）。
-        let got = std::fs::read(&dst).unwrap();
+        // 立即同步读目标尾部（第 i 次拷贝落在 [4i, 4i+4)）。注意：文件长度
+        // 不足也计入“旧内容”——若 SendFile 的 OS 写尚未落盘，文件尚未伸长。
         let off = 4 * i as usize;
-        let tail = &got[off..off + 4];
-        let mut visible = tail == &payload[..];
+        let check = || -> bool {
+            match std::fs::read(&dst) {
+                Ok(got) if got.len() >= off + 4 => &got[off..off + 4] == &payload[..],
+                _ => false,
+            }
+        };
+        let mut visible = check();
         if !visible {
             stale_immediate += 1;
             // 兜底重试（≤1s）：数据最终必须可见（无丢失底线）。
             for _ in 0..100 {
                 std::thread::sleep(Duration::from_millis(10));
-                let got = std::fs::read(&dst).unwrap();
-                visible = &got[off..off + 4] == &payload[..];
+                visible = check();
                 if visible {
                     break;
                 }
