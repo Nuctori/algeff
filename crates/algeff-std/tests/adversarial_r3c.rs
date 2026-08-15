@@ -28,9 +28,9 @@
 //!     （无声明争用 → 真并行 → 动态仲裁有限重试），取消路径（claim 守卫
 //!     drop）与孤儿锁（recover 路径）都不造成**永久毒化**——风暴后
 //!     recover + 同 id 重入成功；
-//! 2d. **SendFile 文件目标写可见性**（flush 修复的相邻面）：op_send_file
-//!     输出到文件无显式 flush，立即同步读可能观察到旧内容（与 R1 根因同
-//!     一类窗口）；底线契约——数据最终必须可见（无丢失）。
+//! 2d. **SendFile 文件目标写可见性**（R3c MEDIUM-1，D-039 对齐修复）：
+//!     op_send_file 输出到文件曾无显式 flush（与 R1 flaky 同根因的异步
+//!     落盘窗口）；executor 修复后 64 轮立即同步读必须观察到新内容。
 //!
 //! Windows 端口预算：全部测试合计约 7 个 TCP 连接 + 1 个 UDP 端口，远低于
 //! 500 上限。
@@ -1102,12 +1102,12 @@ fn r2_arbiter_8x30_mixed_timeout_storm_no_poison() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 2d：SendFile → 文件目标 写可见性（flush 修复的相邻面）。
-// op_send_file 输出到文件走 `g.write(&buf)` 且**无显式 flush** —— 与 R1
-// flaky 根因（write_all 异步落盘）同一类窗口：SendFile op 返回后立即同步
-// 读可能观察到旧内容。本测试 64 轮：每轮重写源文件 → SendFile 拷贝 →
-// 立即同步读目标尾部，统计立即可见率；底线契约断言——数据最终可见
-// （无丢失，BestEffort 撤销不得丢数据）。
+// 攻击面 2d：SendFile → 文件目标 写可见性（R3c MEDIUM-1，D-039 对齐修复）。
+// op_send_file 输出到文件此前走 `g.write(&buf)` 且**无显式 flush** —— 与
+// R1 flaky 根因（write_all 异步落盘）同一类窗口：SendFile op 返回后立即
+// 同步读可观察到旧内容。修复（executor.rs op_send_file 文件路径补 flush）
+// 后本测试升级为严格回归：64 轮每轮重写源文件 → SendFile 拷贝 → 立即同步
+// 读目标尾部，必须观察到新内容（失败即断言，R1 同款 fail-fast 风格）。
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1142,12 +1142,10 @@ fn r2_sendfile_file_target_visibility() {
         .unwrap();
     let (sfd, dfd) = pair_of(&v);
 
-    let mut stale_immediate = 0usize;
-    let mut never_visible = 0usize;
     for i in 0..64u8 {
         let payload = [b'P' + (i % 26); 4];
         // 外部重写源文件（模拟输入侧更新），SendFile 拷贝前 4 字节到目标。
-        std::fs::write(&src, &payload).unwrap();
+        std::fs::write(&src, payload).unwrap();
         rt.run_blocking(syscall(
             DataOp::SendFile {
                 out: dfd,
@@ -1159,30 +1157,16 @@ fn r2_sendfile_file_target_visibility() {
             Action::Pure,
         ))
         .unwrap();
-        // 立即同步读目标尾部（第 i 次拷贝落在 [4i, 4i+4)）。注意：文件长度
-        // 不足也计入“旧内容”——若 SendFile 的 OS 写尚未落盘，文件尚未伸长。
+        // SendFile op 返回后不得依赖任何中间操作兜底——立即同步读目标尾部
+        // （第 i 次拷贝落在 [4i, 4i+4)）必须可见新内容；文件长度不足（OS 写
+        // 未落盘、文件尚未伸长）同样视为旧内容。
         let off = 4 * i as usize;
-        let check = || -> bool {
-            match std::fs::read(&dst) {
-                Ok(got) if got.len() >= off + 4 => &got[off..off + 4] == &payload[..],
-                _ => false,
-            }
-        };
-        let mut visible = check();
-        if !visible {
-            stale_immediate += 1;
-            // 兜底重试（≤1s）：数据最终必须可见（无丢失底线）。
-            for _ in 0..100 {
-                std::thread::sleep(Duration::from_millis(10));
-                visible = check();
-                if visible {
-                    break;
-                }
-            }
-        }
-        if !visible {
-            never_visible += 1;
-        }
+        let got = std::fs::read(&dst).unwrap();
+        assert!(
+            got.len() >= off + 4 && got[off..off + 4] == payload[..],
+            "第 {i} 轮：SendFile op 完成后新内容必须立即可观察（D-039 对齐；\
+             修复前无 flush 时此处读到旧内容或文件未伸长）"
+        );
         // 复位 A4（wr(dfd) 每轮至多一次）；registry 清空后 executor 文件
         // 映射仍可寻址（RFC-05 记录行为）。
         rt.run_blocking(Action::Replace {
@@ -1190,11 +1174,4 @@ fn r2_sendfile_file_target_visibility() {
         })
         .unwrap();
     }
-    eprintln!(
-        "R3C SendFile 可见性：64 轮中立即同步读旧内容 {stale_immediate} 次；最终不可见 {never_visible} 次"
-    );
-    assert_eq!(
-        never_visible, 0,
-        "SendFile 拷贝数据最终必须可见（无数据丢失），stale_immediate={stale_immediate}"
-    );
 }
