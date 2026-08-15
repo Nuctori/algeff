@@ -4,6 +4,7 @@
 //! `adapters.rs`（预包装适配器 open_tcp/read/write/close…，pdr.md §14 风格）。
 
 pub mod adapters;
+pub mod dx;
 pub mod executor;
 
 pub use executor::TokioExecutor;

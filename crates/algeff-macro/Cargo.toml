@@ -14,5 +14,6 @@ syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
 algeff-core = { path = "../algeff-core" }
+algeff-std = { path = "../algeff-std" }
 # A4 批4 授权：执行级集成测试需本地 tokio runtime 驱动 interpret（宏测试专属 dev-dep）
 tokio.workspace = true
