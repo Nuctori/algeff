@@ -432,15 +432,26 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
 
     let branch = |fd: u64, byte: u8| Action::Sequential {
         current: Box::new(syscall(DataOp::GetTime, vec![], Action::Pure)),
-        next: Box::new(move |_| {
-            syscall(
-                DataOp::Write {
-                    fd,
-                    data: vec![byte],
-                },
-                vec![wu(fd)],
-                Action::Pure,
-            )
+        // Sleep 加宽并行窗口：分支 op（GetTime→Sleep→Write）必须与另一分支
+        // 重叠在飞，两个 spawn_blocking 任务才能确保落在不同阻塞池线程（无
+        // Sleep 时两分支各仅一两次 syscall，可能被调度为同线程顺序执行——
+        // 下方 threads.len() >= 2 并行证据将变成调度相关而非语义确定；同
+        // ub_fork_conflict_blindspot_mutex_wouldblock 的既有做法）。
+        next: Box::new(move |_| Action::Sequential {
+            current: Box::new(Action::Sleep {
+                duration: Duration::from_millis(50),
+                next: Box::new(move |_| {
+                    syscall(
+                        DataOp::Write {
+                            fd,
+                            data: vec![byte],
+                        },
+                        vec![wu(fd)],
+                        Action::Pure,
+                    )
+                }),
+            }),
+            next: Box::new(Action::Pure),
         }),
     };
 

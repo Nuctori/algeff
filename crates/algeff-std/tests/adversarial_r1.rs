@@ -302,25 +302,28 @@ fn rev_write_effect_immediately_observable_via_sync_read() {
     let pa = dir.path().join("obs.txt");
     std::fs::write(&pa, b"0000000000").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let fd = {
-        let v = rt
-            .run_blocking(syscall(
-                DataOp::Open {
-                    path: pa.clone(),
-                    flags: OpenFlags {
-                        read: true,
-                        write: true,
-                        ..Default::default()
-                    },
-                },
-                vec![wr_path(pa.clone())],
-                Action::Pure,
-            ))
-            .unwrap();
-        fd_of(&v)
-    };
     for i in 0..64u8 {
         let payload = [b'A' + (i % 26); 4];
+        // RFC-05 修复后 Replace 使旧 fd 失效（registry 活性唯一真相，见
+        // lin_stale_fd_write_after_replace_fails）——每轮重开新 fd（顺带覆盖
+        // D10「Replace 后同路径重开正常」，见 lin_replace_then_reopen_same_path_ok）。
+        let fd = {
+            let v = rt
+                .run_blocking(syscall(
+                    DataOp::Open {
+                        path: pa.clone(),
+                        flags: OpenFlags {
+                            read: true,
+                            write: true,
+                            ..Default::default()
+                        },
+                    },
+                    vec![wr_path(pa.clone())],
+                    Action::Pure,
+                ))
+                .unwrap();
+            fd_of(&v)
+        };
         rt.run_blocking(syscall(
             DataOp::Seek {
                 fd,
@@ -348,8 +351,8 @@ fn rev_write_effect_immediately_observable_via_sync_read() {
             &payload[..],
             "第 {i} 轮：Write op 完成后效果必须立即可观察"
         );
-        // Replace（D10 = recover + reg.clear）复位 A4 线性标记并撤销本轮 Write，
-        // 供下一轮复用同一 fd（Write 的 WriteOnly 资源每轮只允许一次）。
+        // Replace（D10 = recover + reg.clear）复位 A4 线性标记并撤销本轮 Write 与
+        // Open（旧 fd 随之失效，RFC-05）——下一轮重开新 fd 复用同一文件。
         rt.run_blocking(Action::Replace {
             target: Box::new(Action::Pure(Value::Unit)),
         })
@@ -726,8 +729,8 @@ fn lin_replace_then_reopen_same_path_ok() {
     .unwrap();
     assert_eq!(
         std::fs::read(&pa).unwrap(),
-        b"new-data",
-        "重开句柄写生效（游标 0 覆写 seed 前 3 字节）"
+        b"newd-data",
+        "重开句柄写生效：游标 0 覆写 seed 前 3 字节（see→new，d-data 保留）"
     );
     // 旧 fd 仍彻底失效
     let e = rt
@@ -741,7 +744,7 @@ fn lin_replace_then_reopen_same_path_ok() {
         ))
         .unwrap_err();
     assert_eq!(e, SysError::NotFound, "旧 fd 仍失效（NotFound）");
-    assert_eq!(std::fs::read(&pa).unwrap(), b"new-data", "旧 fd 写未落盘");
+    assert_eq!(std::fs::read(&pa).unwrap(), b"newd-data", "旧 fd 写未落盘");
 }
 
 /// RFC-05 修复配套：Fork 并行分支内 Replace 的隔离性（D13）。左分支
