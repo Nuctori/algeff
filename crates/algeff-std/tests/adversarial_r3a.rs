@@ -361,27 +361,35 @@ fn catch_inside_timeout_and_timeout_error_caught() {
 }
 
 /// 同一错误蓝图连续执行 3 次（状态毒化检查）：每次结果一致（第二次起
-/// 结果相同），3 条 Write undo 累积后一次 Replace 逆序全恢复（错误重复
-/// 执行不残留状态、撤销链仍按 LIFO 逐条成立）。
+/// 结果相同）、捕获的错误码一致、写副作用一致；3 条 Write undo 累积后
+/// 一次 Replace 逆序全恢复。
+///
+/// 构造说明：蓝图对路径参数化（每次新文件）——A4 路径级线性要求同一
+/// 路径 Write 至多一次，参数化使「同一错误蓝图」在无 Replace 情况下可
+/// 连续执行并累积 undo，恰为「错误重复执行不残留状态」的最小真实场景。
 #[test]
 fn catch_same_error_blueprint_3_runs_no_poison() {
     let dir = tempfile::tempdir().unwrap();
-    let pa = dir.path().join("blueprint.txt");
-    std::fs::write(&pa, b"original").unwrap();
+    let mut files = Vec::new();
+    for k in 0..3u8 {
+        files.push(dir.path().join(format!("blueprint-{k}.txt")));
+        std::fs::write(&files[k as usize], b"original").unwrap();
+    }
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
     for k in 1..=3u64 {
+        let p = files[(k - 1) as usize].clone();
         let payload = format!("run{k:03}!!").into_bytes();
-        let pa_in = pa.clone();
+        let p_in = p.clone();
         let payload_in = payload.clone();
         let v = rt
             .run_blocking(Action::Catch {
                 action: Box::new(syscall(
                     DataOp::Open {
-                        path: pa_in.clone(),
+                        path: p_in.clone(),
                         flags: rw_flags(),
                     },
-                    vec![wr_path(pa_in.clone())],
+                    vec![wr_path(p_in.clone())],
                     move |v| {
                         let fd = fd_of(&v);
                         syscall(
@@ -395,7 +403,7 @@ fn catch_same_error_blueprint_3_runs_no_poison() {
                     },
                 )),
                 handler: Box::new(move |e| {
-                    assert_eq!(e, SysError::NotFound, "第 {k} 次蓝图错误一致");
+                    assert_eq!(e, SysError::NotFound, "第 {k} 次蓝图错误码一致");
                     Action::Pure(Value::U64(42))
                 }),
             })
@@ -406,7 +414,7 @@ fn catch_same_error_blueprint_3_runs_no_poison() {
             k as usize,
             "第 {k} 次 undo 累积 {k} 条（Catch 不吞栈）"
         );
-        assert_eq!(std::fs::read(&pa).unwrap(), payload, "第 {k} 次写生效");
+        assert_eq!(std::fs::read(&p).unwrap(), payload, "第 {k} 次写生效");
     }
 
     // 3 条 undo 一次 Replace 逆序全恢复（LIFO：第 3 写先撤、第 1 写最后撤）。
@@ -415,11 +423,13 @@ fn catch_same_error_blueprint_3_runs_no_poison() {
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
-    assert_eq!(
-        std::fs::read(&pa).unwrap(),
-        b"original",
-        "3 次重复错误蓝图后撤销链逆序全恢复"
-    );
+    for k in 0..3u8 {
+        assert_eq!(
+            std::fs::read(&files[k as usize]).unwrap(),
+            b"original",
+            "第 {k} 文件：重复错误蓝图后撤销链逆序全恢复"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -630,6 +640,11 @@ fn undo_8_files_consecutive_writes_all_inverse_restored() {
         } else {
             format!("p{i}").into_bytes() // 2 字节 < 原 11 字节
         };
+        // POSIX 游标写（不截断）：短 payload 在尾部留下原内容残段。
+        let mut expect = payload.clone();
+        if payload.len() < originals[i as usize].len() {
+            expect.extend_from_slice(&originals[i as usize][payload.len()..]);
+        }
         let payload_in = payload.clone();
         let v = rt
             .run_blocking(syscall(
@@ -654,8 +669,8 @@ fn undo_8_files_consecutive_writes_all_inverse_restored() {
         assert_eq!(v, Value::Unit);
         assert_eq!(
             std::fs::read(&files[i as usize]).unwrap(),
-            payload,
-            "第 {i} 文件写生效"
+            expect,
+            "第 {i} 文件写生效（游标覆盖语义）"
         );
     }
     assert_eq!(rt.undo_stack().len(), 8, "8 条 undo 全部压栈");
@@ -677,16 +692,22 @@ fn undo_8_files_consecutive_writes_all_inverse_restored() {
 /// 同文件两 fd 连续 Write（撤销栈压力 + LIFO 逆序判别）：第二 fd 的写基于
 /// 第一写后的状态；Replace 恢复必须严格逆序——先撤第二写、再撤第一写。
 /// 若实现按 FIFO 恢复，终态会得到 "12CDEFGH" 而非 "ABCDEFGH"（可判别）。
+///
+/// 构造说明：同一路径两次 Open(write) 会被 A4 路径级线性拦截（InvalidInput），
+/// 故用**硬链接**（同 inode、两条路径、两个独立资源身份）获得指向同一物理
+/// 文件的两个 fd——两条 undo 作用于同一 inode，LIFO 恢复顺序可判别。
 #[test]
 fn undo_same_file_two_fds_lifo_recover_inverse_order() {
     let dir = tempfile::tempdir().unwrap();
     let pa = dir.path().join("two-fds.txt");
+    let pb = dir.path().join("two-fds-link.txt");
     std::fs::write(&pa, b"ABCDEFGH").unwrap();
+    std::fs::hard_link(&pa, &pb).unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
     let fd1 = open_fd(&mut rt, pa.clone());
-    let fd2 = open_fd(&mut rt, pa.clone());
-    assert_ne!(fd1, fd2, "两个打开各自独立 fd");
+    let fd2 = open_fd(&mut rt, pb.clone());
+    assert_ne!(fd1, fd2, "两个打开各自独立 fd（同一 inode）");
 
     // 第一写 "123"（游标 0）→ "123DEFGH"；第二写 "XY"（游标 0）→ "XY3DEFGH"。
     rt.run_blocking(syscall(
@@ -707,7 +728,7 @@ fn undo_same_file_two_fds_lifo_recover_inverse_order() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(std::fs::read(&pa).unwrap(), b"XY3DEFGH", "两写叠加生效");
+    assert_eq!(std::fs::read(&pa).unwrap(), b"XY3DEFGH", "两写叠加生效（硬链接同 inode）");
     assert_eq!(rt.undo_stack().len(), 2, "同文件两条 undo（不同 fd 各一次）");
 
     // LIFO：第二写 undo 先执行（→"123DEFGH"），第一写 undo 后执行（→"ABCDEFGH"）。
