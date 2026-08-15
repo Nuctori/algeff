@@ -35,6 +35,7 @@ name = "algeff-std"
 version = "0.1.0"
 dependencies = [
  "algeff-core",
+ "algeff-macro",
  "criterion",
  "proptest",
  "tempfile",

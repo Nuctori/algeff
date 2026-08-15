@@ -14,13 +14,12 @@ Algeff（Algebraic Effects）将 Unix 系统效应从「指令（动词）」代
 2. **命题**：P1–P5 五条可证明性质建立于公理之上（幺半群、并行交换律、写隔离、撤销双态、无死锁）；
 3. **契约冻结**：D1–D19 十九项决策把承诺边界钉死在 `contracts.md`，作为 8 Agent 并行开发的唯一接口事实来源；
 4. **实现**：三层 crate（core 解释器 / std tokio 执行器 / macro 语法糖），约 2000+1200+300 行；
-5. **验证**：300 个测试函数（约 292 个二进制测试 + 8 条 doc-test）+ 40 个测试二进制，叠加
+5. **验证**：305 个测试函数（约 297 个二进制测试 + 8 条 doc-test）+ 41 个测试二进制，叠加
    `tla/scheduler.tla` 模型检测；
 6. **审计**：5 轮「对抗审计（120 个 E2E 测试）× 形式逻辑审计」串行收官——P1/P2/P3/P5 终判
    「有效（附声明前提）」，P4 部分收敛（差距 RFC-05，阶段 3+ 已裁决）。
 
-**结论**：语义正确性定案，可作研究/原型基线；并行性能（executor 锁串行化，R-6）与跨平台
-错误语义（RFC-10）为**已知开放面**，生产采用需先完成阶段 3+ 缺口清单（§10）。
+**结论**：语义正确性定案，可作研究/原型基线；并行性能（executor 锁串行化，R-6）为**已知开放面**，生产采用需先完成阶段 3+ 缺口清单（§10）；跨平台错误语义（RFC-10）已修复（executor 层归一化，fdd0cfe）。
 
 ---
 
@@ -207,8 +206,8 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | 对抗 E2E | `tests/adversarial_r{1..5}.rs` | 120 个测试（R1=17、R2=19、R3=28、R4=32、R5=24） |
 | 模型检测 | `tla/scheduler.tla` | TLC 通过 `TypeOK`/`ExclusiveHold`/`ExactHold`/`NoCircularWait` 4 不变式 + `Progress` 时序属性 |
 
-总量：`cargo test --workspace` **300 个测试函数**（约 292 个 `#[test]`/`#[tokio::test]` +
-8 条 doc-test 断言；40 个测试二进制 + 3 个 doc-test 运行）。特性测试（coeffects/virtual-clock）
+总量：`cargo test --workspace` **305 个测试函数**（约 297 个 `#[test]`/`#[tokio::test]` +
+8 条 doc-test 断言；41 个测试二进制 + 3 个 doc-test 运行）。特性测试（coeffects/virtual-clock）
 由 feature 门控，CI 三平台补跑（并含 release 编译验证）。
 
 ### 6.2 审计协议（5 轮串行）
@@ -245,11 +244,11 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | RFC-07 | 管道半端经 D13 Clone 共享 Arc → executor `Arc::get_mut` 失败 → 分支内管道 IO 被错误拒绝 | 已登记（R2）；**阶段 3+** | 管道双表改造或 make_mut + 代际标记 |
 | RFC-08 | Timeout 内并行 Fork 孤儿分支副作用不可撤销（P4/A6 边界反例） | 已登记（R2 编号修正）；**阶段 3+** | 取消传播/分支取消协议 |
 | RFC-09 | Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover（可恢复，非永久毒化） | 已登记（R3）；**阶段 3+** | 取消传播协议 |
-| RFC-10 | Windows 错误码未映射 POSIX 语义（Other(80) vs AlreadyExists 等） | 已登记（R4）；**阶段 3+**（error.rs 属冻结面，需 D20 契约授权） | `From<io::Error>` Win32/WSA→errno 归一化，或执行器层归一化 |
+| RFC-10 | Windows 错误码未映射 POSIX 语义（Other(80) vs AlreadyExists 等） | **已修复**（R5 后，fdd0cfe：executor 层 `to_sys_err` + `normalize_windows_errno`，冻结面零改动） | ErrorKind 优先 + Win32/WSA 码表兑底 |
 | RFC-11 | 解释器嵌套蓝图递归栈溢出（进程级 abort） | **已修复**（R4→A2 批 7，阈值 96 深度守卫，D-052） | — |
 
 另：审计期内另有 2 项**非 RFC 编号**缺陷已修复——R1 游标撤销（D-031）、R3 SendFile flush
-（D-046）。合计审计共修复 3 项缺陷。
+（D-046）。合计审计共修复 3 项缺陷；R5 后新增修复 RFC-10（Windows 错误码归一化，fdd0cfe）——共 4 项。
 
 ### 8.2 边界与已知盲区
 
@@ -310,9 +309,8 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 
 ## 10 结论与后续工作
 
-**结论**：Algeff 0.1.0（未发布）是一个**语义正确性已定案**的实验性交付——5 轮对抗+形式审计
-收官（P1/P2/P3/P5 有效附声明、P4 部分收敛且差距明确）、300 测试全绿、契约冻结。性能与跨平台
-错误语义为**已知开放面**，本阶段不提供稳定性承诺。
+收官（P1/P2/P3/P5 有效附声明、P4 部分收敛且差距明确）、305 测试全绿、契约冻结。并行性能为
+**已知开放面**（RFC-10 跨平台错误语义已修复），本阶段不提供稳定性承诺。
 
 **阶段 3+ 工作清单**：
 
@@ -320,7 +318,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 2. **RFC-06**：`offset_next_fd`/`merge` 区间归一化（D1 边界注兑现，优先）；
 3. **RFC-07**：管道半端双表改造或 make_mut + 代际标记；
 4. **RFC-08/09**：Timeout 取消传播协议（孤儿副作用可撤销 + 锁饥饿消除）；
-5. **RFC-10**：Windows 错误码归一化映射（需契约变更 D20 授权）；
+5. ~~RFC-10~~（已修复 fdd0cfe，executor 层归一化，无需 D20 授权）；
 6. **R-6 锁重构**：`exec_via` 锁边界收窄（物理 IO 移出锁外），兑现 D17 并行收益（pdr §16 ~100%）；
 7. **位置读原语**：shared_read 并行前置（执行器层）；
 8. **make_mut 物理 COW**：阶段 3 并行写前置（resource-notes §9.4 裁决，需先补分支破坏性操作契约测试）；

@@ -27,7 +27,7 @@ Algeff 写法：   先把"要做的事"写成一份数据蓝图（Action）→ �
 
 ---
 
-## 这是什么？30 秒理解
+## 这是什么？
 
 ### 问题
 
@@ -42,17 +42,9 @@ Algeff 把所有系统交互编码成**不可变的数据结构（`Action`）**�
 - **可撤销**：运行时自动记录"做过的操作"，出错可整体回滚；
 - **确定性**：蓝图 + 输入 ⇒ 唯一结果，天然可测试、可验证。
 
-### 心智模型：食谱 vs 做菜
-
-| 传统编程 | Algeff |
-| --- | --- |
-| 边读食谱边做菜（指令即执行） | 先把食谱抄成一张卡片（蓝图） |
-| 做坏了只能重新开始 | 卡片在手，随时"回到上一步"重来 |
-| 换一个厨房就得重写食谱 | 同一张卡片换执行器就能跑（tokio / mock / 未来后端） |
-
 ---
 
-## 快速上手（5 分钟）
+## 快速上手
 
 ### 1. 添加依赖
 
@@ -95,28 +87,36 @@ fn main() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let path = std::path::PathBuf::from("hello.txt");
 
-    // Open（声明"要写这个路径"）→ 拿到 fd → Write → Read → Close
+    // Open（声明"要写这个路径"）→ 拿到 fd → Write → Seek → Read
+    // 注意：每个 next 闭包都要加 move（NextFn 是 'static 的）
     let blueprint = Action::Syscall {
-        op: DataOp::Open { path: path.clone(), flags: OpenFlags { read: true, write: true, ..Default::default() } },
-        resources: vec![write_path(&path)],   // 类型安全资源声明
-        next: Box::new(|v| {
-            let fd = match v { Value::Fd(fd) => fd, other => panic!("期望 Fd，得到 {other:?}") };
+        op: DataOp::Open {
+            path: path.clone(),
+            flags: OpenFlags { read: true, write: true, create: true, ..Default::default() },
+        },
+        resources: vec![write_path(&path)], // 类型安全资源声明
+        next: Box::new(move |v| {
+            let fd = match v {
+                Value::Fd(fd) => fd,
+                other => panic!("期望 Fd，得到 {other:?}"),
+            };
             Action::Sequential {
                 current: Box::new(Action::Syscall {
                     op: DataOp::Write { fd, data: b"hello algeff".to_vec() },
                     resources: vec![write_fd(fd)],
-                    next: Box::new(Action::Pure),
+                    next: Box::new(|_| Action::Pure(Value::Unit)),
                 }),
-                next: Box::new(|_| Action::Sequential {
+                next: Box::new(move |_| Action::Sequential {
                     current: Box::new(Action::Syscall {
                         op: DataOp::Seek { fd, offset: 0, whence: std::io::SeekFrom::Start(0) },
                         resources: vec![read_fd(fd)],
-                        next: Box::new(Action::Pure),
+                        next: Box::new(|_| Action::Pure(Value::Unit)),
                     }),
-                    next: Box::new(|_| Action::Syscall {
+                    next: Box::new(move |_| Action::Syscall {
                         op: DataOp::Read { fd, len: 64 },
                         resources: vec![read_fd(fd)],
-                        next: Box::new(Action::Pure),
+                        // 最后一个操作把结果透传出去（next 收到 Read 的 Bytes）
+                        next: Box::new(|v| Action::Pure(v)),
                     }),
                 }),
             }
@@ -139,6 +139,8 @@ fn read_fd(fd: u64) -> ResourceUsage {
 }
 ```
 
+> ✅ 本示例与下文示例由 `crates/algeff-std/tests/readme_examples.rs` 编译验证，保证照抄可跑。
+
 > 💡 每个操作都要声明它**怎么使用**资源（读/写/独占）——这是 Algeff 保证撤销安全和冲突检测的基础，见[核心概念](#核心概念蓝图执行资源)。
 
 ### 4. 用适配器少写样板
@@ -150,14 +152,27 @@ use algeff_core::prelude::*;
 use algeff_std::{TokioExecutor, adapters::{open_file, write, read, close}};
 
 let blueprint = Action::Sequential {
-    current: Box::new(open_file(path.clone(), OpenFlags { read: true, write: true, ..Default::default() })),
-    next: Box::new(|v| {
+    current: Box::new(open_file(path.clone(), OpenFlags { read: true, write: true, create: true, ..Default::default() })),
+    next: Box::new(move |v| {
         let fd = match v { Value::Fd(fd) => fd, other => panic!("{other:?}") };
         Action::Sequential {
             current: Box::new(write(fd, b"hello".to_vec())),
-            next: Box::new(|_| Action::Sequential {
-                current: Box::new(read(fd, 64)),
-                next: Box::new(|_| close(fd)),
+            next: Box::new(move |_| Action::Sequential {
+                // 关闭后重开：新句柄从位置 0 读（适配器层无 Seek，手写版见 §3）
+                current: Box::new(close(fd)),
+                next: Box::new(move |_| Action::Sequential {
+                    current: Box::new(open_file(path.clone(), OpenFlags { read: true, write: false, ..Default::default() })),
+                    next: Box::new(move |v| {
+                        let fd2 = match v { Value::Fd(fd) => fd, other => panic!("{other:?}") };
+                        Action::Sequential {
+                            current: Box::new(read(fd2, 64)),
+                            next: Box::new(move |v| Action::Sequential {
+                                current: Box::new(close(fd2)),
+                                next: Box::new(move |_| Action::Pure(v)),
+                            }),
+                        }
+                    }),
+                }),
             }),
         }
     }),
@@ -175,16 +190,16 @@ let blueprint = Action::Sequential {
 所有操作都是 `Action` 枚举的一个节点，不可变、可自由嵌套。核心节点：
 
 | 节点 | 作用 | 直觉 |
-| --- | --- | --- |
+| -------------------------------------------------- | -------------------------------- | --------- |
 | `Action::Pure(v)` | 返回一个值 | 终点/常量 |
 | `Action::Syscall { op, resources, next }` | 执行一个系统调用，结果交给 `next` | 一步操作 |
 | `Action::Sequential { current, next }` | 先做 `current`，把结果喂给 `next`（CPS 链） | 顺序组合 |
 | `Action::Fork { left, right, combine }` | 两分支并行执行，结果合并 | 并行 |
 | `Action::Catch { action, handler }` | 出错时交给 `handler` 处理 | try/catch |
 | `Action::Timeout { action, duration, on_timeout }` | 超时走 `on_timeout` | 限时 |
-| `Action::Scope { path, inner }` | 在临时作用域内执行，退出自动撤销 | 沙箱 |
+| `Action::Scope { base, inner, next }` | 在临时作用域内执行，退出自动撤销 | 沙箱 |
 | `Action::Replace { target }` | 先回滚全部已做操作，再执行 `target` | 一键撤销 |
-| `Action::Choose { options }` | 运行时选择 | 分支 |
+| `Action::Choose { cond, then_branch, else_branch }` | 条件分支 | if/else |
 
 > 链式写法是 CPS（延续传递风格）：每一步的 `next` 是"接下来做什么"的闭包。可以理解为**把程序的控制流显式写成数据**。
 
@@ -304,7 +319,7 @@ fn main() {
 
 - **执行轨迹只由蓝图决定**（`fork!` 冲突时自动顺序化 → 无调度器非确定性）；
 - **同一蓝图 + 同一输入 ⇒ 同一结果**（100 轮重复执行逐字节一致，测试锁定）；
-- 蓝图本身是数据 → 可以 `serde` 序列化、缓存、离线重放（pdr §1.1）。
+- 蓝图本身是数据 → 天然可缓存、可复制、可离线重放（序列化支持是阶段 3 设计目标，尚未实现——`Action` 含闭包，不可直接 serde）；
 
 ### trackΓ / recoverΓ：撤销的记账本
 
@@ -335,29 +350,29 @@ fn main() {
 
 （面向工程师/研究者。完整推导过程——动机、公理化、契约设计、审计证据——见 [`docs/src/derivation.md`](docs/src/derivation.md)（工程论文）与 `spec/` 形式化文档。）
 
-| # | 推导步骤 | 一句话 | 证据 |
-| --- | --- | --- | --- |
-| 1 | 动机 | Unix 效应是"指令"而非"数据"→ 无法组合/缓存/重放 → 代数化 | `pdr.md` §0–§1 |
-| 2 | 公理化 | A1–A7 七条公理（结合律/单位元/交换律/资源线性/分支隔离/撤销双态/无死锁） | `spec/axioms.md` |
-| 3 | 命题 | P1–P5 五条可证明性质（幺半群/并行交换律/写隔离/撤销双态/无死锁） | `spec/proofs.md` |
-| 4 | 契约冻结 | D1–D19 决策表 = 正确性承诺边界 | `contracts.md` |
-| 5 | 关键决策 | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 96 = 实测崩溃边界 104–108 留 8% 余量（D-052） | 决策链 + `spec/resource-notes.md` |
-| 6 | 实现 | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖 | `pdr.md` §15 |
-| 7 | 验证分层 | 305 个测试函数（约 297 二进制 + 8 doc-test），44 个测试二进制 | `spec/verification-plan.md` |
-| 8 | 对抗审计 ×5 | 120 个 E2E 测试，每轮独立发现（句柄活性/fd 区间/盲区/栈溢出…） | `spec/proof-obligations.md` |
-| 9 | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决） | `spec/proof-obligations.md` |
-| 10 | 缺陷库 | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复 | `spec/resource-notes.md` §10 |
-| 11 | 性能推导 | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制 | `perf/baseline-2026-08-15.txt` |
-| 12 | 结论 | 语义正确性定案；并行性能/跨平台为已知开放面 | 本文档下方 |
+| #   | 推导步骤    | 一句话                                                                                                   | 证据                             |
+| --- | ------- | ----------------------------------------------------------------------------------------------------- | ------------------------------ |
+| 1   | 动机      | Unix 效应是"指令"而非"数据"→ 无法组合/缓存/重放 → 代数化                                                                  | `pdr.md` §0–§1                 |
+| 2   | 公理化     | A1–A7 七条公理（结合律/单位元/交换律/资源线性/分支隔离/撤销双态/无死锁）                                                            | `spec/axioms.md`               |
+| 3   | 命题      | P1–P5 五条可证明性质（幺半群/并行交换律/写隔离/撤销双态/无死锁）                                                                 | `spec/proofs.md`               |
+| 4   | 契约冻结    | D1–D19 决策表 = 正确性承诺边界                                                                                  | `contracts.md`                 |
+| 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 96 = 实测崩溃边界 104–108 留 8% 余量（D-052） | 决策链 + `spec/resource-notes.md` |
+| 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
+| 7   | 验证分层    | 305 个测试函数（约 297 二进制 + 8 doc-test），44 个测试二进制                                                           | `spec/verification-plan.md`    |
+| 8   | 对抗审计 ×5 | 120 个 E2E 测试，每轮独立发现（句柄活性/fd 区间/盲区/栈溢出…）                                                               | `spec/proof-obligations.md`    |
+| 9   | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决）                                                    | `spec/proof-obligations.md`    |
+| 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
+| 11  | 性能推导    | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制                                                               | `perf/baseline-2026-08-15.txt` |
+| 12  | 结论      | 语义正确性定案；并行性能/跨平台为已知开放面                                                                                | 本文档下方                          |
 
 ---
 
 ## 性能速览
 
-相对原生 tokio 的基准（`perf/baseline-2026-08-15.txt`，A7 批 2-4，>100% = 更慢）：
+相对原生 tokio 的基准（`perf/baseline-2026-08-15.txt`，A7 批 2-4，&gt;100% = 更慢）：
 
 | 基准 | 对比 | 含义 |
-| --- | --- | --- |
+| ------------------- | ---------- | ----------------------------------- |
 | echo（顺序 TCP 回显） | **103.1%** | 顺序路径 ≈ 原生 tokio，可放心用 |
 | append（顺序追加） | 24.3% | 每步全量撤销记账 + flush 的开销，顺序小操作注意 |
 | parallel_reads（并行读） | 366.2% | 并行受 executor 共享锁串行化（阶段 3+ R-6 重构目标） |
@@ -370,14 +385,14 @@ fn main() {
 ## 已知限制与边界
 
 | 限制 | 说明 | 状态 |
-| --- | --- | --- |
+| ------------- | ------------------------------------------ | ---------------- |
 | 并行吞吐 | executor 共享锁串行化所有物理 IO | 阶段 3+ R-6 重构 |
 | 深度上限 | 左结合链 ≥97 步报 `Other(105)`（右结合无限制） | 已修复（RFC-11），见上 |
 | Windows 错误码 | 已归一化到 POSIX 语义（EEXIST/EADDRINUSE/…） | 已修复（RFC-10） |
 | Replace 句柄活性 | Replace 后旧 fd 的残留句柄仍可写（边界反例） | RFC-05，阶段 3+ 已裁决 |
 | fd 区间溢出 | Fork 右分支极端分配 ~360 轮后可能溢出 u64 | RFC-06，阶段 3+ |
 | Timeout 孤儿副作用 | 超时取消的并行分支副作用不可撤销 / 锁饥饿 | RFC-08/09，阶段 3+ |
-| 闭包静态盲区 | `next` 闭包内构造的 `Syscall` 不参与静态冲突检测（合并时仍并入父） | 系统性声明前提，已文档化 |
+| 闭包静态盲区 | `next` 闭包内构造的 `Syscall` 对静态冲突检测不可见（运行时仅收集 `current` 的资源声明；执行时仍会真实执行并并入父撤销栈） | 系统性声明前提，已文档化 |
 | 1MB 主线程栈 | 深嵌套蓝图需抬栈（`/STACK` 或 spawn 线程） | 用户责任，已文档化 |
 
 完整清单：`spec/resource-notes.md` §10。
@@ -387,7 +402,7 @@ fn main() {
 ## 文档入口
 
 | 入口 | 面向 | 内容 |
-| --- | --- | --- |
+| -------------------------------------------------- | ------- | ----------------------------------------------------------- |
 | [`docs/src/derivation.md`](docs/src/derivation.md) | 工程师/研究者 | 设计推导与验证过程（工程论文：动机→公理→契约→审计→收敛） |
 | [`docs/`](docs/)（mdBook） | 所有人 | 概述/架构/示例/路线图：`mdbook build docs` 后打开 `docs/book/index.html` |
 | `spec/proof-obligations.md` | 审计 | 证明义务登记表（A1–A7 × P1–P5 证据链闭环） |
