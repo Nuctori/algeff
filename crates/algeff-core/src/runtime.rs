@@ -349,10 +349,10 @@ const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
 /// 守卫在 `interpret_impl` 递归入口检查，超限返回可捕获错误替代栈溢出。
 /// 阈值初取 96（比实测边界 ~104 留 ~8% 余量）；迭代 1 复测（取消传播帧膨胀实测 80 OK/88 崩）裁决 64。
 /// 波动，保留安全边际），且 r4c 深度 64 安全回归不受影响；统一保守取值保证
-/// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 96 帧余量更大。
+/// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 64 帧余量更大。
 ///
 /// **保证范围（文档化限制）**：守卫保证限于 **≥2MB 栈**（Rust 测试线程/tokio
-/// worker/`std::thread::spawn` 默认 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB，在
+/// worker/`std::thread::spawn` 默认 2MB）——64 帧 × ~20-23KB ≈ 1.3-1.5MB，在
 /// 2MB 栈下留有余量；若宿主在更小栈（如 1MB 主线程栈：实测崩溃边界 ~50-54 帧）
 /// 上执行深嵌套蓝图，**正确缓解**：a. 链接器 /STACK 提升主线程栈；b. 将解释器
 /// 运行在 spawn 线程（受 `RUST_MIN_STACK` 控制）；c. Catch Other(105)。注意
@@ -371,7 +371,7 @@ const NESTING_DEPTH_EXCEEDED: SysError = SysError::Other(105);
 /// 时钟（读取非推进）；墙钟路径恒 None。
 ///
 /// 栈帧纪律：`#[inline(never)]` + Option<Value> 临时不落入解释器帧 ——
-/// RFC-11 深度守卫的嵌套边界取决于每帧栈用量（r5a 边界测试 95/96/97），
+/// RFC-11 深度守卫的嵌套边界取决于每帧栈用量（r5a 边界测试 63/64/65），
 /// 解释器帧越大边界越低；提取后 Syscall 臂只做 match 操作数调用。
 #[cfg(feature = "virtual-clock")]
 #[inline(never)]
