@@ -176,11 +176,7 @@ impl Runtime {
     /// 两份只应执行其中一份（pdr.md §5.2.3 可逆性保证）。
     /// 依赖表未初始化（None）时返回 ENOSYS（`SysError::Other(38)`）。
     #[cfg(feature = "coeffects")]
-    pub async fn set_dependency(
-        &mut self,
-        k: DepKey,
-        v: Value,
-    ) -> Result<UndoOp, SysError> {
+    pub async fn set_dependency(&mut self, k: DepKey, v: Value) -> Result<UndoOp, SysError> {
         let Some(store) = self.dependency_table.as_ref() else {
             return Err(SysError::Other(38));
         };

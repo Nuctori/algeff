@@ -119,10 +119,7 @@ fn e2e_file_write_read_undo() {
             vec![rd(fd)],
             move |_| {
                 syscall(
-                    DataOp::Read {
-                        fd,
-                        len: orig_len,
-                    },
+                    DataOp::Read { fd, len: orig_len },
                     vec![rd(fd)],
                     Action::Pure,
                 )
@@ -160,38 +157,42 @@ fn tcp_read_all(fd: u64, expected: usize, acc: Vec<u8>) -> Action {
 
 /// 服务端蓝图：TcpAccept → TcpRead(循环收满) → TcpWrite(echo) → TcpShutdown。
 fn echo_server_chain(listener: u64, expected: usize) -> Action {
-    syscall(DataOp::TcpAccept { listener }, vec![rd(listener)], move |v| {
-        let sfd = match v {
-            Value::List(l) => fd_of(&l[0]),
-            other => panic!("期望 List([Fd, Addr])，得到 {other:?}"),
-        };
-        Action::Sequential {
-            current: Box::new(tcp_read_all(sfd, expected, Vec::new())),
-            next: Box::new(move |v| {
-                let echo = match v {
-                    Value::Bytes(b) => b,
-                    other => panic!("期望 Bytes，得到 {other:?}"),
-                };
-                syscall(
-                    DataOp::TcpWrite {
-                        fd: sfd,
-                        data: echo.clone(),
-                    },
-                    vec![wr(sfd)],
-                    move |_| {
-                        syscall(
-                            DataOp::TcpShutdown {
-                                fd: sfd,
-                                how: Shutdown::Both,
-                            },
-                            vec![ow(sfd)],
-                            move |_| Action::Pure(Value::U64(echo.len() as u64)),
-                        )
-                    },
-                )
-            }),
-        }
-    })
+    syscall(
+        DataOp::TcpAccept { listener },
+        vec![rd(listener)],
+        move |v| {
+            let sfd = match v {
+                Value::List(l) => fd_of(&l[0]),
+                other => panic!("期望 List([Fd, Addr])，得到 {other:?}"),
+            };
+            Action::Sequential {
+                current: Box::new(tcp_read_all(sfd, expected, Vec::new())),
+                next: Box::new(move |v| {
+                    let echo = match v {
+                        Value::Bytes(b) => b,
+                        other => panic!("期望 Bytes，得到 {other:?}"),
+                    };
+                    syscall(
+                        DataOp::TcpWrite {
+                            fd: sfd,
+                            data: echo.clone(),
+                        },
+                        vec![wr(sfd)],
+                        move |_| {
+                            syscall(
+                                DataOp::TcpShutdown {
+                                    fd: sfd,
+                                    how: Shutdown::Both,
+                                },
+                                vec![ow(sfd)],
+                                move |_| Action::Pure(Value::U64(echo.len() as u64)),
+                            )
+                        },
+                    )
+                }),
+            }
+        },
+    )
 }
 
 #[test]
@@ -235,9 +236,7 @@ fn e2e_tcp_echo_server() {
     });
 
     // 服务端：interpret 全链路（Accept→Read→Write→Shutdown）在主线程运行。
-    let v = rt
-        .run_blocking(echo_server_chain(lfd, n))
-        .unwrap();
+    let v = rt.run_blocking(echo_server_chain(lfd, n)).unwrap();
 
     let echoed = client.join().unwrap();
     assert_eq!(v, Value::U64(n as u64));
@@ -308,7 +307,10 @@ fn e2e_scope_cwd() {
         .run_blocking(Action::Scope {
             base: PathBuf::from("other"),
             inner: Box::new(syscall(
-                DataOp::Read { fd: 999_999, len: 1 },
+                DataOp::Read {
+                    fd: 999_999,
+                    len: 1,
+                },
                 vec![rd(999_999)],
                 Action::Pure,
             )),
