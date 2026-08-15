@@ -4,11 +4,12 @@
 //! `Action` 链等价表达；宏仅做 AST 构造（syn/quote 拼接），**不参与类型系统**，
 //! 不增加编译负担（pdr.md §八）。
 //!
-//! 提供四个宏：
+//! 提供五个宏：
 //! - `plan!{ stmt; stmt; ... }` → `Action::Sequential` 链
 //! - `fork!{ left: ..., right: ... }` → `Action::Fork`
 //! - `scope!("/tmp", || { ... })` → `Action::Scope`
 //! - `choose!(cond, then: ..., else: ...)` → `Action::Choose`
+//! - `do_!{ stmt; ...; 尾表达式 }` → 命令式 CPS 链（配合 `algeff_std::dx`）
 //!
 //! 展开产物一律引用 `algeff_core::action::` 路径构造节点，宏本身不做任何类型
 //! 检查。使用宏的代码需依赖 algeff-core，推荐配合其 prelude 使用：
@@ -19,6 +20,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::spanned::Spanned;
 use syn::{Block, Expr, ExprMacro, Ident, Lit, Pat, Stmt, Token};
 
 /// 终止 continuation：`|_| Action::Pure(Value::Unit)`。
@@ -433,12 +435,18 @@ pub fn choose(input: TokenStream) -> TokenStream {
 /// 真实文件 IO 示例见 README §3 与 `algeff_std::dx` 模块文档。
 #[proc_macro]
 pub fn do_(input: TokenStream) -> TokenStream {
-    let block = syn::parse_macro_input!(input as Block);
+    // 调用点 `do_! { stmts }` 的定界符 `{}` 不进入输入流，补包一层再按 Block 解析
+    // （否则 syn 的 `Block` parse 会报 "expected curly braces"）。
+    let input2: TokenStream2 = input.into();
+    let block: Block = match syn::parse2(quote!({ #input2 })) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     // 分离语句与尾表达式（最后一个无分号元素）。
     let mut stmts: Vec<Stmt> = block.stmts;
     let tail: Option<Expr> = match stmts.pop() {
-        Some(Stmt::Expr(e, None)) => Some(*e),
+        Some(Stmt::Expr(e, None)) => Some(e),
         Some(Stmt::Macro(sm)) if sm.semi_token.is_none() => Some(Expr::Macro(ExprMacro {
             attrs: sm.attrs,
             mac: sm.mac,
@@ -447,6 +455,7 @@ pub fn do_(input: TokenStream) -> TokenStream {
             stmts.push(other);
             None
         }
+        None => None,
     };
 
     // 从尾向前折叠成 and_then 链。
@@ -461,7 +470,7 @@ pub fn do_(input: TokenStream) -> TokenStream {
         match stmt {
             Stmt::Local(local) => {
                 let init = match local.init {
-                    Some((_, expr)) => *expr,
+                    Some(init) => *init.expr,
                     None => {
                         return syn::Error::new(
                             local.let_token.span,

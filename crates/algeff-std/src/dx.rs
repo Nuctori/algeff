@@ -17,6 +17,7 @@
 //!
 //! ```rust
 //! use algeff_core::prelude::*;
+//! use algeff_core::OpenFlags;
 //! use algeff_macro::do_;
 //! use algeff_std::dx;
 //! use algeff_std::TokioExecutor;
@@ -28,6 +29,7 @@
 //! let blueprint = do_! {
 //!     let fd = dx::open(&path, OpenFlags { read: true, write: true, create: true, ..Default::default() });
 //!     dx::write(&fd, b"hello dx".to_vec());
+//!     dx::seek(&fd, 0, std::io::SeekFrom::Start(0));
 //!     let data = dx::read(&fd, 64);
 //!     dx::close(&fd);
 //!     data // 尾表达式 = 链的最终值
@@ -60,10 +62,7 @@ fn usage(resource: Resource, mode: AccessMode) -> ResourceUsage {
 }
 
 fn path_usage(p: &Path, mode: AccessMode) -> ResourceUsage {
-    usage(
-        Resource::Path(p.to_string_lossy().into_owned()),
-        mode,
-    )
+    usage(Resource::Path(p.to_string_lossy().into_owned()), mode)
 }
 
 fn fd_usage(fd: Fd, mode: AccessMode) -> ResourceUsage {
@@ -138,7 +137,7 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
             pid_usage(*pid, AccessMode::Write),
         ],
         // 内存
-        DataOp::Mmap { path, prot } => {
+        DataOp::Mmap { path, prot, .. } => {
             let mode = if prot.write {
                 AccessMode::Write
             } else {
@@ -170,7 +169,8 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
 /// 按 `infer_usage` 自动推导资源声明，构造 `Action::Syscall` 节点
 /// （next 收敛为 `Pure`，值经 `and_then` 交付）。
 pub fn syscall(op: DataOp) -> Action {
-    syscall_with(op, infer_usage(&op))
+    let resources = infer_usage(&op);
+    syscall_with(op, resources)
 }
 
 /// 显式指定资源声明构造 Syscall 节点——**覆盖**自动推导（手动覆盖入口）。
@@ -289,9 +289,7 @@ pub fn seek(fd: &Value, offset: i64, whence: std::io::SeekFrom) -> Action {
 
 /// 关闭 fd（Own 语义：唯一持有者释放物理资源）。
 pub fn close(fd: &Value) -> Action {
-    syscall(DataOp::Close {
-        fd: expect_fd(fd),
-    })
+    syscall(DataOp::Close { fd: expect_fd(fd) })
 }
 
 /// 文件元数据（返回 Value::List([len, is_dir, is_file])）。
