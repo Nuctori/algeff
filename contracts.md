@@ -39,7 +39,7 @@
 - `SendFile { out, input, offset, len }`：`in` 为保留字改名 `input`——决策 D8。
 - 类型状态包装命名为 `TypedResource<M>`（与 `Resource` 枚举同模块冲突）——决策 D7。
 - `Value`：Unit/Bool/U64/I64/Bytes/Str/Fd/Pid/Addr/List。
-- `DataOp`：pdr.md §2.2 全部 39 个变体（含 `SendFile` 改名）。
+- `DataOp`：pdr.md §2.2 全部 36 个变体（含 `SendFile` 改名；审计修正：非 39）。
 - `SysError`：14 种 POSIX + `Other(i32)`，含 `from_errno`/`code`/`From<io::Error>`。
 - `SyscallExecutor`：dyn 兼容 trait（方法返回 `BoxFuture`，非 async fn）——决策 D3。
 - `UndoOp = Pin<Box<dyn Future<Output=()> + Send>>`：异步逆操作——决策 D4。
@@ -60,6 +60,7 @@
 | D10 | `Replace` 语义：先 recover 再执行 target | 安全默认（资源不泄漏） |
 | D11 | `Alloc` 返回 `Value::Bytes(vec![0; len])` | 确定性；COW 优化留给 A2 自选 |
 | D12 | 路径规范化：词法（绝对化+消除 `.`/`..`），不碰真实 FS | 确定性；符号链接解析属物理层 |
+| D13 | `ResourceRegistry` 实现 `Clone` | Fork 并行时子任务隔离状态，完成后合并回父（A1 审计补录） |
 
 ## 4. 阶段门禁（CTO 执行）
 
