@@ -493,9 +493,10 @@ async fn chain_spawn_missing_program_maps_not_found() {
 /// （executor.rs:64-92）；兜底 `from_errno(normalize(raw))` 把未映射 Win32
 /// 码按 POSIX errno 空间重解释（error.rs:90-94 碰撞面）。
 /// 修复方向（不在本审计内执行）：表加 `17→18` + kind 臂 `CrossesDevices→
-/// Some(18)`；未映射码兜底改 `Other(raw)`。修复后本断言应改为 CrossDevice。
+/// 修复状态（JD-2，609c393）：kind 臂补 `CrossesDevices → Some(18)` 后，
+/// Windows 跨卷 rename 现正确映射 `CrossDevice`——本测试断言修复后行为。
 #[tokio::test]
-async fn defect_xvol_rename_windows_mis_maps_to_already_exists() {
+async fn xvol_rename_windows_maps_to_cross_device() {
     let Some((from, to, src_dir, dst_dir)) = xvol_rename_paths("defect") else {
         return;
     };
@@ -513,8 +514,8 @@ async fn defect_xvol_rename_windows_mis_maps_to_already_exists() {
     #[cfg(windows)]
     assert_eq!(
         e,
-        SysError::AlreadyExists,
-        "F1 缺陷锁定：Windows 跨卷 rename 当前误映射 AlreadyExists（正确应为 CrossDevice）"
+        SysError::CrossDevice,
+        "Windows 跨卷 rename → EXDEV(18) → CrossDevice（JD-2 修复后行为）"
     );
     #[cfg(not(windows))]
     assert_eq!(
