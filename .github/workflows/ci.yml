@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: Checkout
@@ -29,6 +29,12 @@ jobs:
 
       - name: cargo clippy --workspace -- -D warnings
         run: cargo clippy --workspace -- -D warnings
+
+      # Release 编译验证：release 模式是生产形态，与 debug 测试路径不同，
+      # 三平台统一编译一次确保无 release-only 编译错误。
+      # 依赖产物写入 target/release，runner 上无需提交，本地验证时由 .gitignore 忽略。
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace
 
       - name: cargo test --workspace
         run: cargo test --workspace
