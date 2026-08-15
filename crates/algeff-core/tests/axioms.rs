@@ -231,31 +231,51 @@ proptest! {
         }
     }
 
-    /// 随机混合序列：Read/Append 可重复；Write/Own 恰好一次，重复 → InvalidInput。
+    /// 随机混合序列（对齐 A3 合并后的最终线性语义）：
+    /// Read/Append 可重复（但 Own 之后拒绝）；Write 每资源至多一次；Own 为终结；
+    /// Write→Own（Close）合法。
     #[test]
     fn a4_random_read_write_sequence(
         ref seq in proptest::collection::vec((arb_resource(), arb_mode()), 0..16),
     ) {
         let mut reg = ResourceRegistry::new();
         let mut written: HashSet<Resource> = HashSet::new();
+        let mut owned: HashSet<Resource> = HashSet::new();
         for (r, m) in seq {
             let u = usage(r.clone(), *m);
+            if owned.contains(&r) {
+                prop_assert_eq!(
+                    reg.check_linear(&u),
+                    Err(SysError::InvalidInput),
+                    "Own 之后任何 usage 都应拒绝: {:?}",
+                    u
+                );
+                continue;
+            }
             match m {
                 AccessMode::Read | AccessMode::Append => {
                     prop_assert!(reg.check_linear(&u).is_ok(), "Read/Append 可重复: {:?}", u);
                 }
-                AccessMode::Write | AccessMode::Own => {
-                    if written.contains(r) {
+                AccessMode::Write => {
+                    if written.contains(&r) {
                         prop_assert_eq!(
                             reg.check_linear(&u),
                             Err(SysError::InvalidInput),
-                            "重复消费应拒绝: {:?}",
+                            "重复 Write 应拒绝: {:?}",
                             u
                         );
                     } else {
-                        prop_assert!(reg.check_linear(&u).is_ok(), "首次消费应 Ok: {:?}", u);
+                        prop_assert!(reg.check_linear(&u).is_ok(), "首次 Write 应 Ok: {:?}", u);
                         written.insert(r.clone());
                     }
+                }
+                AccessMode::Own => {
+                    prop_assert!(
+                        reg.check_linear(&u).is_ok(),
+                        "未 Own 过时 Own 应 Ok（含 Write 之后 Close）: {:?}",
+                        u
+                    );
+                    owned.insert(r.clone());
                 }
             }
         }
