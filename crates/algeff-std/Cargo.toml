@@ -1,0 +1,14 @@
+[package]
+name = "algeff-std"
+version.workspace = true
+edition.workspace = true
+description = "Algeff 标准适配层：tokio 物理后端（DataOp 执行器 + 预包装适配器）"
+
+[dependencies]
+algeff-core = { path = "../algeff-core" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+proptest.workspace = true

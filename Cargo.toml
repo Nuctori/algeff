@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/algeff-core", "crates/algeff-std", "crates/algeff-macro"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Algeff — 将 Unix 效应代数化的跨平台确定性运行时框架"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["fs", "net", "io-util", "sync", "process", "signal", "time", "rt-multi-thread", "macros"] }
+proptest = "1"
+criterion = "0.5"
+tempfile = "3"

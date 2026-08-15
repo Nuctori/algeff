@@ -1,0 +1,16 @@
+[package]
+name = "algeff-core"
+version.workspace = true
+edition.workspace = true
+description = "Algeff 核心：Action AST、ResourceSet、Resource<M>、Runtime 内核（契约冻结）"
+
+[dependencies]
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[features]
+default = []
+coeffects = []
+virtual-clock = []
