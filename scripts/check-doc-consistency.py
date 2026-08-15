@@ -8,7 +8,7 @@
   - spec/proof-obligations.md
 
 事实集合（canonical = 实测 + main 33704cc 统一口径，supervisor 已裁决）：
-  1. 测试计数：309 个测试函数（约 301 二进制 + 8 doc-test），42 个测试二进制 + 3 个 doc-test 运行
+  1. 测试计数：352 个测试函数（约 344 二进制 + 8 doc-test），46 个测试二进制 + 3 个 doc-test 运行
   2. RFC-10 状态：已修复
   3. RFC-11 状态：已修复（深度守卫阈值 96）
   4. CI 三平台：ubuntu / windows / macos
@@ -57,7 +57,7 @@ def main():
             check_absent(p, t, "测试计数", stale)
         # 新口径应存在（至少一处）
         if any(s in t for s in ("测试函数", "测试全绿", "测试二进制")):
-            if "309 个测试函数" not in t and "309 测试全绿" not in t:
+            if "352 个测试函数" not in t and "352 测试全绿" not in t:
                 issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「309」")
 
     # ---- 2. RFC-10 状态：提及即须体现已修复 ----
@@ -107,7 +107,7 @@ def main():
         for i in issues:
             print(" -", i)
         return 1
-    print("=== 核对通过：四处文档在 6 组事实集合上一致（309/42+3 口径）===")
+    print("=== 核对通过：四处文档在 6 组事实集合上一致（352/46+3 口径）===")
     return 0
 
 
