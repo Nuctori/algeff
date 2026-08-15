@@ -12,3 +12,20 @@ tokio.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+
+# A7: criterion 基准（harness=false → bench 自带 criterion main）。见 benches/*.rs
+[[bench]]
+name = "echo"
+harness = false
+
+[[bench]]
+name = "parallel_reads"
+harness = false
+
+[[bench]]
+name = "shared_read"
+harness = false
+
+[[bench]]
+name = "append"
+harness = false
