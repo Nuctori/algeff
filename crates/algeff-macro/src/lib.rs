@@ -1,13 +1,18 @@
-//! Algeff 可选语法糖宏 —— A4 交付（pdr.md §13 / §八）。
+//! Algeff 可选语法糖宏（pdr.md §13「宏的使用（可选）」/ §八「代数原语」）。
 //!
-//! 仅做 AST 构造，不参与类型系统：
+//! 本 crate 是**可选语法糖**：algeff-core 核心不依赖任何宏，所有蓝图均可手写
+//! `Action` 链等价表达；宏仅做 AST 构造（syn/quote 拼接），**不参与类型系统**，
+//! 不增加编译负担（pdr.md §八）。
+//!
+//! 提供四个宏：
 //! - `plan!{ stmt; stmt; ... }` → `Action::Sequential` 链
 //! - `fork!{ left: ..., right: ... }` → `Action::Fork`
 //! - `scope!("/tmp", || { ... })` → `Action::Scope`
-//! - `choose!{ cond, then: ..., else: ... }` → `Action::Choose`
+//! - `choose!(cond, then: ..., else: ...)` → `Action::Choose`
 //!
-//! 展开产物一律引用 `algeff_core::action::` 路径；宏只拼 AST，
-//! 不做任何类型检查（pdr.md §13：核心不依赖宏，宏仅为语法糖）。
+//! 展开产物一律引用 `algeff_core::action::` 路径构造节点，宏本身不做任何类型
+//! 检查。使用宏的代码需依赖 algeff-core，推荐配合其 prelude 使用：
+//! `use algeff_core::prelude::*;`（提供 `Action`/`Value` 等类型）。
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
