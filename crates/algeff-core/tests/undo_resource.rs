@@ -24,7 +24,10 @@ use algeff_core::runtime::UndoStack;
 use proptest::prelude::*;
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 fn mutex_handle() -> ResourceHandle {
@@ -55,7 +58,10 @@ fn undo_restores_linear_state() {
 
     // 第一次完整序列：Open → Write → Close 全部成功
     let t1 = run_sequence(&mut reg, &handle);
-    assert!(t1.iter().all(Result::is_ok), "第一次 Open→Write→Close 均应 Ok");
+    assert!(
+        t1.iter().all(Result::is_ok),
+        "第一次 Open→Write→Close 均应 Ok"
+    );
 
     // 撤销（手动恢复模式）：take 已释放句柄，clear 复位线性标记
     // （Write 消费的逆 —— pdr.md §5.1.3 recoverΓ 的 registry 等价）
@@ -64,7 +70,10 @@ fn undo_restores_linear_state() {
     // 可重放性（pdr.md §1.1）：撤销后 registry 的线性状态允许重放同一序列，
     // 第二次完整序列可再次成功执行，且两次 Ok/Err 轨迹完全一致
     let t2 = run_sequence(&mut reg, &handle);
-    assert!(t2.iter().all(Result::is_ok), "撤销后重放 Open→Write→Close 仍应 Ok");
+    assert!(
+        t2.iter().all(Result::is_ok),
+        "撤销后重放 Open→Write→Close 仍应 Ok"
+    );
     assert_eq!(t1, t2, "两次序列结果应完全一致（可重放性）");
 
     // 负向对照：不执行撤销时 Write 消费标记残留 → 重放被线性约束拒绝，
@@ -72,7 +81,9 @@ fn undo_restores_linear_state() {
     let mut reg2 = ResourceRegistry::new();
     let fd2 = reg2.allocate(handle);
     let r = Resource::Fd(fd2);
-    assert!(reg2.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+    assert!(reg2
+        .check_linear(&usage(r.clone(), AccessMode::Write))
+        .is_ok());
     assert_eq!(
         reg2.check_linear(&usage(r.clone(), AccessMode::Write)),
         Err(SysError::InvalidInput),
@@ -94,7 +105,10 @@ async fn undo_lifo_with_registry() {
         fds.push(fd);
     }
     assert_eq!(fds.len(), 3);
-    assert!(fds.windows(2).all(|w| w[0] < w[1]), "Fd 单调递增（决策 D1）");
+    assert!(
+        fds.windows(2).all(|w| w[0] < w[1]),
+        "Fd 单调递增（决策 D1）"
+    );
 
     // 模拟撤销：按分配逆序（3→2→1）逐一 take，lookup 状态逐步收敛为空
     for fd in fds.iter().rev() {
@@ -103,7 +117,10 @@ async fn undo_lifo_with_registry() {
         assert!(reg.lookup(*fd).is_none(), "take 后 fd {fd} 不可见");
     }
     for fd in &fds {
-        assert!(reg.lookup(*fd).is_none(), "全量逆序释放后 registry 收敛为空: fd {fd}");
+        assert!(
+            reg.lookup(*fd).is_none(),
+            "全量逆序释放后 registry 收敛为空: fd {fd}"
+        );
     }
 
     // 与 UndoStack LIFO 语义呼应（pdr.md §5.1.4）：按分配序压栈逆操作，

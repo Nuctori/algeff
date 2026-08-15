@@ -83,11 +83,7 @@ fn fork_fields_and_combine() {
 fn scope_string_base_becomes_pathbuf() {
     let action = scope!("/tmp", || Action::Pure(Value::Unit));
     match action {
-        Action::Scope {
-            base,
-            inner,
-            next,
-        } => {
+        Action::Scope { base, inner, next } => {
             assert_eq!(base, PathBuf::from("/tmp"));
             assert!(matches!(*inner, Action::Pure(Value::Unit)));
             let cont = next(Value::Unit);

@@ -217,7 +217,11 @@ impl ComponentRegistry {
 }
 
 /// notify(σ, σ′, d)（pdr.md §5.2.2）：σ⊨d 当且仅当 d ⊆ dom(σ)。
-pub fn notify(sigma: &DependencyTable, sigma_prime: &DependencyTable, deps: &HashSet<DepKey>) -> Activation {
+pub fn notify(
+    sigma: &DependencyTable,
+    sigma_prime: &DependencyTable,
+    deps: &HashSet<DepKey>,
+) -> Activation {
     let satisfied = |s: &DependencyTable| deps.iter().all(|k| s.contains(k));
     match (satisfied(sigma), satisfied(sigma_prime)) {
         (false, true) => Activation::Activating,

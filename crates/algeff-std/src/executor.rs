@@ -27,8 +27,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use algeff_core::{
-    BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, ResourceHandle, ResourceRegistry,
-    SysError, SyscallExecutor, UndoOp, Value,
+    BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, ResourceHandle, ResourceRegistry, SysError,
+    SyscallExecutor, UndoOp, Value,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -147,7 +147,8 @@ impl TokioExecutor {
         // registry 簿记 token：try_clone 共享同一 OS 描述（真实工作对象在 executor 侧）。
         let token = file.try_clone().await?;
         let fd = reg.allocate(ResourceHandle::File(Arc::new(token)));
-        self.files.insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
+        self.files
+            .insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
         // undo=None：物理关闭由 Arc Drop 保证；Fd 表残留清理列入 RFC-05。
         Ok((Value::Fd(fd), None))
     }
@@ -475,7 +476,11 @@ impl TokioExecutor {
         len: usize,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self.stream_fds.get(&fd).copied().ok_or(SysError::NotFound)?;
+        let cur = self
+            .stream_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
         let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
         let mut buf = vec![0u8; len];
         let n = {
@@ -493,7 +498,11 @@ impl TokioExecutor {
         data: &[u8],
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self.stream_fds.get(&fd).copied().ok_or(SysError::NotFound)?;
+        let cur = self
+            .stream_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
         let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
         {
             let s = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
@@ -509,7 +518,11 @@ impl TokioExecutor {
         how: &std::net::Shutdown,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self.stream_fds.get(&fd).copied().ok_or(SysError::NotFound)?;
+        let cur = self
+            .stream_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
         let arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
         // tokio 未公开 std::net::Shutdown 的 Read/Both 语义（shutdown_std 为
         // pub(super)），经 std 层往返实现完整 how 语义（被 Dup 共享时无法 → InvalidInput）。
@@ -548,7 +561,10 @@ impl TokioExecutor {
         let mut buf = vec![0u8; len];
         let (n, addr) = sock.recv_from(&mut buf).await?;
         buf.truncate(n);
-        Ok((Value::List(vec![Value::Bytes(buf), Value::Addr(addr)]), None))
+        Ok((
+            Value::List(vec![Value::Bytes(buf), Value::Addr(addr)]),
+            None,
+        ))
     }
 
     async fn op_udp_send_to(
@@ -575,8 +591,8 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = flags; // tokio duplex 天然非阻塞；nonblocking 标志忽略。
-        // duplex(n) 返回相连的一对：A.read 与 B.write 共享同一缓冲区。
-        // 读端取 A 的 ReadHalf，写端取 B 的 WriteHalf → 相连管道。
+                       // duplex(n) 返回相连的一对：A.read 与 B.write 共享同一缓冲区。
+                       // 读端取 A 的 ReadHalf，写端取 B 的 WriteHalf → 相连管道。
         let (a, b) = tokio::io::duplex(PIPE_BUF_SIZE);
         let (ra, _wa) = tokio::io::split(a);
         let (_rb, wb) = tokio::io::split(b);
@@ -695,7 +711,11 @@ impl TokioExecutor {
         Ok((Value::Bytes(bytes), None))
     }
 
-    async fn op_munmap(&mut self, addr: usize, len: usize) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_munmap(
+        &mut self,
+        addr: usize,
+        len: usize,
+    ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = (addr, len); // 无真实映射（Mmap 返回 Bytes）；no-op。
         Ok((Value::Unit, None))
     }
@@ -922,8 +942,14 @@ impl SyscallExecutor for TokioExecutor {
                 DataOp::GetTime => self.op_get_time().await,
                 DataOp::MutexLock { id } => self.op_mutex_lock(*id).await,
                 DataOp::MutexUnlock { id } => self.op_mutex_unlock(*id).await,
-                DataOp::SendFile { out, input, offset, len } => {
-                    self.op_send_file(*out, *input, *offset, *len, registry).await
+                DataOp::SendFile {
+                    out,
+                    input,
+                    offset,
+                    len,
+                } => {
+                    self.op_send_file(*out, *input, *offset, *len, registry)
+                        .await
                 }
                 DataOp::Dup { fd } => self.op_dup(*fd, registry).await,
                 DataOp::Dup2 { old_fd, new_fd } => self.op_dup2(*old_fd, *new_fd, registry).await,

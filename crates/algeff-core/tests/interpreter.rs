@@ -99,7 +99,9 @@ impl SyscallExecutor for MockExecutor {
             let undo: Option<UndoOp> = if self.with_undo {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(async move { undo_log.lock().unwrap().push(label) }))
+                Some(Box::pin(
+                    async move { undo_log.lock().unwrap().push(label) },
+                ))
             } else {
                 None
             };
@@ -118,7 +120,10 @@ fn syscall_step(op: DataOp, resources: Vec<ResourceUsage>) -> Action {
 }
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 // ── 1. Pure 单位元 ────────────────────────────────────────────────────
@@ -221,7 +226,13 @@ fn fork_conflict_sequential_execution() {
     ex.respond("read:1:8", MockOutcome::Value(Value::U64(20)));
 
     let action = Action::Fork {
-        left: Box::new(syscall_step(DataOp::Write { fd: 1, data: vec![0xAA] }, l_set)),
+        left: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xAA],
+            },
+            l_set,
+        )),
         right: Box::new(syscall_step(DataOp::Read { fd: 1, len: 8 }, r_set)),
         combine: Box::new(|l, r| match (l, r) {
             (Value::U64(a), Value::U64(b)) => Action::Pure(Value::U64(a + b)),
@@ -248,8 +259,20 @@ fn fork_disjoint_resources_can_parallel() {
     ex.respond("write:2", MockOutcome::Value(Value::U64(20)));
 
     let action = Action::Fork {
-        left: Box::new(syscall_step(DataOp::Write { fd: 1, data: vec![] }, l_set)),
-        right: Box::new(syscall_step(DataOp::Write { fd: 2, data: vec![] }, r_set)),
+        left: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 1,
+                data: vec![],
+            },
+            l_set,
+        )),
+        right: Box::new(syscall_step(
+            DataOp::Write {
+                fd: 2,
+                data: vec![],
+            },
+            r_set,
+        )),
         combine: Box::new(|l, r| match (l, r) {
             (Value::U64(a), Value::U64(b)) => Action::Pure(Value::U64(a + b)),
             _ => Action::Pure(Value::Unit),
@@ -615,7 +638,11 @@ fn catch_after_partial_undo_keeps_stack() {
     };
     let v = drive(async {
         let v = interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex).await;
-        assert_eq!(undo.len(), 1, "Catch handler 执行时 undo 栈应保留 gettime 的逆操作");
+        assert_eq!(
+            undo.len(),
+            1,
+            "Catch handler 执行时 undo 栈应保留 gettime 的逆操作"
+        );
         v
     });
     assert_eq!(v, Ok(Value::U64(7)));

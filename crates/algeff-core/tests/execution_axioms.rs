@@ -112,7 +112,9 @@ impl SyscallExecutor for MockExecutor {
             let undo: Option<UndoOp> = if self.with_undo {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(async move { undo_log.lock().unwrap().push(label) }))
+                Some(Box::pin(
+                    async move { undo_log.lock().unwrap().push(label) },
+                ))
             } else {
                 None
             };
@@ -131,7 +133,10 @@ fn syscall_step(op: DataOp, resources: Vec<ResourceUsage>) -> Action {
 }
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 // ── MockExecutor 错误配置：经解释器传播 ──────────────────────────────
@@ -153,7 +158,11 @@ fn exec_syscall_error_propagates() {
         &mut reg,
         &mut ex,
     ));
-    assert_eq!(v, Err(SysError::NotFound), "执行器错误经 interpret 原样传播");
+    assert_eq!(
+        v,
+        Err(SysError::NotFound),
+        "执行器错误经 interpret 原样传播"
+    );
     assert_eq!(ex.ops(), vec!["gettime"], "错误在 execute 记录后返回");
 }
 
@@ -208,13 +217,21 @@ fn exec_A1_associativity() {
     let mut undo1 = UndoStack::new();
     let mut reg1 = ResourceRegistry::new();
     let mut ex1 = cfg_ex();
-    let v1 = drive(interpret(chain_left, &mut ctx1, &mut undo1, &mut reg1, &mut ex1));
+    let v1 = drive(interpret(
+        chain_left, &mut ctx1, &mut undo1, &mut reg1, &mut ex1,
+    ));
 
     let mut ctx2 = Context::new();
     let mut undo2 = UndoStack::new();
     let mut reg2 = ResourceRegistry::new();
     let mut ex2 = cfg_ex();
-    let v2 = drive(interpret(chain_right, &mut ctx2, &mut undo2, &mut reg2, &mut ex2));
+    let v2 = drive(interpret(
+        chain_right,
+        &mut ctx2,
+        &mut undo2,
+        &mut reg2,
+        &mut ex2,
+    ));
 
     assert_eq!(v1, v2, "(a;b);c 与 a;(b;c) 最终 Value 一致（A1 执行等价）");
     assert_eq!(v1, Ok(Value::U64(50)), "值流穿透两种嵌套（20+30）");
@@ -338,12 +355,18 @@ fn exec_A4_linearity_runtime() {
     let w = usage(Resource::Fd(1), AccessMode::Write);
     let action = Action::Sequential {
         current: Box::new(syscall_step(
-            DataOp::Write { fd: 1, data: vec![0xAA] },
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xAA],
+            },
             vec![w.clone()],
         )),
         next: Box::new(move |_| {
             syscall_step(
-                DataOp::Write { fd: 1, data: vec![0xBB] },
+                DataOp::Write {
+                    fd: 1,
+                    data: vec![0xBB],
+                },
                 vec![w],
             )
         }),
@@ -376,12 +399,18 @@ fn exec_A6_undo_roundtrip() {
     let w2 = usage(Resource::Fd(2), AccessMode::Write);
     let action = Action::Sequential {
         current: Box::new(syscall_step(
-            DataOp::Write { fd: 1, data: vec![0xAA] },
+            DataOp::Write {
+                fd: 1,
+                data: vec![0xAA],
+            },
             vec![w1],
         )),
         next: Box::new(move |_| {
             syscall_step(
-                DataOp::Write { fd: 2, data: vec![0xBB] },
+                DataOp::Write {
+                    fd: 2,
+                    data: vec![0xBB],
+                },
                 vec![w2],
             )
         }),
@@ -454,8 +483,20 @@ fn exec_fork_conflict_static() {
         "同资源 Write×Write 冲突（pdr.md §9.1 / D14）"
     );
 
-    let left = syscall_step(DataOp::Write { fd: 1, data: vec![0xAA] }, l_set);
-    let right = syscall_step(DataOp::Write { fd: 1, data: vec![0xAA, 0xBB] }, r_set);
+    let left = syscall_step(
+        DataOp::Write {
+            fd: 1,
+            data: vec![0xAA],
+        },
+        l_set,
+    );
+    let right = syscall_step(
+        DataOp::Write {
+            fd: 1,
+            data: vec![0xAA, 0xBB],
+        },
+        r_set,
+    );
 
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();

@@ -438,6 +438,12 @@ impl ResourceArbiter {
     pub fn held(&self, r: &Resource) -> bool {
         self.claims.get(r).is_some_and(|&c| c != 0)
     }
+
+    /// 仲裁表是否为空（无任何占坑）。供泄漏检测断言：全部 `release` 后应返回
+    /// `true`（批 4 属性测试的终止不变量）。
+    pub fn is_clean(&self) -> bool {
+        self.claims.is_empty()
+    }
 }
 
 #[cfg(test)]

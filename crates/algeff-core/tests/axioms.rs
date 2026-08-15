@@ -31,7 +31,10 @@ const MODES: [AccessMode; 4] = [
 ];
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 fn mutex_handle() -> ResourceHandle {
@@ -74,7 +77,10 @@ fn a2_empty_resource_set_parallel_always() {
     let reg = ResourceRegistry::new();
     assert!(reg.can_parallel(&vec![], &vec![]), "空集 × 空集恒真");
     let w = usage(Resource::Fd(1), AccessMode::Write);
-    assert!(reg.can_parallel(&vec![], &vec![w.clone()]), "空集 × 非空恒真");
+    assert!(
+        reg.can_parallel(&vec![], &vec![w.clone()]),
+        "空集 × 非空恒真"
+    );
     assert!(reg.can_parallel(&vec![w], &vec![]), "非空 × 空集恒真");
 }
 
@@ -144,8 +150,14 @@ fn a3_append_append_requires_opt_in() {
     let r = Resource::Fd(1);
     let a = vec![usage(r.clone(), AccessMode::Append)];
     let b = vec![usage(r.clone(), AccessMode::Append)];
-    assert!(!reg.can_parallel(&a, &b), "默认 Append∥Append 串行（决策 D6）");
-    assert!(reg.can_parallel_with(&a, &b, true), "显式声明顺序无关 → 并行");
+    assert!(
+        !reg.can_parallel(&a, &b),
+        "默认 Append∥Append 串行（决策 D6）"
+    );
+    assert!(
+        reg.can_parallel_with(&a, &b, true),
+        "显式声明顺序无关 → 并行"
+    );
     // opt-in 只放宽 Append∥Append，其余冲突仍然拒绝
     let w = vec![usage(r, AccessMode::Write)];
     assert!(!reg.can_parallel_with(&a, &w, true));
@@ -162,8 +174,7 @@ fn a3_conflict_matrix_with_append_opt_in() {
             // opt-in 后：Read×Read 与 Append×Append 并行，其余仍串行
             let expected = matches!(
                 (m1, m2),
-                (AccessMode::Read, AccessMode::Read)
-                    | (AccessMode::Append, AccessMode::Append)
+                (AccessMode::Read, AccessMode::Read) | (AccessMode::Append, AccessMode::Append)
             );
             assert_eq!(reg.can_parallel_with(&a, &b, true), expected);
         }
@@ -297,7 +308,11 @@ async fn a6_undo_lifo_order() {
     }
     assert_eq!(stack.len(), 2);
     stack.recover().await;
-    assert_eq!(*log.lock().unwrap(), vec![2u8, 1u8], "后压入的先执行（LIFO 逆序）");
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![2u8, 1u8],
+        "后压入的先执行（LIFO 逆序）"
+    );
     assert!(stack.is_empty(), "recover 后栈清空");
 }
 
@@ -313,7 +328,11 @@ async fn a6_undo_restores_observable_state() {
     }));
     assert_eq!(state.load(Ordering::SeqCst), 2);
     stack.recover().await;
-    assert_eq!(state.load(Ordering::SeqCst), 0, "状态应恢复为初始值（w;w̄=1）");
+    assert_eq!(
+        state.load(Ordering::SeqCst),
+        0,
+        "状态应恢复为初始值（w;w̄=1）"
+    );
 }
 
 #[tokio::test]

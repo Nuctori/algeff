@@ -9,6 +9,6 @@ pub mod executor;
 pub use executor::TokioExecutor;
 
 pub mod prelude {
-    
+
     pub use crate::executor::TokioExecutor;
 }

@@ -13,14 +13,19 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use algeff_core::{AccessMode, Fd, Resource, ResourceHandle, ResourceRegistry, ResourceUsage, SysError};
+use algeff_core::{
+    AccessMode, Fd, Resource, ResourceHandle, ResourceRegistry, ResourceUsage, SysError,
+};
 use proptest::prelude::*;
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 fn mutex_handle() -> ResourceHandle {
@@ -33,11 +38,7 @@ fn mutex_handle() -> ResourceHandle {
 fn temp_file_handle() -> (ResourceHandle, PathBuf) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "algeff_a3_reg_{}_{}.tmp",
-        std::process::id(),
-        n
-    ));
+    let path = std::env::temp_dir().join(format!("algeff_a3_reg_{}_{}.tmp", std::process::id(), n));
     let f = std::fs::File::create(&path).expect("创建临时文件失败");
     let tf = tokio::fs::File::from_std(f);
     (ResourceHandle::File(Arc::new(tf)), path)
@@ -62,7 +63,8 @@ fn open_write_close_lifecycle() {
 
     // Write：A4 线性通过（Write 至多一次）
     assert!(
-        reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok(),
         "首次 Write 应通过线性检查"
     );
     // 重复 Write 拒绝（A4）
@@ -122,9 +124,15 @@ fn replace_semantics() {
     let _ = fds[2];
 
     // 旧路径上的线性消费：Write 消费 + Own 终结
-    assert!(reg.check_linear(&usage(r0.clone(), AccessMode::Write)).is_ok());
-    assert!(reg.check_linear(&usage(r0.clone(), AccessMode::Own)).is_ok());
-    assert!(reg.check_linear(&usage(r1.clone(), AccessMode::Write)).is_ok());
+    assert!(reg
+        .check_linear(&usage(r0.clone(), AccessMode::Write))
+        .is_ok());
+    assert!(reg
+        .check_linear(&usage(r0.clone(), AccessMode::Own))
+        .is_ok());
+    assert!(reg
+        .check_linear(&usage(r1.clone(), AccessMode::Write))
+        .is_ok());
     assert_eq!(
         reg.check_linear(&usage(r0.clone(), AccessMode::Read)),
         Err(SysError::InvalidInput),
@@ -140,15 +148,18 @@ fn replace_semantics() {
     }
     // 线性状态复位：同资源再次 Write + Own 成功（A4 回到未消费状态）
     assert!(
-        reg.check_linear(&usage(r0.clone(), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(r0.clone(), AccessMode::Write))
+            .is_ok(),
         "clear() 后同资源应可再次 Write"
     );
     assert!(
-        reg.check_linear(&usage(r0.clone(), AccessMode::Own)).is_ok(),
+        reg.check_linear(&usage(r0.clone(), AccessMode::Own))
+            .is_ok(),
         "clear() 后同资源应可再次 Own 终结"
     );
     assert!(
-        reg.check_linear(&usage(r1.clone(), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(r1.clone(), AccessMode::Write))
+            .is_ok(),
         "clear() 后第二资源 Write 消费记录复位"
     );
 
@@ -190,11 +201,15 @@ fn fork_clone_merge_pattern() {
     let c2 = child.allocate(mutex_handle());
     assert_ne!(c1, c2);
     assert!(
-        child.check_linear(&usage(Resource::Fd(c1), AccessMode::Write)).is_ok(),
+        child
+            .check_linear(&usage(Resource::Fd(c1), AccessMode::Write))
+            .is_ok(),
         "子路径 Write 应通过"
     );
     assert!(
-        child.check_linear(&usage(Resource::Fd(c1), AccessMode::Own)).is_ok(),
+        child
+            .check_linear(&usage(Resource::Fd(c1), AccessMode::Own))
+            .is_ok(),
         "子路径 Own 终结应通过"
     );
 
@@ -204,7 +219,9 @@ fn fork_clone_merge_pattern() {
     assert!(parent.lookup(c2).is_none(), "父不应看到子句柄 c2");
     // 子的线性消费不污染父：父对该资源仍可正常 Write（A4 状态隔离）
     assert!(
-        parent.check_linear(&usage(Resource::Fd(c1), AccessMode::Write)).is_ok(),
+        parent
+            .check_linear(&usage(Resource::Fd(c1), AccessMode::Write))
+            .is_ok(),
         "子路径的线性消费不应污染父"
     );
 
@@ -232,10 +249,15 @@ fn fork_clone_merge_pattern() {
 
     // 父 registry 可见子句柄（值身份保留：Arc 指向同一底层对象）
     for (cfd, nfd, expect_arc) in &migrated {
-        let h = parent.lookup(*nfd).unwrap_or_else(|| panic!("父应可见迁移后的句柄（子 fd {cfd} → 父 fd {nfd}）"));
+        let h = parent
+            .lookup(*nfd)
+            .unwrap_or_else(|| panic!("父应可见迁移后的句柄（子 fd {cfd} → 父 fd {nfd}）"));
         match h {
             ResourceHandle::Mutex(m) => {
-                assert!(Arc::ptr_eq(m, expect_arc), "迁移应保留句柄值身份（同一 Arc 对象）");
+                assert!(
+                    Arc::ptr_eq(m, expect_arc),
+                    "迁移应保留句柄值身份（同一 Arc 对象）"
+                );
             }
             _ => unreachable!("本测试只使用 Mutex 句柄"),
         }
@@ -260,7 +282,9 @@ fn fork_clone_merge_pattern() {
     // 注意：c1 == migrated[0].1 == 2（父子 next_fd 同一起点），该键已被上方
     // 隔离断言消费过，故用第二个迁移句柄（新 fd 3）的键验证全新线性状态。
     assert!(
-        parent.check_linear(&usage(Resource::Fd(migrated[1].1), AccessMode::Write)).is_ok(),
+        parent
+            .check_linear(&usage(Resource::Fd(migrated[1].1), AccessMode::Write))
+            .is_ok(),
         "迁移句柄在父侧应带全新线性状态"
     );
 }

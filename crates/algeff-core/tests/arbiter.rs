@@ -12,7 +12,10 @@
 use algeff_core::{AccessMode, Resource, ResourceArbiter, ResourceUsage};
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 // a. 全部可占 → 成功且 held
@@ -129,7 +132,10 @@ fn finite_retry_eventually_succeeds() {
     assert!(arb.try_claim(&held_lock));
 
     // 重试目标：Read(r)（与持锁冲突）+ Read(s)（无冲突，用于验证回滚无残留）
-    let claim = vec![usage(r.clone(), AccessMode::Read), usage(s.clone(), AccessMode::Read)];
+    let claim = vec![
+        usage(r.clone(), AccessMode::Read),
+        usage(s.clone(), AccessMode::Read),
+    ];
 
     const MAX_RETRIES: usize = 5;
     let mut attempts = 0usize;

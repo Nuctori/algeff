@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use algeff_core::{
-    Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, ResourceInner,
-    ResourceUsage, Signal, TypedResource,
+    Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, ResourceInner, ResourceUsage,
+    Signal, TypedResource,
 };
 
 /// 构造一个 next 为 `Pure` 的 Syscall 节点。
@@ -147,7 +147,12 @@ pub fn mmap(path: PathBuf, len: usize, prot: MmapProt) -> Action {
 
 /// 打开内存管道（决策 D5），返回 Value::List([reader_fd, writer_fd])。
 pub fn pipe_open() -> Action {
-    syscall(DataOp::PipeOpen { flags: PipeFlags::default() }, vec![])
+    syscall(
+        DataOp::PipeOpen {
+            flags: PipeFlags::default(),
+        },
+        vec![],
+    )
 }
 
 // ── 进程 ──────────────────────────────────────────────────────────────

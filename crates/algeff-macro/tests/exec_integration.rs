@@ -21,9 +21,9 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use algeff_core::prelude::*;
 use algeff_core::runtime::interpret;
 use algeff_core::syscall::BoxFuture;
-use algeff_core::prelude::*;
 use algeff_macro::{choose, fork, plan, scope};
 
 /// 本地 current-thread runtime 驱动（interpret future 非 Send，不能用多线程 block_on）。
@@ -103,7 +103,10 @@ fn syscall_step(op: DataOp) -> Action {
 }
 
 fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-    ResourceUsage { resource: r, mode: m }
+    ResourceUsage {
+        resource: r,
+        mode: m,
+    }
 }
 
 // ── 1. plan! 纯链可执行 ───────────────────────────────────────────────

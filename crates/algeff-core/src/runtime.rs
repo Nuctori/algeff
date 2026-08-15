@@ -236,9 +236,7 @@ fn collect_syscall_resources(action: &Action, out: &mut ResourceSet) {
         Action::Scope { inner, .. } => collect_syscall_resources(inner, out),
         Action::Replace { target } => collect_syscall_resources(target, out),
         Action::Timeout {
-            action,
-            on_timeout,
-            ..
+            action, on_timeout, ..
         } => {
             collect_syscall_resources(action, out);
             collect_syscall_resources(on_timeout, out);
@@ -299,7 +297,11 @@ pub async fn interpret(
                 (Value::Unit, na)
             }
 
-            Action::Syscall { op, resources, next } => {
+            Action::Syscall {
+                op,
+                resources,
+                next,
+            } => {
                 for u in &resources {
                     reg.check_linear(u)?;
                 }
@@ -311,12 +313,24 @@ pub async fn interpret(
                 (Value::Unit, na)
             }
 
-            Action::Choose { cond, then_branch, else_branch } => {
-                let chosen = if cond(&cur) { *then_branch } else { *else_branch };
+            Action::Choose {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let chosen = if cond(&cur) {
+                    *then_branch
+                } else {
+                    *else_branch
+                };
                 (cur, chosen)
             }
 
-            Action::Fork { left, right, combine } => {
+            Action::Fork {
+                left,
+                right,
+                combine,
+            } => {
                 // 阶段 1（D14）：静态冲突检测 + 顺序执行。检测结果暂不改变调度。
                 let _conflict = fork_conflict(reg, &left, &right);
                 // 分支 registry 隔离（D13：Clone），避免两分支在共享 consumed 集上
@@ -391,19 +405,19 @@ pub async fn interpret(
                 action: inner,
                 duration,
                 on_timeout,
-            } => match tokio::time::timeout(duration, run_sub(*inner, ctx, undo, reg, ex)).await
-            {
+            } => match tokio::time::timeout(duration, run_sub(*inner, ctx, undo, reg, ex)).await {
                 Ok(Ok(v)) => return Ok(v),
                 Ok(Err(e)) => return Err(e),
                 Err(_elapsed) => return run_sub(*on_timeout, ctx, undo, reg, ex).await,
             },
 
-            Action::Catch { action: inner, handler } => {
-                match run_sub(*inner, ctx, undo, reg, ex).await {
-                    Ok(v) => return Ok(v),
-                    Err(e) => return run_sub(handler(e), ctx, undo, reg, ex).await,
-                }
-            }
+            Action::Catch {
+                action: inner,
+                handler,
+            } => match run_sub(*inner, ctx, undo, reg, ex).await {
+                Ok(v) => return Ok(v),
+                Err(e) => return run_sub(handler(e), ctx, undo, reg, ex).await,
+            },
         };
         cur = next_cur;
         action = next_action;

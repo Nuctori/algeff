@@ -42,19 +42,32 @@ async fn file_write_read_roundtrip() {
     let fd = fd_of(&v.0);
 
     let (v, _undo) = ex
-        .execute(&DataOp::Write { fd, data: b"hello world".to_vec() }, &mut reg)
+        .execute(
+            &DataOp::Write {
+                fd,
+                data: b"hello world".to_vec(),
+            },
+            &mut reg,
+        )
         .await
         .unwrap();
     assert_eq!(v, Value::Unit);
 
     ex.execute(
-        &DataOp::Seek { fd, offset: 0, whence: std::io::SeekFrom::Start(0) },
+        &DataOp::Seek {
+            fd,
+            offset: 0,
+            whence: std::io::SeekFrom::Start(0),
+        },
         &mut reg,
     )
     .await
     .unwrap();
 
-    let (v, _) = ex.execute(&DataOp::Read { fd, len: 11 }, &mut reg).await.unwrap();
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd, len: 11 }, &mut reg)
+        .await
+        .unwrap();
     assert_eq!(v, Value::Bytes(b"hello world".to_vec()));
 }
 
@@ -72,7 +85,11 @@ async fn undo_restores_file_content() {
         .execute(
             &DataOp::Open {
                 path: path.clone(),
-                flags: OpenFlags { read: true, write: true, ..Default::default() },
+                flags: OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
             },
             &mut reg,
         )
@@ -81,7 +98,13 @@ async fn undo_restores_file_content() {
     let fd = fd_of(&v.0);
 
     let (_, undo) = ex
-        .execute(&DataOp::Write { fd, data: b"changed content!".to_vec() }, &mut reg)
+        .execute(
+            &DataOp::Write {
+                fd,
+                data: b"changed content!".to_vec(),
+            },
+            &mut reg,
+        )
         .await
         .unwrap();
     let undo = undo.expect("小文件 Write 应返回 Full 撤销（undo）");
@@ -102,7 +125,13 @@ async fn rename_undo() {
     std::fs::write(&a, b"data").unwrap();
 
     let (_, undo) = ex
-        .execute(&DataOp::Rename { from: a.clone(), to: b.clone() }, &mut reg)
+        .execute(
+            &DataOp::Rename {
+                from: a.clone(),
+                to: b.clone(),
+            },
+            &mut reg,
+        )
         .await
         .unwrap();
     assert!(b.exists() && !a.exists());
@@ -119,7 +148,12 @@ async fn tcp_echo_roundtrip() {
     let mut reg = ResourceRegistry::new();
 
     let v = ex
-        .execute(&DataOp::TcpBind { addr: "127.0.0.1:0".parse().unwrap() }, &mut reg)
+        .execute(
+            &DataOp::TcpBind {
+                addr: "127.0.0.1:0".parse().unwrap(),
+            },
+            &mut reg,
+        )
         .await
         .unwrap();
     let lfd = fd_of(&v.0);
@@ -128,20 +162,35 @@ async fn tcp_echo_roundtrip() {
         _ => panic!("期望 TcpListener 句柄"),
     };
 
-    let v = ex.execute(&DataOp::TcpConnect { addr }, &mut reg).await.unwrap();
-    let cfd = fd_of(&v.0);
-
-    ex.execute(&DataOp::TcpWrite { fd: cfd, data: b"ping".to_vec() }, &mut reg)
+    let v = ex
+        .execute(&DataOp::TcpConnect { addr }, &mut reg)
         .await
         .unwrap();
+    let cfd = fd_of(&v.0);
 
-    let v = ex.execute(&DataOp::TcpAccept { listener: lfd }, &mut reg).await.unwrap();
+    ex.execute(
+        &DataOp::TcpWrite {
+            fd: cfd,
+            data: b"ping".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
+
+    let v = ex
+        .execute(&DataOp::TcpAccept { listener: lfd }, &mut reg)
+        .await
+        .unwrap();
     let sfd = match &v.0 {
         Value::List(l) => fd_of(&l[0]),
         other => panic!("期望 List，得到 {other:?}"),
     };
 
-    let (v, _) = ex.execute(&DataOp::TcpRead { fd: sfd, len: 4 }, &mut reg).await.unwrap();
+    let (v, _) = ex
+        .execute(&DataOp::TcpRead { fd: sfd, len: 4 }, &mut reg)
+        .await
+        .unwrap();
     assert_eq!(v, Value::Bytes(b"ping".to_vec()));
 }
 
@@ -171,16 +220,26 @@ async fn dup_shares_handle() {
         .unwrap();
     let fd = fd_of(&v.0);
 
-    ex.execute(&DataOp::Write { fd, data: b"hello".to_vec() }, &mut reg)
-        .await
-        .unwrap();
+    ex.execute(
+        &DataOp::Write {
+            fd,
+            data: b"hello".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
 
     let v = ex.execute(&DataOp::Dup { fd }, &mut reg).await.unwrap();
     let dup = fd_of(&v.0);
 
     // 共享句柄：原 fd 上的 seek 会影响 dup fd 的游标（同一文件描述）。
     ex.execute(
-        &DataOp::Seek { fd, offset: 0, whence: std::io::SeekFrom::Start(0) },
+        &DataOp::Seek {
+            fd,
+            offset: 0,
+            whence: std::io::SeekFrom::Start(0),
+        },
         &mut reg,
     )
     .await
@@ -188,7 +247,10 @@ async fn dup_shares_handle() {
 
     // 取走原 fd（注册表 token 移除），dup fd 仍可读。
     assert!(reg.take(fd).is_some());
-    let (v, _) = ex.execute(&DataOp::Read { fd: dup, len: 5 }, &mut reg).await.unwrap();
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: dup, len: 5 }, &mut reg)
+        .await
+        .unwrap();
     assert_eq!(v, Value::Bytes(b"hello".to_vec()));
 }
 
@@ -199,17 +261,34 @@ async fn pipe_duplex() {
     let mut ex = TokioExecutor::new();
     let mut reg = ResourceRegistry::new();
 
-    let (v, _) = ex.execute(&DataOp::PipeOpen { flags: PipeFlags::default() }, &mut reg).await.unwrap();
+    let (v, _) = ex
+        .execute(
+            &DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            &mut reg,
+        )
+        .await
+        .unwrap();
     let (rfd, wfd) = match v {
         Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),
         other => panic!("期望 List，得到 {other:?}"),
     };
 
-    ex.execute(&DataOp::Write { fd: wfd, data: b"ping".to_vec() }, &mut reg)
+    ex.execute(
+        &DataOp::Write {
+            fd: wfd,
+            data: b"ping".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
+
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: rfd, len: 4 }, &mut reg)
         .await
         .unwrap();
-
-    let (v, _) = ex.execute(&DataOp::Read { fd: rfd, len: 4 }, &mut reg).await.unwrap();
     assert_eq!(v, Value::Bytes(b"ping".to_vec()));
 }
 

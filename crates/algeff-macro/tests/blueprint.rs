@@ -83,7 +83,11 @@ fn shutdown_blueprint_nesting_and_base_path() {
     let Action::Scope { base, inner, next } = blueprint else {
         panic!("蓝图顶层应为 scope! 展开的 Action::Scope");
     };
-    assert_eq!(base, PathBuf::from("/var/log/myapp"), "scope! 应透传 base 路径");
+    assert_eq!(
+        base,
+        PathBuf::from("/var/log/myapp"),
+        "scope! 应透传 base 路径"
+    );
     let cont = next(Value::Unit);
     assert!(
         matches!(cont, Action::Pure(Value::Unit)),
@@ -100,7 +104,12 @@ fn shutdown_blueprint_nesting_and_base_path() {
     assert!(steps.next().is_none(), "不应存在第 3 个步骤");
 
     // ── 第 3 层：步骤 1 = fork!{ left, right } ───────────────────────────
-    let Action::Fork { left, right, combine } = step_fork else {
+    let Action::Fork {
+        left,
+        right,
+        combine,
+    } = step_fork
+    else {
         panic!("步骤 1 应为 fork! 展开的 Action::Fork");
     };
     let combined = combine(Value::Unit, Value::Unit);
@@ -123,7 +132,12 @@ fn shutdown_blueprint_nesting_and_base_path() {
     );
 
     // ── 第 5 层：left 的 choose!（关闭模式分支）──────────────────────────
-    let Action::Choose { cond, then_branch, else_branch } = left_chain.pop().unwrap() else {
+    let Action::Choose {
+        cond,
+        then_branch,
+        else_branch,
+    } = left_chain.pop().unwrap()
+    else {
         panic!("fork! 左路应为 choose! 展开的 Action::Choose");
     };
     assert!(
@@ -149,7 +163,11 @@ fn shutdown_blueprint_nesting_and_base_path() {
     );
 
     // ── 步骤 2 = Alloc{ len }，字段透传 ──────────────────────────────────
-    let Action::Alloc { len, next: alloc_next } = step_alloc else {
+    let Action::Alloc {
+        len,
+        next: alloc_next,
+    } = step_alloc
+    else {
         panic!("步骤 2 应为 Action::Alloc");
     };
     assert_eq!(len, 4096, "Alloc 的 len 应透传");
@@ -214,7 +232,12 @@ fn choose_else_keyword_parsing() {
         then: Action::Pure(Value::U64(1)),
         else: Action::Pure(Value::U64(2)),
     );
-    let Action::Choose { cond, then_branch, else_branch } = action else {
+    let Action::Choose {
+        cond,
+        then_branch,
+        else_branch,
+    } = action
+    else {
         panic!("choose! 应展开为 Action::Choose");
     };
     assert!(cond(&Value::Unit), "cond 闭包应返回 true");

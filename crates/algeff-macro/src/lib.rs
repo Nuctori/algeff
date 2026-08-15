@@ -137,7 +137,9 @@ impl Parse for ForkInput {
         // 容忍尾随逗号，再拒绝任何多余 token
         let _ = input.parse::<Token![,]>();
         if !input.is_empty() {
-            return Err(input.error("fork! 存在多余 token（语法：fork!{ left: <expr>, right: <expr> }）"));
+            return Err(
+                input.error("fork! 存在多余 token（语法：fork!{ left: <expr>, right: <expr> }）")
+            );
         }
         Ok(Self { left, right })
     }
@@ -308,7 +310,9 @@ impl Parse for ChooseInput {
         // 容忍尾随逗号，再拒绝任何多余 token
         let _ = input.parse::<Token![,]>();
         if !input.is_empty() {
-            return Err(input.error("choose! 存在多余 token（语法：choose!(cond, then: <expr>, else: <expr>)）"));
+            return Err(input.error(
+                "choose! 存在多余 token（语法：choose!(cond, then: <expr>, else: <expr>)）",
+            ));
         }
         Ok(Self {
             cond,
