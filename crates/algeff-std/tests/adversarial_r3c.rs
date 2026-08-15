@@ -953,7 +953,11 @@ fn arb_round(id: u64, dur_ms: u64, sleep_ms: u64) -> Action {
                         next: Box::new(Action::Pure),
                     }),
                     next: Box::new(move |_| {
-                        syscall(DataOp::MutexUnlock { id }, vec![], Action::Pure)
+                        // 完成路径显式产出 U64(0)（op_mutex_unlock 返回 Unit，
+                        // go 延续按 U64 匹配——修复预存 flaky：完整完成轮 panic 期望 U64）
+                        syscall(DataOp::MutexUnlock { id }, vec![], |_| {
+                            Action::Pure(Value::U64(0))
+                        })
                     }),
                 }),
             }),

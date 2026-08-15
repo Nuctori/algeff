@@ -287,11 +287,14 @@ type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// 波动，保留安全边际），且 r4c 深度 64 安全回归不受影响；统一保守取值保证
 /// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 96 帧余量更大。
 ///
-/// **保证范围（文档化限制）**：守卫保证限于 **≥2MB 栈**（Rust 测试线程默认
-/// 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB，在 2MB 栈下留有余量；若宿主在更小
-/// 栈（如 1MB 主线程栈：96 帧可能越界，实测崩溃边界 ~50-54 帧）上执行深嵌套
-/// 蓝图，需由宿主设置 `RUST_MIN_STACK` 提升栈尺寸，否则属用户责任（阈值
-/// 不随栈尺寸动态调整，保持 96）。
+/// **保证范围（文档化限制）**：守卫保证限于 **≥2MB 栈**（Rust 测试线程/tokio
+/// worker/`std::thread::spawn` 默认 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB，在
+/// 2MB 栈下留有余量；若宿主在更小栈（如 1MB 主线程栈：实测崩溃边界 ~50-54 帧）
+/// 上执行深嵌套蓝图，**正确缓解**：a. 链接器 /STACK 提升主线程栈；b. 将解释器
+/// 运行在 spawn 线程（受 `RUST_MIN_STACK` 控制）；c. Catch Other(105)。注意
+/// `RUST_MIN_STACK` 只影响 `std::thread::spawn` 新线程、**不影响主线程**（审查
+/// 修正，与 spec/resource-notes.md RFC-11 一致）。否则属用户责任（阈值不随栈
+/// 尺寸动态调整，保持 96）。
 const MAX_NESTING_DEPTH: usize = 96;
 
 /// 深度超限错误：`SysError::Other(105)`（ENOBUFS=105，「嵌套资源耗尽」语义
