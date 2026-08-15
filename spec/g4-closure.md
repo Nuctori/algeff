@@ -9,7 +9,7 @@
 > - worktree `.wt/a1` 分支 `s6/a1` @ `c968ebd` = **main @ `c968ebd`（零落后）**。已含 A2 批 4 Fork 并行化
 >   （`57b53d1`/`430d64d`）、A5 批 4 错误路径修复（`f28236c`/`ab662c7`）、契约 D15–D18 补录
 >   （`d356368`/`6cb3de9`/`ed84a3c`）、A2 批 4 合并后的集成修复（`2f612f9`/`eb380f5`/`c968ebd`）。
-> - 契约文档：`contracts.md`（**D1–D18 决策表**，终版）；`pdr.md` v3.2（§四/§十六/§十九）。
+> - 契约文档：`contracts.md`（**D1–D19 决策表**，终版）；`pdr.md` v3.2（§四/§十六/§十九）。
 > - 基线验证（本批实际执行）：`cargo test --workspace` → **151 passed, 0 failed**（24 测试二进制全绿）；
 >   `cargo test --workspace --features coeffects,virtual-clock` → 全绿（含 `runtime_features` 7 + `features_regression` 2）；
 >   `cargo fmt --check` 干净（exit 0）；`cargo clippy --workspace` 0 error 0 warning。
