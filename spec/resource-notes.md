@@ -84,3 +84,84 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
 - s1/a3：check_linear 细化（Write 至多一次 / Own 终结 / Read·Append 不限）；
   新增 `ResourceRegistry::clear`（供 A2 Replace）；Component 生命周期回调 +
   ComponentRegistry::sync；冲突矩阵穷举测试。
+- s2/a3：新增 §7「解释器集成模式」（Open/Write/Close 生命周期、Replace→clear、
+  Fork clone 隔离-合并、A4 随机序列状态机）；配套集成测试
+  `crates/algeff-core/tests/registry_integration.rs`（不依赖 interpret，用公共
+  API 预演 A2 解释器调用序列，为 A2 合并后集成铺路）。
+
+## 7. 解释器集成模式（A2 合并前的预演）
+
+> 本节给出 A2 解释器将执行的 registry 调用序列（伪代码）与决策 D10/D13 的
+> 对应关系，由 `crates/algeff-core/tests/registry_integration.rs` 实测验证。
+> 该测试不依赖 `interpret`（A2 未合并），仅用现有公共 API 预演调用序列。
+
+### 7.1 Open → Write → Close 生命周期（对应 D1/A4）
+
+```
+// Syscall(Open) 成功后登记句柄：
+let fd = registry.allocate(handle);            // D1：全局唯一、单调递增
+// Syscall(Write { fd }) 执行前的线性预检：
+registry.check_linear(&usage(Fd(fd), Write))?; // A4：Write 至多一次
+// Syscall(Close { fd })：
+registry.check_linear(&usage(Fd(fd), Own))?;   // A4：Own 终结（之后一切 usage 拒绝）
+registry.take(fd);                             // Own 语义：取出并释放句柄
+```
+
+要点：`Write → Close(Own)` 是合法序列（pdr.md §14 示例）；Close 后 fd 不复用
+（D1），资源键保持终结标记（后续任何 usage 报 `InvalidInput`）。
+对应测试：`open_write_close_lifecycle`。
+
+### 7.2 Replace → clear()（对应 D10）
+
+`Replace { target }` 语义（决策 D10）：先 recover 再执行 target。registry 侧配合
+为 `clear()`：释放当前路径积累的全部句柄与线性标记（`handles`/`consumed`/
+`owned_consumed` 清空；`next_fd` **不复位** —— D1 单调性），随后新蓝图在同一
+注册表上继续分配与消费。验证：`clear()` 后同资源可再次 Write + Own 成功
+（A4 状态复位），新分配的 fd 不复用旧值（D1）。
+对应测试：`replace_semantics`。
+
+### 7.3 Fork 隔离-合并（对应 D13）
+
+```
+// Fork 前：子任务克隆父状态（COW 隔离，A5）
+let mut child = parent.clone();
+// 子任务在私有副本上分配 / 消费 / 终结（对父完全不可见）
+let fd = child.allocate(handle);
+child.check_linear(&usage(Fd(fd), Write))?;
+// join 后合并：子注册表句柄迁回父，next_fd 取 max
+//   —— 意图语义（需 merge 原语，见 7.4 / RFC-A3-2）：
+//      parent.handles.extend(child.handles);
+//      parent.next_fd = max(parent.next_fd, child.next_fd);
+//   —— 当前公共 API 可行路径（值迁移 + fd 重分配）：
+//      let h = child.take(fd);
+//      let new_fd = parent.allocate(h);
+```
+
+**无重复 fd 保证**：子注册表克隆自父，`next_fd` 继承父值；子新分配的 fd 均
+≥ 父 `next_fd`，与父已有句柄（均 < 父 `next_fd`）互不重叠 —— extend 式合并
+天然无冲突（测试中以 `parent.lookup(cfd).is_none()` 断言该前置条件）。
+对应测试：`fork_clone_merge_pattern`。
+
+### 7.4 当前 API 的合并缺口（RFC-A3-2）
+
+`ResourceRegistry` 公共 API 未暴露句柄枚举与「固定 fd 插入」，测试中的合并只能用
+`take` + `allocate` 完成**值迁移**：句柄值身份（Arc）保留、fd 身份重分配。
+fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，子路径的
+`consumed`/`owned_consumed` 无法按原键合并（spec/axioms.md 提示的 consumed
+合并将漏报）。建议（A2 集成时由 CTO 裁决）：新增
+`pub fn merge(&mut self, other: Self)` —— 固定 fd 插入 + `consumed`/
+`owned_consumed` 取并集 + `next_fd = max`；或等价地暴露句柄迭代器与
+固定 fd 插入原语。
+
+### 7.5 对应关系小结
+
+| 调用序列 | 决策 | 公理 | 测试 |
+| --- | --- | --- | --- |
+| allocate → check_linear(Write) → take(Close/Own) | D1 | A4 | `open_write_close_lifecycle` |
+| 多句柄 + 多消费 → clear() → 再消费 | D10 | A4 | `replace_semantics` |
+| clone → 子分配+消费 → 合并回父 | D13 | A3/A5 | `fork_clone_merge_pattern` |
+| 随机 usage 序列的状态机不变量 | — | A4 | `linearity_sequence_random` |
+
+> 备注：任务文本提及「与 D10/D14 的对应关系」，但当前 contracts.md 决策表只有
+> D1–D13，**D14 未定义**（全仓库检索无 D14 条目）。本节按现存决策 D1/D10/D13
+> 撰写对应关系；D14 的存在性需 CTO 澄清（见 RFC-A3-3）。
