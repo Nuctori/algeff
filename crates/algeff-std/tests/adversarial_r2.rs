@@ -179,30 +179,18 @@ enum Shape {
 fn deep_shape() -> Shape {
     Shape::Fork(
         Box::new(Shape::Fork(
+            Box::new(Shape::Fork(Box::new(Shape::Leaf), Box::new(Shape::Leaf))),
             Box::new(Shape::Fork(
                 Box::new(Shape::Leaf),
-                Box::new(Shape::Leaf),
-            )),
-            Box::new(Shape::Fork(
-                Box::new(Shape::Leaf),
-                Box::new(Shape::Fork(
-                    Box::new(Shape::Leaf),
-                    Box::new(Shape::Leaf),
-                )),
+                Box::new(Shape::Fork(Box::new(Shape::Leaf), Box::new(Shape::Leaf))),
             )),
         )),
         Box::new(Shape::Fork(
-            Box::new(Shape::Fork(
-                Box::new(Shape::Leaf),
-                Box::new(Shape::Leaf),
-            )),
+            Box::new(Shape::Fork(Box::new(Shape::Leaf), Box::new(Shape::Leaf))),
             Box::new(Shape::Fork(
                 Box::new(Shape::Leaf),
                 Box::new(Shape::Fork(
-                    Box::new(Shape::Fork(
-                        Box::new(Shape::Leaf),
-                        Box::new(Shape::Leaf),
-                    )),
+                    Box::new(Shape::Fork(Box::new(Shape::Leaf), Box::new(Shape::Leaf))),
                     Box::new(Shape::Leaf),
                 )),
             )),
@@ -411,7 +399,11 @@ fn fd_1000_conflict_forks_region_seq_and_fd_monotonic() {
     let c999 = read_back(&mut rt, files[999], 2);
     assert_eq!(c999, b"LR".to_vec(), "第 999 轮文件顺序双写");
     // 每轮左/右分支各一个 Write undo 经顺序路径直接压入父栈（A2 批 6 merge）。
-    assert_eq!(rt.undo_stack().len(), 2000, "1000 轮 × 2 个 Write undo 入父栈");
+    assert_eq!(
+        rt.undo_stack().len(),
+        2000,
+        "1000 轮 × 2 个 Write undo 入父栈"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -538,17 +530,13 @@ fn arb_declared_fork_same_lock_id_serialized() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     // 分支内锁 id=7 声明 wu(Fd(7))（与执行器仲裁键 Resource::Fd(7) 对齐）。
     // 注意：unlock 必须声明 rd —— Write 声明会被 A4 消费（每资源至多一次）。
-    let lock_unlock = |id: u64| {
-        Action::Sequential {
-            current: Box::new(syscall(
-                DataOp::MutexLock { id },
-                vec![wu(id)],
-                Action::Pure,
-            )),
-            next: Box::new(move |_| {
-                syscall(DataOp::MutexUnlock { id }, vec![rd(id)], Action::Pure)
-            }),
-        }
+    let lock_unlock = |id: u64| Action::Sequential {
+        current: Box::new(syscall(
+            DataOp::MutexLock { id },
+            vec![wu(id)],
+            Action::Pure,
+        )),
+        next: Box::new(move |_| syscall(DataOp::MutexUnlock { id }, vec![rd(id)], Action::Pure)),
     };
     let v = rt
         .run_blocking(Action::Fork {
@@ -557,7 +545,11 @@ fn arb_declared_fork_same_lock_id_serialized() {
             combine: Box::new(|_, _| Action::Pure(Value::Unit)),
         })
         .unwrap();
-    assert_eq!(v, Value::Unit, "声明冲突 → 顺序化：两分支 lock+unlock 均成功");
+    assert_eq!(
+        v,
+        Value::Unit,
+        "声明冲突 → 顺序化：两分支 lock+unlock 均成功"
+    );
     assert_eq!(rt.undo_stack().len(), 2, "两把锁的 undo 均入栈");
 
     // 锁与占坑都已释放（显式 unlock）→ 同一 id 可重入。
@@ -597,20 +589,16 @@ fn arb_undeclared_contention_wouldblock_no_deadlock() {
     // 重试后 WouldBlock（绝不挂起等待）。
     let err = rt
         .run_blocking(Action::Fork {
-            left: Box::new(syscall(
-                DataOp::MutexLock { id: 9 },
-                vec![],
-                Action::Pure,
-            )),
-            right: Box::new(syscall(
-                DataOp::MutexLock { id: 9 },
-                vec![],
-                Action::Pure,
-            )),
+            left: Box::new(syscall(DataOp::MutexLock { id: 9 }, vec![], Action::Pure)),
+            right: Box::new(syscall(DataOp::MutexLock { id: 9 }, vec![], Action::Pure)),
             combine: Box::new(|_, _| Action::Pure(Value::Unit)),
         })
         .unwrap_err();
-    assert_eq!(err, SysError::WouldBlock, "竞争失败方应 WouldBlock（非死锁）");
+    assert_eq!(
+        err,
+        SysError::WouldBlock,
+        "竞争失败方应 WouldBlock（非死锁）"
+    );
 
     // 胜者的 undo 已合并回父（含占坑释放逆操作）。
     assert_eq!(rt.undo_stack().len(), 1, "胜者锁的 undo 合并回父");
@@ -749,7 +737,11 @@ fn arb_explicit_unlock_reentrant_and_idempotent() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(rt.undo_stack().len(), 2, "两把锁的 undo 在栈（unlock 不压栈）");
+    assert_eq!(
+        rt.undo_stack().len(),
+        2,
+        "两把锁的 undo 在栈（unlock 不压栈）"
+    );
 
     // Replace → recover：undo 的 slot take 与 arbiter release 均为幂等 no-op。
     rt.run_blocking(Action::Replace {
@@ -859,9 +851,7 @@ fn r1_cursor_undo_nested_seq_replace() {
                                             whence: std::io::SeekFrom::Current(0),
                                         },
                                         vec![rd(fdb)],
-                                        move |pos_b| {
-                                            Action::Pure(Value::List(vec![pos_a, pos_b]))
-                                        },
+                                        move |pos_b| Action::Pure(Value::List(vec![pos_a, pos_b])),
                                     )
                                 },
                             )),
@@ -917,11 +907,7 @@ fn r1_putback_tcp_shutdown_10_rounds_fd_still_usable() {
         other => panic!("期望 TcpListener，得到 {other:?}"),
     };
     let v = rt
-        .run_blocking(syscall(
-            DataOp::TcpConnect { addr },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::TcpConnect { addr }, vec![], Action::Pure))
         .unwrap();
     let cfd = fd_of(&v);
     // Dup 共享 Arc → 后续 IO 均 InvalidInput（共享后无法 &mut / try_unwrap）。
@@ -1057,7 +1043,11 @@ fn r1_stale_fd_write_after_replace_recheck() {
         combine: Box::new(|_, _| Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert_eq!(rt.undo_stack().len(), 1, "父级 Write undo 未被分支级 Replace 吞掉");
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "父级 Write undo 未被分支级 Replace 吞掉"
+    );
     // 父级 A4：同资源再 Write 仍被拦截（分支级 Replace 不清父 consumed）。
     let e = rt
         .run_blocking(syscall(
@@ -1220,7 +1210,11 @@ fn err_fork_left_error_catch_merged_handle_visible_sequential() {
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
-    assert_eq!(std::fs::read(&pa).unwrap(), b"seed-a", "错误路径后撤销链完整");
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"seed-a",
+        "错误路径后撤销链完整"
+    );
 
     // 状态未毒化：同路径重开可写。
     let v = rt
@@ -1314,10 +1308,7 @@ fn err_fork_left_error_catch_merged_handle_visible_parallel() {
                     vec![wr(wfd)],
                     move |_| {
                         syscall(
-                            DataOp::Read {
-                                fd: rfd,
-                                len: 5,
-                            },
+                            DataOp::Read { fd: rfd, len: 5 },
                             vec![rd(rfd)],
                             Action::Pure,
                         )
@@ -1457,11 +1448,7 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
             vec![rd_path(pb.clone())],
             move |v| {
                 let fd = fd_of(&v);
-                syscall(
-                    DataOp::Read { fd, len: 3 },
-                    vec![rd(fd)],
-                    Action::Pure,
-                )
+                syscall(DataOp::Read { fd, len: 3 }, vec![rd(fd)], Action::Pure)
             },
         ))
         .unwrap();
@@ -1598,10 +1585,7 @@ fn mem_mmap_bounds_through_runtime() {
 
     // Munmap no-op。
     rt.run_blocking(syscall(
-        DataOp::Munmap {
-            addr: 0,
-            len: 0,
-        },
+        DataOp::Munmap { addr: 0, len: 0 },
         vec![],
         Action::Pure,
     ))
