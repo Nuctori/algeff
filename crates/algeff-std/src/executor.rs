@@ -69,7 +69,12 @@ const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 /// errno，透传语义与冻结面
 /// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
 /// （JD-3：其全部条目已被 kind 臂覆盖）。
-/// （JD-3：其全部条目已被 kind 臂覆盖）。
+///
+/// **与冻结面 `From<io::Error>` 的有意分叉（D-059：冻结面零改动）**：
+/// error.rs 的 `From` 实现把 `raw_os_error` 按 POSIX errno 解释（Windows 上
+/// kind 未命中码会撞码错映射）；执行器统一经本函数归一化（kind-first +
+/// Windows 兜底 Other(raw)）——任何物理 IO 错误都不会到达冻结面 From，
+/// 该分叉仅影响用户直接构造 `SysError::from(io::Error)` 的场景，非回归。
 fn to_sys_err(e: std::io::Error) -> SysError {
     // ErrorKind 优先：语义映射不受平台码值漂移影响（比手写平台码表更稳健）。
     let kind_errno = match e.kind() {

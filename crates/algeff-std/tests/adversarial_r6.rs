@@ -31,7 +31,7 @@
 //! 修复状态（R6 已落地，本文件断言修复后行为）：
 //! - F1 → JD-2（609c393）：kind 臂补 `CrossesDevices → 18`，Windows 跨卷
 //!   rename 现正确映射 `CrossDevice`；未映射码兑底改为 `Other(raw)`（审查
-//!   MEDIUM-1，5648125 后续提交）。
+//!   MEDIUM-1，4d9a263）。
 //! - F2 → RFC-12（6ded2db）：exec 失败路径回滚本批预插入的 Write/Own 标记
 //!   （+ B2 前缀回滚 2bfac05），同路径重试语义恢复。
 //!
