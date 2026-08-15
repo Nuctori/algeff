@@ -27,7 +27,7 @@
 //! 3. **R1 修复回归**：
 //!    - 游标撤销在嵌套 Sequential + Replace 组合下仍成立；
 //!    - put_back 错误循环（TcpShutdown try_unwrap 分支）10 次后 fd 仍可用；
-//!    - RFC-05 偏差（Replace 后旧 fd 可写）在新代码上仍复现 + 分支级 Replace
+//!    - RFC-05 已修复（Replace 后旧 fd 写失败 NotFound）+ 分支级 Replace
 //!      不清父级 A4 状态的隔离语义。
 //! 4. **Fork 顺序/并行错误路径**：左分支 Err → 右分支副作用发生 → 错误传播
 //!    → Catch 捕获后右分支 merge 的句柄仍可见。
@@ -817,64 +817,121 @@ fn r1_cursor_undo_nested_seq_replace() {
     let (fda, fdb) = pair_of(&v);
 
     // 嵌套 Sequential：内层 current = Sequential{ Seek(fda,0) → Write "XY" }，
-    // 外层 next = Write(fdb, "PQ") → Replace。
-    let v = rt
-        .run_blocking(Action::Sequential {
-            current: Box::new(Action::Sequential {
-                current: Box::new(syscall(
-                    DataOp::Seek {
-                        fd: fda,
-                        offset: 0,
-                        whence: std::io::SeekFrom::Start(0),
-                    },
-                    vec![rd(fda)],
-                    move |_| {
-                        syscall(
-                            DataOp::Write {
-                                fd: fda,
-                                data: b"XY".to_vec(),
-                            },
-                            vec![wr(fda)],
-                            Action::Pure,
-                        )
-                    },
-                )),
-                next: Box::new(move |_| {
+    // 外层 next = Write(fdb, "PQ") → Replace。RFC-05 修复后 Replace =
+    // recover + reg.clear() 在 target 执行**前**完成——旧 fd 已失效，target
+    // 不得再触碰（旧实现 target 内 Seek 旧 fd 观察游标；修复后该路径 NotFound）。
+    rt.run_blocking(Action::Sequential {
+        current: Box::new(Action::Sequential {
+            current: Box::new(syscall(
+                DataOp::Seek {
+                    fd: fda,
+                    offset: 0,
+                    whence: std::io::SeekFrom::Start(0),
+                },
+                vec![rd(fda)],
+                move |_| {
                     syscall(
                         DataOp::Write {
-                            fd: fdb,
-                            data: b"PQ".to_vec(),
+                            fd: fda,
+                            data: b"XY".to_vec(),
                         },
-                        vec![wr(fdb)],
-                        move |_| Action::Replace {
-                            target: Box::new(syscall(
+                        vec![wr(fda)],
+                        Action::Pure,
+                    )
+                },
+            )),
+            next: Box::new(move |_| {
+                syscall(
+                    DataOp::Write {
+                        fd: fdb,
+                        data: b"PQ".to_vec(),
+                    },
+                    vec![wr(fdb)],
+                    move |_| Action::Replace {
+                        target: Box::new(Action::Pure(Value::Unit)),
+                    },
+                )
+            }),
+        }),
+        next: Box::new(Action::Pure),
+    })
+    .unwrap();
+
+    // 双写生效后 Replace：内容恢复 + 旧 fd 失效（RFC-05）+ 路径重开游标为 0
+    // （世界恢复至执行前，A6 双态）。
+    assert_eq!(std::fs::read(&pa).unwrap(), orig_a, "a 内容恢复");
+    assert_eq!(std::fs::read(&pb).unwrap(), orig_b, "b 内容恢复");
+    assert!(rt.undo_stack().is_empty(), "Replace 后撤销栈空");
+
+    // RFC-05：Replace 后旧 fd 任何操作均 NotFound（registry 活性唯一真相，
+    // lin_stale_fd_read_close_fail_after_replace 的单 fd 变体；本测试为嵌套
+    // Sequential + 双文件变体）。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: fda,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(fda)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "Replace 后旧 fd 失效（NotFound）");
+
+    // A6 游标维：重开新 fd 后游标为写前位置 0（世界恢复至执行前）。
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: pa.clone(),
+                flags: OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            },
+            vec![wr_path(pa.clone())],
+            move |v| {
+                let fda2 = fd_of(&v);
+                syscall(
+                    DataOp::Open {
+                        path: pb.clone(),
+                        flags: OpenFlags {
+                            read: true,
+                            write: true,
+                            ..Default::default()
+                        },
+                    },
+                    vec![wr_path(pb.clone())],
+                    move |v| {
+                        let fdb2 = fd_of(&v);
+                        Action::Sequential {
+                            current: Box::new(syscall(
                                 DataOp::Seek {
-                                    fd: fda,
+                                    fd: fda2,
                                     offset: 0,
                                     whence: std::io::SeekFrom::Current(0),
                                 },
-                                vec![rd(fda)],
+                                vec![rd(fda2)],
                                 move |pos_a| {
                                     syscall(
                                         DataOp::Seek {
-                                            fd: fdb,
+                                            fd: fdb2,
                                             offset: 0,
                                             whence: std::io::SeekFrom::Current(0),
                                         },
-                                        vec![rd(fdb)],
+                                        vec![rd(fdb2)],
                                         move |pos_b| Action::Pure(Value::List(vec![pos_a, pos_b])),
                                     )
                                 },
                             )),
-                        },
-                    )
-                }),
-            }),
-            next: Box::new(Action::Pure),
-        })
+                            next: Box::new(Action::Pure),
+                        }
+                    },
+                )
+            },
+        ))
         .unwrap();
-
-    // 双写生效后 Replace：内容恢复 + 两文件游标都回到写前位置（0）。
     let (pos_a, pos_b) = match &v {
         Value::List(l) => (
             match l[0] {
@@ -888,11 +945,8 @@ fn r1_cursor_undo_nested_seq_replace() {
         ),
         other => panic!("{other:?}"),
     };
-    assert_eq!(std::fs::read(&pa).unwrap(), orig_a, "a 内容恢复");
-    assert_eq!(std::fs::read(&pb).unwrap(), orig_b, "b 内容恢复");
-    assert_eq!(pos_a, 0, "a 游标恢复（A6 双态：Seek(Current) 可观察）");
-    assert_eq!(pos_b, 0, "b 游标恢复");
-    assert!(rt.undo_stack().is_empty(), "Replace 后撤销栈空");
+    assert_eq!(pos_a, 0, "重开后 a 游标为写前位置 0（A6 双态：Seek(Current) 可观察）");
+    assert_eq!(pos_b, 0, "重开后 b 游标为写前位置 0（A6 双态）");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1003,8 +1057,8 @@ fn r1_putback_tcp_shutdown_10_rounds_fd_still_usable() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 3c：RFC-05 偏差回归 —— Replace 后旧 fd 可写在新代码上仍复现
-// （已知偏差，无需修复，确认测试记录仍准确）；另验证分支级 Replace 只
+// 攻击面 3c：RFC-05 回归 —— Replace 后旧 fd 写失败（修复验证，与 R1
+// lin_stale_fd_write_after_replace_fails 一致）；另验证分支级 Replace 只
 // 清分支 registry（父级 A4 状态隔离保留）。
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1084,24 +1138,28 @@ fn r1_stale_fd_write_after_replace_recheck() {
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), seed, "父级 Replace 已恢复内容");
 
-    // RFC-05 偏差复现：executor.files 仍持有旧 fd 强引用 → 旧 fd 可写且
-    // 物理落盘（与 R1 lin_stale_fd_write_after_replace_succeeds 记录一致）。
-    let v = rt.run_blocking(syscall(
-        DataOp::Write {
-            fd,
-            data: b"ZZ".to_vec(),
-        },
-        vec![wr(fd)],
-        Action::Pure,
-    ));
-    assert!(
-        v.is_ok(),
-        "偏差复现：父级 Replace 后旧 fd Write 仍成功（executor 侧句柄残留，RFC-05）"
+    // RFC-05 已修复：父级 Replace 后旧 fd Write 必须失败（NotFound）——registry
+    // 是 fd 活性唯一真相，executor 侧 files 缓存不得绕过（与 R1
+    // lin_stale_fd_write_after_replace_fails 一致）。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"ZZ".to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "RFC-05 修复后：父级 Replace 后旧 fd Write 必须失败"
     );
-    assert_ne!(
+    assert_eq!(
         std::fs::read(&pa).unwrap(),
         seed,
-        "偏差复现：旧 fd 的写确实物理落盘"
+        "旧 fd 写失败 → 恢复后的内容不再被破坏"
     );
 }
 

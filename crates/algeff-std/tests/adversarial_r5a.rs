@@ -332,7 +332,9 @@ fn fix_five_point_regression_single_blueprint() {
         "阶段1：handler 内 Replace 撤销写副作用，内容恢复"
     );
     let pa_fd = pa_fd.lock().unwrap().expect("阶段1 Open 已执行");
-    let pos = rt
+    // RFC-05：阶段1 handler 内 Replace 已使旧 fd 失效（registry 活性唯一真相）
+    // ——游标复原维度改经重开新 fd 观察（世界恢复至执行前，pos=0）。
+    let e = rt
         .run_blocking(syscall(
             DataOp::Seek {
                 fd: pa_fd,
@@ -342,11 +344,34 @@ fn fix_five_point_regression_single_blueprint() {
             vec![rd(pa_fd)],
             Action::Pure,
         ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "阶段1：Replace 后旧 fd 失效（NotFound）");
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: pa.clone(),
+                flags: rw_flags(),
+            },
+            vec![wr_path(pa.clone())],
+            Action::Pure,
+        ))
+        .unwrap();
+    let pa2 = fd_of(&v);
+    let pos = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: pa2,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(pa2)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(
         pos,
         Value::U64(0),
-        "阶段1：undo 恢复游标到写前位置 0（非写后 2）"
+        "阶段1：重开新 fd 游标为 0（undo 恢复写前位置；旧 fd 已随 Replace 失效）"
     );
 
     // 2. flush 可见性：阶段 2 写入已落盘（内联断言之外再确认）。
@@ -723,7 +748,10 @@ fn interact_flush_undo_restores_content_and_cursor() {
         .unwrap();
     assert_eq!(pos, Value::U64(7), "写后游标在 7");
 
-    // Replace（D10 = recover + clear）：undo 恢复内容**与游标**。
+    // Replace（D10 = recover + clear）：undo 恢复内容；旧 fd 随之失效（RFC-05，
+    // registry 活性唯一真相）——游标复原维度改经重开新 fd 观察（世界恢复至
+    // 执行前，pos=0；写前位置 5 的游标态随旧 fd 一并失效，A6 双态仍由
+    // rev_undo_restores_file_cursor 经 recover() 路径覆盖）。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
@@ -734,7 +762,7 @@ fn interact_flush_undo_restores_content_and_cursor() {
         b"hello world",
         "undo 恢复写前内容"
     );
-    let pos = rt
+    let e = rt
         .run_blocking(syscall(
             DataOp::Seek {
                 fd,
@@ -744,10 +772,19 @@ fn interact_flush_undo_restores_content_and_cursor() {
             vec![rd(fd)],
             Action::Pure,
         ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "Replace 后旧 fd 失效（NotFound）");
+    let fd2 = open_fd(&mut rt, pa.clone());
+    let pos = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: fd2,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(fd2)],
+            Action::Pure,
+        ))
         .unwrap();
-    assert_eq!(
-        pos,
-        Value::U64(5),
-        "undo 恢复游标到写前位置 5（非写后 7，A6 双态 w;w̄=1）"
-    );
+    assert_eq!(pos, Value::U64(0), "重开新 fd 游标为 0（世界恢复至执行前）");
 }
