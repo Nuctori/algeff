@@ -700,7 +700,6 @@ async fn r6b_pipe_write_no_reader_error_handle_restored() {
 /// (a) 输出侧为无读端管道写端 → 与 op_write 管道路径同源错误（两平台均
 ///     BrokenPipe——JD-1 kind-first 统一；修复前 Unix 为 Other(0)）；输入侧
 ///     文件 fd 不受影响（Seek+Read 仍可用，错误路径不丢输入句柄）；
-///     （Seek+Read 仍可用，错误路径不丢输入句柄）；
 /// (b) out == input 自拷贝 → InvalidInput（无 io、无状态变化）。
 /// 句柄恢复（put_back）的重复错误断言见
 /// `r6b_send_file_error_handle_restored`（direct executor——Runtime 层
