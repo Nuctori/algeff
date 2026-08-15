@@ -20,7 +20,7 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 | Crate | 职责 | 代码量估算 | 稳定性 |
 | --- | --- | --- | --- |
 | `algeff-core` | Action、ResourceSet、Resource\<M\>、Runtime 内核 | ~2000 行 | 永久冻结 |
-| `algeff-std` | 预包装适配层（open_tcp、read 等） | ~2500 行 | 永久稳定 |
+| `algeff-std` | 预包装适配层（open_tcp、read 等） | ~1200 行 | 永久稳定 |
 | `algeff-macro` | 极简语法糖宏（可选） | ~300 行 | 极少修改 |
 
 发布顺序（依赖方向）：`algeff-core` → `algeff-std` → `algeff-macro`，见 `scripts/release.sh`。
@@ -29,19 +29,21 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 
 | 模块 | 状态 | 测试数 | 待办 |
 | --- | --- | --- | --- |
-| `algeff-core` 解释器（15 节点 + UndoStack + Runtime） | 已实现并合并（A2/A3/A6） | 61（单元 15 + 集成 46） | 无（契约冻结） |
-| `algeff-std`（TokioExecutor + 适配器） | A5 交付中：`execute` 为 `todo!()` 桩 | 0（4 个 doc-test） | 实现全部 DataOp、Full 撤销策略、集成测试 |
-| `algeff-macro`（plan!/fork!/scope!/choose!） | 已实现并合并（A4） | 13（蓝图 5 + 展开 8） | 无（可选语法糖） |
-| 基准 benches（echo/parallel_reads/shared_read/append） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 物理执行器落地后刷新基线 |
-| CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + mdBook 构建 | — | — |
+| `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 87（单元 15 + 集成 72） | 无（契约冻结） |
+| `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器） | 已实现并合并（A5） | 23（adapters 5 + adapters_flow 6 + e2e 4 + executor 8） | 无 |
+| `algeff-macro`（plan!/fork!/scope!/choose!） | 已实现并合并（A4） | 19 + 8 doc-test | 无（可选语法糖） |
+| 基准 benches（echo/parallel_reads/shared_read/append + algeff 对比臂） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 阶段 3 Fork 并行调度落地后刷新对比列 |
+| CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + feature 测试 + mdBook 构建 | — | — |
 | 文档（`docs/` mdBook + `spec/` 形式化） | 已齐备（G3 门禁） | — | — |
 
-- 测试合计：`cargo test --workspace` 78 个全绿（74 个测试函数 + 4 个 doc-test）。
-- 发布准备（G4 终验）：`algeff-core` / `algeff-macro` 的 `cargo publish --dry-run --registry crates-io` 全绿；RFC-1 已落地（`algeff-std` 的 path 依赖补 `version = 0.1.0`），但 `algeff-std` 的 dry-run 仍被 cargo 发布依赖校验拒绝（`no matching package named 'algeff-core' found`）——因 `algeff-core` 0.1.0 尚未真实发布到 crates.io，属 cargo 固有的发布顺序约束（先真实发布 core、镜像同步后 std 自然解除）。可用 `scripts/release.sh --allow-unpublished-deps` 预览 std 的打包/编译面。
+- 测试合计：`cargo test --workspace` 137 个全绿（20 个测试二进制 + 3 个 doc-test 运行；129 个测试函数 + 8 个 doc-test）。
+- 特性测试：`crates/algeff-core/tests/runtime_features.rs` 的 7 个测试由 `--features coeffects,virtual-clock` 门控，默认测试不含；CI 双平台补跑 `cargo test --workspace --features coeffects,virtual-clock` 覆盖。
+- 性能基线：`perf/baseline-2026-08-15.txt`（A7 批 2 + 批 3），含原生 tokio 参照列与 Algeff 对比列（echo 100.0%、parallel_reads 340.0%、shared_read 307.6%、append 29.4%），接入说明见 `crates/algeff-std/benches/README.md`。
+- 发布准备（G4 终验）：三个 crate 的 `cargo publish --dry-run --registry crates-io` 全部通过（RFC-1 已落地：`algeff-std` 的 path 依赖补 `version = 0.1.0`）。`algeff-std` 因依赖尚未真实发布的 `algeff-core`，需 `scripts/release.sh --allow-unpublished-deps`（以本地成员代偿 registry 存在性校验）——属 cargo 固有的发布顺序约束，先真实发布 core、镜像同步后 std 自然解除。
 
 ## 快速开始
 
-最小**可运行**蓝图（已用独立项目验证可编译执行；完整示例见 `docs/example.md` 与 `pdr.md` §14）：
+最小**可运行**蓝图（已用独立项目验证可编译执行；完整示例见 `docs/src/example.md` 与 `pdr.md` §14）：
 
 ```toml
 [dependencies]
@@ -60,7 +62,7 @@ fn main() {
     // D9：Runtime::new 须在 tokio 上下文之外调用（普通 fn main 即可）
     let mut runtime = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // plan! 构造 Sequential 链；纯蓝图（不触物理 IO）当前即可运行
+    // plan! 构造 Sequential 链；纯蓝图与含 Syscall 的物理 IO 蓝图均可运行
     let blueprint = plan! {
         Action::Pure(Value::U64(1));
         Action::Pure(Value::U64(2));
@@ -74,7 +76,7 @@ fn main() {
 
 > 说明：
 > - `Action` 全部节点 CPS，递归字段一律 `Box<Action>`（契约 D2）；蓝图只依赖 `algeff-core`，可自由组合、缓存、重放，物理执行由 `algeff-std` 的 `TokioExecutor` 提供。
-> - ⚠️ `TokioExecutor::execute` 目前仍是 A5 交付中的 `todo!()` 桩：含 `Syscall` 节点的蓝图需待 A5 合并后方可运行；纯 `Pure`/`Alloc` 蓝图不受影响。
+> - `TokioExecutor::execute` 已实现全部 DataOp（A5 已合并）：含 `Syscall` 节点的蓝图直接由 tokio 后端驱动，`Runtime::run_blocking` 即可运行。
 > - pdr.md §14 示例风格为 `use algeff::prelude::*`（统一 façade crate，随发布提供）；当前工作区以 `algeff-core` / `algeff-macro` 名义发布。
 
 ## 文档入口
