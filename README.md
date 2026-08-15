@@ -280,7 +280,7 @@ let blueprint = Action::Replace { target: Box::new(Action::Pure(Value::Unit)) };
 ### 完整 TCP echo 服务器骨架
 
 ```rust
-use algeff_core::{Action, DataOp, Value};
+use algeff_core::{Action, DataOp, Runtime, Value};
 use algeff_std::TokioExecutor;
 
 fn main() {
@@ -364,7 +364,7 @@ fn main() {
 | 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 96 = 实测崩溃边界 104–108 留 8% 余量（D-052） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
 | 7   | 验证分层    | 309 个测试函数（约 301 二进制 + 8 doc-test），42 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
-| 8   | 对抗审计 ×5 | 120 个 E2E 测试，每轮独立发现（句柄活性/fd 区间/盲区/栈溢出…）                                                               | `spec/proof-obligations.md`    |
+| 8   | 对抗审计 ×5+R6 | 120 个 E2E 测试（R1-R5）+ R6 增补中（125+），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno…）                                                               | `spec/proof-obligations.md`    |
 | 9   | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决）                                                    | `spec/proof-obligations.md`    |
 | 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
 | 11  | 性能推导    | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制                                                               | `perf/baseline-2026-08-15.txt` |
@@ -397,6 +397,7 @@ fn main() {
 | Replace 句柄活性 | Replace 后旧 fd 的残留句柄仍可写（边界反例） | RFC-05，阶段 3+ 已裁决 |
 | fd 区间溢出 | Fork 右分支极端分配 ~360 轮后可能溢出 u64 | RFC-06，阶段 3+ |
 | Timeout 孤儿副作用 | 超时取消的并行分支副作用不可撤销 / 锁饥饿 | RFC-08/09，阶段 3+ |
+| 管道半端 | 未 Dup 的管道在 Fork 分支内 IO 被拒绝（Arc 共享与 `Arc::get_mut` 冲突） | RFC-07，阶段 3+ |
 | 闭包静态盲区 | `next` 闭包内构造的 `Syscall` 对静态冲突检测不可见（运行时仅收集 `current` 的资源声明；执行时仍会真实执行并并入父撤销栈） | 系统性声明前提，已文档化 |
 | 1MB 主线程栈 | 深嵌套蓝图需抬栈（`/STACK` 或 spawn 线程） | 用户责任，已文档化 |
 

@@ -203,7 +203,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | 属性（proptest） | `tests/axioms.rs`、`commutation.rs`、`arbiter.rs` | A3 对称 combine 交换、arbiter 三不变量（单调不减/原子快照/无泄漏） |
 | 执行级 | `tests/execution_axioms.rs` | `exec_A1_associativity`、`exec_A2_identity`、`exec_A6_undo_roundtrip` |
 | 端到端 | `algeff-std/tests/` | 文件往返、TCP echo、撤销往返、深度守卫 |
-| 对抗 E2E | `tests/adversarial_r{1..5}.rs` | 120 个测试（R1=17、R2=19、R3=28、R4=32、R5=24） |
+| 对抗 E2E | `tests/adversarial_r{1..6}.rs` | 125 个测试（R1=17、R2=19、R3=28、R4=32、R5=24、R6=5+，增补中） |
 | 模型检测 | `tla/scheduler.tla` | TLC 通过 `TypeOK`/`ExclusiveHold`/`ExactHold`/`NoCircularWait` 4 不变式 + `Progress` 时序属性 |
 
 总量：`cargo test --workspace` **309 个测试函数**（约 301 个 `#[test]`/`#[tokio::test]` +
