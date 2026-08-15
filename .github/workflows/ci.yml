@@ -1,0 +1,45 @@
+name: CI
+
+# GitHub Actions 部分 YAML 解析器会把裸 `on` 当作布尔值，
+# 加引号保证在任何严格 YAML 解析器下都按字符串键解析。
+"on":
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # mdBook 构建：仅当 docs/book.toml 存在时执行。
+      # 选 cargo install --locked 而非下载 release 二进制：
+      # 同一命令跨 ubuntu/windows 矩阵，无需维护各平台二进制 URL，
+      # --locked 固定依赖版本，保证可复现构建。
+      - name: Build mdBook docs
+        if: hashFiles('docs/book.toml') != ''
+        run: |
+          cargo install mdbook --locked
+          mdbook build docs
+        shell: bash
