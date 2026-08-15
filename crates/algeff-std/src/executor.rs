@@ -46,24 +46,30 @@ const ARBITER_RETRY_LIMIT: usize = 8;
 /// 动态仲裁占坑重试退避间隔（固定 1ms，竞争窗口合计约 7ms）。
 const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 
-/// io::Error → SysError 转换（RFC-10 修复，A5 域）。
+/// io::Error → SysError 转换（RFC-10 / JD-1 / JD-2 修复，A5 域）。
 ///
-/// 缺口：冻结面 `SysError::from_errno`（error.rs）只识别 POSIX errno，而
-/// Windows 上 `io::Error::raw_os_error()` 返回 Win32/WSA 原生码
+/// 缺口 1（RFC-10，Windows）：冻结面 `SysError::from_errno`（error.rs）只识别
+/// POSIX errno，而 Windows 上 `io::Error::raw_os_error()` 返回 Win32/WSA 原生码
 /// （ERROR_FILE_EXISTS=80、WSAEADDRINUSE=10048 等）——直接透传会退化为
 /// `Other(n)`，同一蓝图在 Windows 返回 Other(80)、在 Unix 返回
-/// `AlreadyExists`，破坏跨平台错误语义一致性（RFC-10）。
+/// `AlreadyExists`，破坏跨平台错误语义一致性。
 ///
-/// 修复：A5 域内先归一化再转换——优先 std 已解码的 `ErrorKind`
-/// （`decode_error_kind` 在 Windows 上把常见 Win32/WSA 码解码为语义 kind，
-/// 实测 raw=80→AlreadyExists、10048→AddrInUse、10061→ConnectionRefused、
-/// 5→PermissionDenied），兜底按原生码查 `normalize_windows_errno` 映射表后
-/// 再经 `from_errno`。Unix 上为纯透传（raw_os_error 即 POSIX errno），
-/// 行为与冻结面 `From<io::Error>` 完全一致。
-#[cfg(windows)]
+/// 缺口 2（JD-1，macOS/BSD）：`raw_os_error()` 的 Darwin 码与 Linux 不同
+/// （EAGAIN=35/ETIMEDOUT=60/ECONNRESET=54/ECONNREFUSED=61/EADDRINUSE=48/
+/// EADDRNOTAVAIL=49；Linux 为 11/110/104/111/98/99），纯透传使 WouldBlock/
+/// TimedOut/ConnectionReset/ConnectionRefused 在 macOS 上退化为 Other(n)。
+///
+/// 修复：统一为 **kind-first**——std 的 `decode_error_kind` 在各平台用平台
+/// 自身 errno 常量解码 `ErrorKind`（Linux EAGAIN=11、macOS EAGAIN=35、
+/// Windows WSAEWOULDBLOCK=10035 均解码为 WouldBlock），kind → POSIX errno
+/// 映射天然跨平台正确且不受码值漂移影响。kind 无法归类时 fallback 到
+/// `raw_os_error`：Windows 上 std 已解码的常见 Win32/WSA 码均经 kind 臂命中
+/// （含 WSAECONNABORTED=10053 → ConnectionAborted），未命中码直接透传
+/// （Other(raw)）；Unix 上 raw 即 POSIX errno，透传语义与冻结面
+/// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
+/// （JD-3：其全部条目已被 kind 臂覆盖）。
 fn to_sys_err(e: std::io::Error) -> SysError {
-    // ErrorKind 优先：std 的 decode_error_kind 已覆盖常见 Win32/WSA 码，
-    // 语义映射不受码值漂移影响（比手写码表更稳健）。
+    // ErrorKind 优先：语义映射不受平台码值漂移影响（比手写平台码表更稳健）。
     let kind_errno = match e.kind() {
         std::io::ErrorKind::NotFound => Some(2),
         std::io::ErrorKind::PermissionDenied => Some(13),
@@ -71,11 +77,17 @@ fn to_sys_err(e: std::io::Error) -> SysError {
         std::io::ErrorKind::Interrupted => Some(4),
         std::io::ErrorKind::TimedOut => Some(110),
         std::io::ErrorKind::ConnectionReset => Some(104),
+        // JD-2：Windows WSAECONNABORTED=10053 的 kind=ConnectionAborted
+        // （JD-3 核实：唯一真实到达原码表的条目）→ ECONNABORTED。
+        std::io::ErrorKind::ConnectionAborted => Some(103),
         std::io::ErrorKind::ConnectionRefused => Some(111),
         std::io::ErrorKind::BrokenPipe => Some(32),
         std::io::ErrorKind::StorageFull => Some(28),
         std::io::ErrorKind::InvalidInput => Some(22),
         std::io::ErrorKind::AlreadyExists => Some(17),
+        // JD-2：Windows ERROR_NOT_SAME_DEVICE=17 的 kind=CrossesDevices；
+        // 缺臂会落 raw 路径 → from_errno(17)=AlreadyExists（撞码错映射）。
+        std::io::ErrorKind::CrossesDevices => Some(18),
         std::io::ErrorKind::NotADirectory => Some(20),
         std::io::ErrorKind::IsADirectory => Some(21),
         // EADDRINUSE/EADDRNOTAVAIL 不在 14 错误集（pdr.md §10.1）→ 映射到
@@ -89,35 +101,12 @@ fn to_sys_err(e: std::io::Error) -> SysError {
         return SysError::from_errno(errno);
     }
     match e.raw_os_error() {
-        Some(raw) => SysError::from_errno(normalize_windows_errno(raw)),
+        // kind 未命中：Windows 上 std 未解码的码透传为 Other(raw)（JD-3：
+        // 码表删除后，std 已解码码均经 kind 臂命中）；Unix 上 raw 即
+        // POSIX errno，透传与冻结面 From<io::Error> 一致。
+        Some(raw) => SysError::from_errno(raw),
         None => SysError::Other(0),
     }
-}
-
-/// Windows 原生错误码 → POSIX errno（RFC-10 映射表；ErrorKind 未覆盖时的兜底）。
-#[cfg(windows)]
-fn normalize_windows_errno(raw: i32) -> i32 {
-    match raw {
-        // Win32（winerror.h）
-        2 | 3 => 2,     // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND → ENOENT
-        5 => 13,        // ERROR_ACCESS_DENIED → EACCES
-        80 | 183 => 17, // ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS → EEXIST
-        // WSA（winsock2.h）
-        10035 => 11,  // WSAEWOULDBLOCK → EAGAIN
-        10048 => 98,  // WSAEADDRINUSE → EADDRINUSE
-        10049 => 99,  // WSAEADDRNOTAVAIL → EADDRNOTAVAIL
-        10053 => 103, // WSAECONNABORTED → ECONNABORTED
-        10054 => 104, // WSAECONNRESET → ECONNRESET
-        10060 => 110, // WSAETIMEDOUT → ETIMEDOUT
-        10061 => 111, // WSAECONNREFUSED → ECONNREFUSED
-        _ => raw,
-    }
-}
-
-#[cfg(not(windows))]
-fn to_sys_err(e: std::io::Error) -> SysError {
-    // Unix：raw_os_error 即 POSIX errno，冻结面 from_errno 直接正确（透传）。
-    SysError::from(e)
 }
 
 /// 持锁 guard 的停车位：undo（recover 路径）与显式 `MutexUnlock` 均可取走释放，幂等。
@@ -526,7 +515,9 @@ impl TokioExecutor {
         mode: u32,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(to_sys_err)?;
         // undo=None：恢复需原权限快照；补偿挂钩由用户提供（RFC-05）。
         Ok((Value::Unit, None))
     }
@@ -548,8 +539,9 @@ impl TokioExecutor {
         uid: u32,
         gid: u32,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        // 同步系统调用（快速路径，无阻塞风险）。
-        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(SysError::from)?;
+        // 同步系统调用（快速路径，无阻塞风险）。JD-5：补接统一入口 `to_sys_err`
+        // （Linux 行为不变：raw 即 POSIX errno；macOS Darwin 码经 kind-first 归一）。
+        std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(to_sys_err)?;
         // undo=None：恢复需原 uid/gid 快照；补偿挂钩由用户提供（RFC-05）。
         Ok((Value::Unit, None))
     }
@@ -1588,23 +1580,68 @@ mod tests {
         );
     }
 
-    /// RFC-10：`normalize_windows_errno` 原始码映射表（ErrorKind 未覆盖时的
-    /// 兜底路径，直接测码表本身）。
-    #[cfg(windows)]
+    /// JD-1：macOS/BSD Darwin errno → POSIX 语义（kind-first 修复回归）。
+    /// `from_raw_os_error` 构造 Darwin 码，std 用 Darwin 常量解码为语义 kind
+    /// （EAGAIN=35→WouldBlock、ETIMEDOUT=60→TimedOut 等），kind-first 映射回
+    /// POSIX errno 得具名变体；修复前 not(windows) 分支纯透传 Darwin 码 →
+    /// WouldBlock/TimedOut/ConnectionReset/ConnectionRefused 全部退化为
+    /// Other(n)。本机 Windows 无法执行，但编译必须过（cfg(target_os = "macos")）。
+    #[cfg(target_os = "macos")]
     #[test]
-    fn normalize_windows_errno_mapping_table() {
-        assert_eq!(normalize_windows_errno(80), 17);
-        assert_eq!(normalize_windows_errno(183), 17);
-        assert_eq!(normalize_windows_errno(5), 13);
-        assert_eq!(normalize_windows_errno(2), 2);
-        assert_eq!(normalize_windows_errno(3), 2);
-        assert_eq!(normalize_windows_errno(10035), 11);
-        assert_eq!(normalize_windows_errno(10048), 98);
-        assert_eq!(normalize_windows_errno(10049), 99);
-        assert_eq!(normalize_windows_errno(10053), 103);
-        assert_eq!(normalize_windows_errno(10054), 104);
-        assert_eq!(normalize_windows_errno(10060), 110);
-        assert_eq!(normalize_windows_errno(10061), 111);
-        assert_eq!(normalize_windows_errno(9999), 9999, "未映射码透传");
+    fn to_sys_err_maps_darwin_codes_to_posix_semantics() {
+        use std::io::Error;
+        // Darwin errno（sys/errno.h）与 Linux 数值不同（Linux 为 11/110/104/111/98/99）。
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(35)),
+            SysError::WouldBlock,
+            "Darwin EAGAIN(35) → WouldBlock"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(60)),
+            SysError::TimedOut,
+            "Darwin ETIMEDOUT(60) → TimedOut"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(54)),
+            SysError::ConnectionReset,
+            "Darwin ECONNRESET(54) → ConnectionReset"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(61)),
+            SysError::ConnectionRefused,
+            "Darwin ECONNREFUSED(61) → ConnectionRefused"
+        );
+        // 14 错误集无 AddrInUse/AddrNotAvailable 变体 → Other(98)/Other(99)
+        // （与 Linux 上 bind 冲突的真实 errno 一致，跨平台可移植性目标）。
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(48)),
+            SysError::Other(98),
+            "Darwin EADDRINUSE(48) → Other(98)"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(49)),
+            SysError::Other(99),
+            "Darwin EADDRNOTAVAIL(49) → Other(99)"
+        );
+    }
+
+    /// JD-2：CrossesDevices 臂回归——Windows ERROR_NOT_SAME_DEVICE=17 与
+    /// Unix EXDEV=18 的 kind 均为 CrossesDevices，必须经 kind 臂映射到
+    /// EXDEV(18) → `SysError::CrossDevice`。修复前（缺臂）：Windows 落 raw
+    /// 路径 → from_errno(17)=AlreadyExists（撞码错映射）；Unix 透传 18 恰好
+    /// 正确（未被发现）。注意：`from_errno(18)` 在 14 错误集内（CrossDevice
+    /// 变体，error.rs 冻结面），非 Other(18)。
+    #[test]
+    fn to_sys_err_maps_crosses_devices() {
+        use std::io::Error;
+        #[cfg(windows)]
+        let e = Error::from_raw_os_error(17); // ERROR_NOT_SAME_DEVICE
+        #[cfg(not(windows))]
+        let e = Error::from_raw_os_error(18); // EXDEV
+        assert_eq!(
+            to_sys_err(e),
+            SysError::CrossDevice,
+            "kind=CrossesDevices → EXDEV(18) → CrossDevice（非 AlreadyExists）"
+        );
     }
 }

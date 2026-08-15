@@ -116,11 +116,14 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   §10 登记 RFC-09（Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover，可恢复；
   R3c 风暴实测 240/240 轮超时、undo_len=1，修复方向=取消传播协议，阶段 3+）
   与 LOW（arbiter 重试退避在 executor 锁内 → 争用风暴下全分支串行化放大）。
-- s11/rfc10：RFC-10 修复（A5 执行器层 Windows 错误码归一化，executor.rs 冻结面外）
-  ——`to_sys_err` + `#[cfg(windows)] normalize_windows_errno` 将 Win32/WSA 原生码
-  映射到 POSIX errno（ErrorKind 优先 + 码表兜底；Unix 纯透传），全部物理 IO 错误
-  转换点接入；新增 `tests/rfc10_windows_errno.rs`（跨平台真实路径，UDP 面原「未测」
-  补齐），`adversarial_r4b.rs` 两处 Windows 容忍断言收紧为无条件 `AlreadyExists`；
+- s11/rfc10：RFC-10 修复（A5 执行器层错误码归一化，executor.rs 冻结面外）
+  ——`to_sys_err` 统一 kind-first（ErrorKind → POSIX errno，windows / not(windows)
+  两分支合并；原 Win32/WSA 手写码表删除，JD-3），补齐 CrossesDevices /
+  ConnectionAborted 臂（JD-2）、macOS/BSD Darwin 码语义（JD-1）、op_chmod /
+  op_chown 接入点（JD-5），全部物理 IO 错误转换点接入；新增
+  `tests/rfc10_windows_errno.rs`（跨平台真实路径，UDP 面原「未测」补齐）与
+  executor.rs 单测（Windows 码 / CrossDevice / macOS Darwin 码），
+  `adversarial_r4b.rs` 两处 Windows 容忍断言收紧为无条件 `AlreadyExists`；
   §10 RFC-10 登记段更新为已修复。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
@@ -447,30 +450,57 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 **已修复（A5 执行器层归一化，executor.rs，冻结面外）**：error.rs 属冻结面（契约
 contracts.md），按修复方向二在 `TokioExecutor` 域内新增统一转换入口 `to_sys_err`
-（io::Error → SysError）与 `#[cfg(windows)] normalize_windows_errno`（Win32/WSA 码 →
-POSIX errno 映射表：ERROR_FILE_EXISTS=80 / ERROR_ALREADY_EXISTS=183→EEXIST=17、
-ERROR_ACCESS_DENIED=5→EACCES=13、ERROR_FILE_NOT_FOUND=2 / ERROR_PATH_NOT_FOUND=3→ENOENT=2、
-WSAEADDRINUSE=10048→EADDRINUSE=98、WSAECONNREFUSED=10061→ECONNREFUSED=111、
-WSAECONNRESET=10054→ECONNRESET=104、WSAETIMEDOUT=10060→ETIMEDOUT=110、
-WSAEWOULDBLOCK=10035→EAGAIN=11 等）。策略：优先 std 已解码的 `ErrorKind`
-（`decode_error_kind` 在 Windows 上已将上述码解码为语义 kind，实测 raw=80→
-AlreadyExists、10048→AddrInUse、10061→ConnectionRefused），兜底经码表归一化后再走
-`from_errno`；Unix 上纯透传（行为与冻结面 `From<io::Error>` 完全一致）。全部物理 IO
-错误转换点（op_open/op_read/op_write/op_seek/op_stat/op_truncate/op_unlink/
-op_rename/op_mkdir/op_rmdir/op_read_dir/op_tcp_bind/op_tcp_accept/op_tcp_connect/
-op_tcp_read/op_tcp_write/op_tcp_shutdown/op_udp_bind/op_udp_recv_from/op_udp_send_to/
-op_spawn/op_wait/op_kill/op_mmap/op_send_file）已接入。修复后：create_new 撞已存在 →
-`AlreadyExists`、UDP 端口占用 → `Other(98)`（EADDRINUSE，14 错误集无 AddrInUse 变体，
-与 Unix 真实 errno 一致）、TCP 连接被拒 → `ConnectionRefused`，跨平台一致。
+（io::Error → SysError）。策略统一为 **kind-first**（windows / not(windows) 两分支
+合并）：优先 std 已解码的 `ErrorKind`——`decode_error_kind` 在各平台用平台自身
+errno 常量解码（Windows 上 raw=80→AlreadyExists、10048→AddrInUse、10061→
+ConnectionRefused、5→PermissionDenied；macOS 上 Darwin EAGAIN=35→WouldBlock、
+ETIMEDOUT=60→TimedOut 等）——kind → POSIX errno（14 错误集对应数值）后经
+`from_errno`。kind 无法归类时 fallback 到 `raw_os_error` 直接透传（Windows 上
+std 未解码的 Win32/WSA 码为 Other(raw)，Unix 上 raw 即 POSIX errno）。
+
+**JD-1（macOS/BSD）**：not(windows) 分支原为纯透传 `SysError::from`——`from_errno`
+只认 Linux errno 数值，而 Darwin 码不同（EAGAIN=35、ETIMEDOUT=60、ECONNRESET=54、
+ECONNREFUSED=61、EADDRINUSE=48、EADDRNOTAVAIL=49；Linux 为 11/110/104/111/98/99）
+→ macOS 上 WouldBlock/TimedOut/ConnectionReset/ConnectionRefused 全退化为
+Other(n)。kind-first 由 std 用平台自身常量解码，天然跨平台正确。
+
+**JD-2（CrossesDevices 静默错映射）**：kind 臂补齐 `CrossesDevices => 18`（EXDEV）
+与 `ConnectionAborted => 103`（ECONNABORTED）。缺臂时 Windows
+ERROR_NOT_SAME_DEVICE=17（kind=CrossesDevices）落 raw 路径 → from_errno(17)=
+AlreadyExists（撞码错映射）；WSAECONNABORTED=10053 是唯一真实到达原码表的码。
+
+**JD-3（死代码清除）**：原手写 `normalize_windows_errno` 码表删除——std
+`decode_error_kind` 已解码 2/3/5/80/183/10035/10048/10049/10054/10060/10061，
+码表仅 10053 真实到达（现由 ConnectionAborted 臂覆盖）；Windows 分支 raw fallback
+保留但只透传。
+
+**JD-5（接入点遗漏）**：`op_chmod`（set_permissions await）与 `op_chown`
+（map_err(SysError::from)）两处 `#[cfg(unix)]` 补接 `to_sys_err`（Linux 行为不变，
+macOS 变正确）。
+
+全部物理 IO 错误转换点（op_open/op_read/op_write/op_seek/op_stat/op_truncate/
+op_unlink/op_rename/op_mkdir/op_rmdir/op_read_dir/op_tcp_bind/op_tcp_accept/
+op_tcp_connect/op_tcp_read/op_tcp_write/op_tcp_shutdown/op_udp_bind/
+op_udp_recv_from/op_udp_send_to/op_spawn/op_wait/op_kill/op_mmap/op_send_file/
+op_chmod/op_chown）已接入。修复后：create_new 撞已存在 → `AlreadyExists`、UDP
+端口占用 → `Other(98)`（EADDRINUSE，14 错误集无 AddrInUse 变体，与 Unix 真实
+errno 一致）、TCP 连接被拒 → `ConnectionRefused`、macOS WouldBlock/TimedOut/
+ConnectionReset/ConnectionRefused 具名变体、CrossesDevices → `CrossDevice`（非
+AlreadyExists），跨平台一致。
 
 **测试证据**：
 - 新增 `crates/algeff-std/tests/rfc10_windows_errno.rs`（跨平台真实路径）：
   `create_new_existing_maps_to_already_exists`、
   `udp_bind_port_in_use_maps_to_eaddr_inuse`（UDP 面原「未测」已补齐断言）、
   `tcp_connect_refused_maps_to_connection_refused`；
-- `executor.rs` 单测（`#[cfg(windows)]`）：`to_sys_err_maps_windows_codes_to_posix_semantics`
-  （`from_raw_os_error(80/183/5/2/10048/10061/10054/10060)` 构造模拟，本机 Windows 真实执行）、
-  `normalize_windows_errno_mapping_table`（码表直测，含未映射码透传）；
+- `executor.rs` 单测：`to_sys_err_maps_windows_codes_to_posix_semantics`
+  （`#[cfg(windows)]`，`from_raw_os_error(80/183/5/2/10048/10061/10054/10060)`
+  构造模拟，本机 Windows 真实执行）、`to_sys_err_maps_crosses_devices`
+  （跨平台：Windows ERROR_NOT_SAME_DEVICE=17 / Unix EXDEV=18 → `CrossDevice`，
+  JD-2 回归）、`to_sys_err_maps_darwin_codes_to_posix_semantics`
+  （`#[cfg(target_os = "macos")]`，`from_raw_os_error(35/60/54/61/48/49)` 构造
+  Darwin 码断言 kind-first 映射，JD-1 回归；本机 Windows 无法执行，编译通过）；
+  `normalize_windows_errno_mapping_table` 随码表删除（JD-3）；
 - 收紧断言：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison` 与
   `open_flags_8_combination_matrix_real_files`（(7) 用例）由「Windows 容忍 Other(80)」
   改为无条件断言 `AlreadyExists`（Linux 上 create_new 撞存在文件本就直接 EEXIST，
