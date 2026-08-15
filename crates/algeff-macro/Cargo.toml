@@ -2,7 +2,8 @@
 name = "algeff-macro"
 version.workspace = true
 edition.workspace = true
-description = "Algeff 可选语法糖宏（plan!/fork!/scope!/choose!），仅 AST 构造，不参与类型系统"
+license.workspace = true
+description = "Algeff 可选语法糖宏（plan!/fork!/scope!/choose!/do_!），仅 AST 构造，不参与类型系统"
 
 [lib]
 proc-macro = true
@@ -14,5 +15,6 @@ syn = { version = "2", features = ["full"] }
 
 [dev-dependencies]
 algeff-core = { path = "../algeff-core" }
+algeff-std = { path = "../algeff-std" }
 # A4 批4 授权：执行级集成测试需本地 tokio runtime 驱动 interpret（宏测试专属 dev-dep）
 tokio.workspace = true

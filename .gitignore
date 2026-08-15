@@ -3,3 +3,4 @@
 .pi/
 .pi-subagents/
 *.proptest-regressions
+target-r7

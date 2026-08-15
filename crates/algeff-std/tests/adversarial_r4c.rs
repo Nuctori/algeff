@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use algeff_core::{
     Action, DataOp, OpenFlags, ReadOnly, ResourceHandle, ResourceInner, ResourceUsage, Runtime,
-    TypedResource, Value, WriteOnly,
+    SysError, TypedResource, Value, WriteOnly,
 };
 use algeff_std::TokioExecutor;
 
@@ -200,19 +200,41 @@ fn undo_full_strategy_sub_1mb_write_fully_restored_by_replace() {
     assert_eq!(after.len(), orig.len(), "Full 撤销恢复文件长度");
     assert_eq!(after, orig, "Full 撤销恢复写前内容（A6 双态 w;w̄=1）");
 
-    // 游标复原：undo 将游标 seek 回写前位置（pos=0），故不带 Seek 的 Read
-    // 应读到原内容头 4 字节（RFC-05：reg.clear 后 executor 文件映射仍可寻址）。
-    let head = rt
+    // RFC-05：Replace = recover + reg.clear()，旧 fd 随之失效（registry 活性
+    // 唯一真相）——游标复原维度改由 recover() 路径观察（rev_undo_restores_
+    // file_cursor），此处断言旧 fd 任何操作 NotFound（fd 状态同样恢复至执行前
+    // ——执行前该 fd 不存在，与内容/长度同属 A6 双态）。
+    let e = rt
         .run_blocking(syscall(
             DataOp::Read { fd, len: 4 },
             vec![rd(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "Replace 后旧 fd Read 应 NotFound");
+    // 世界恢复至执行前：同路径重开新 fd 从 pos=0 读到原内容。
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: path.clone(),
+                flags: read_only_flags(),
+            },
+            vec![rd_path(path.clone())],
+            Action::Pure,
+        ))
+        .unwrap();
+    let fd2 = fd_of(&v);
+    let head = rt
+        .run_blocking(syscall(
+            DataOp::Read { fd: fd2, len: 4 },
+            vec![rd(fd2)],
             Action::Pure,
         ))
         .unwrap();
     assert_eq!(
         head,
         Value::Bytes(orig[0..4].to_vec()),
-        "Full 撤销后游标恢复写前位置（从 pos=0 读到原内容）"
+        "重开新 fd 从 pos=0 读到原内容（Full 撤销已恢复）"
     );
 }
 
@@ -441,10 +463,10 @@ fn fork_16_way_parallel_all_leaves_disjoint_merge_value_fidelity() {
 // ══════════════════════════════════════════════════════════════════════
 // 攻击面 3b：连续 100 个顺序并行 Fork（每轮左右分支各开 1 文件，资源不相交
 // → 并行路径 → 每轮右分支消耗 1 个全局区间序号）。断言：200 个 fd 全不碰撞
-// （区间互斥）、区间序号（(rfd-lfd)>>48）严格单调、fd 严格递增、末轮读回
-// 正确。RFC-06 边界：右分支分配型连续 Fork 使 next_fd 二次增长（每轮 +k·2^48），
-// 100 轮累计 ≈ 2^60 ≪ 2^64，远低于 ~362 轮 u64 溢出阈值——本测试在安全区
-// 内验证正确性，仅记录增长量级（溢出偏差已由 R2 记录）。
+// （区间互斥）、右分支区间序号（rfd>>48）严格单调、fd 严格递增、末轮读回
+// 正确。RFC-06（已修复）：右分支分配型连续 Fork 经 merge 锚点吸收后父 next_fd
+// 线性增长（每轮 +2^48，100 轮 ≈ 2^56 ≪ 2^64）；修复前 Σk·2^48 二次增长，
+// ~362 轮 u64 溢出（R2 记录，已修；确定性回归门见 resource.rs 单测）。
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -476,9 +498,14 @@ fn fork_100_sequential_rounds_region_monotonic_no_collision() {
 
         assert!(seen.insert(lfd), "第 {i} 轮左 fd 碰撞: {lfd}");
         assert!(seen.insert(rfd), "第 {i} 轮右 fd 碰撞: {rfd}");
-        // 右分支区间偏移 = (rfd - lfd)（右分支在 k<<48 区间分配恰 1 个 fd）。
-        let k = (rfd - lfd) >> 48;
-        assert_eq!((rfd - lfd) & ((1u64 << 48) - 1), 0, "第 {i} 轮区间对齐");
+        // 右分支 fd 落在锚定根基线的全局唯一区间起点（k<<48 对齐，RFC-06
+        // 修复后右分支偏移锚定根基线，而非被抬高的父 next_fd）。
+        assert_eq!(
+            rfd & ((1u64 << 48) - 1),
+            0,
+            "第 {i} 轮右分支 fd 应区间对齐（RFC-06 锚定根基线）"
+        );
+        let k = rfd >> 48;
         if let Some(pk) = prev_k {
             assert!(
                 k > pk,
@@ -504,17 +531,16 @@ fn fork_100_sequential_rounds_region_monotonic_no_collision() {
     assert_eq!(read_back(&mut rt, lfd, 4), b"L099", "末轮左 fd 读回");
     assert_eq!(read_back(&mut rt, rfd, 4), b"R099", "末轮右 fd 读回");
 
-    // RFC-06 量级记录：右分支分配型连续 Fork 使 next_fd 二次增长（每轮 +k·2^48），
-    // 100 轮累计 ≥ Σk·2^48 ≈ 2^60（实际分配仅 200 个 fd）。远低于 2^64 溢出
-    // 阈值（~362 轮）——本测试在安全区；溢出偏差见 R2 记录。
+    // RFC-06（已修复）量级验证：右分支分配型连续 Fork 经 merge 锚点吸收后，
+    // 父 next_fd 线性增长（每轮 +2^48 区间一跳，100 轮 ≈ 2^56），远低于 u64
+    // 溢出阈值；修复前 Σk·2^48 二次增长，~362 轮即溢出（R2 记录，已修）。
     let n = rt
         .registry()
         .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(
-        n < (1u64 << 63),
-        "100 轮后 next_fd 应仍远离 u64 溢出（RFC-06 边界内），实测 {n}"
+        n < (1u64 << 62),
+        "100 轮后 next_fd 应保持线性量级（< 2^62），实测 {n}"
     );
-    eprintln!("R4C RFC-06 量级记录：100 轮后 next_fd 已升至 {n}（实际仅 201 个分配）");
 }
 
 // ══════════════════════════════════════════════════════════════════════

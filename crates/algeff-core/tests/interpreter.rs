@@ -90,7 +90,7 @@ fn describe(op: &DataOp) -> String {
         DataOp::Open { path, .. } => format!("open:{}", path.display()),
         DataOp::Write { fd, .. } => format!("write:{fd}"),
         DataOp::Read { fd, len } => format!("read:{fd}:{len}"),
-        DataOp::GetTime => "gettime".to_string(),
+        DataOp::Close { fd: 999 } => "Close { fd: 999 }".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -193,11 +193,11 @@ fn sequential_value_flow() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(21)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(21)));
 
     // current 产生 21 → next 变换为 42
     let action = Action::Sequential {
-        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(|v| match v {
             Value::U64(n) => Action::Pure(Value::U64(n * 2)),
             _ => Action::Pure(Value::Unit),
@@ -205,7 +205,7 @@ fn sequential_value_flow() {
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(42)));
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 // ── 3. Choose 分支选择 ───────────────────────────────────────────────
@@ -216,18 +216,18 @@ fn choose_picks_then_branch() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
     ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
     // cur 初始为 Unit → cond 成立 → then 分支
     let action = Action::Choose {
         cond: Box::new(|cur| matches!(cur, Value::Unit)),
-        then_branch: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        then_branch: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         else_branch: Box::new(syscall_step(DataOp::Read { fd: 7, len: 4 }, vec![])),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(5)));
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 #[test]
@@ -236,12 +236,12 @@ fn choose_picks_else_branch() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
     ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
     let action = Action::Choose {
         cond: Box::new(|_| false),
-        then_branch: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        then_branch: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         else_branch: Box::new(syscall_step(DataOp::Read { fd: 7, len: 4 }, vec![])),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
@@ -332,17 +332,17 @@ fn scope_restores_cwd() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(7)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(7)));
 
     let action = Action::Scope {
         base: PathBuf::from("sub/dir"),
-        inner: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        inner: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(Action::Pure),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(7)));
     assert_eq!(ctx.cwd, PathBuf::from("/app")); // 恢复原 cwd
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 #[test]
@@ -352,11 +352,11 @@ fn scope_restores_cwd_on_error() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Err(SysError::NotFound));
+    ex.respond("Close { fd: 999 }", MockOutcome::Err(SysError::NotFound));
 
     let action = Action::Scope {
         base: PathBuf::from("sub"),
-        inner: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        inner: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(Action::Pure),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
@@ -420,13 +420,13 @@ fn timeout_fires_on_timeout() {
     ex.delay = Duration::from_millis(100); // 慢执行
 
     let action = Action::Timeout {
-        action: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         duration: Duration::from_millis(10),
         on_timeout: Box::new(Action::Pure(Value::U64(99))),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(99))); // 超时 → on_timeout 结果
-    assert_eq!(ex.ops(), vec!["gettime"]); // 慢 op 已启动后被取消
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]); // 慢 op 已启动后被取消
 }
 
 // ── 9. Catch：错误处理 ───────────────────────────────────────────────
@@ -437,12 +437,12 @@ fn catch_error_invokes_handler() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Err(SysError::NotFound));
+    ex.respond("Close { fd: 999 }", MockOutcome::Err(SysError::NotFound));
     let handled = Arc::new(Mutex::new(false));
     let handled2 = Arc::clone(&handled);
 
     let action = Action::Catch {
-        action: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         handler: Box::new(move |e| {
             *handled2.lock().unwrap() = true;
             Action::Pure(Value::Str(format!("handled:{e}")))
@@ -459,12 +459,12 @@ fn catch_passthrough_on_ok() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(1)));
     let handled = Arc::new(Mutex::new(false));
     let handled2 = Arc::clone(&handled);
 
     let action = Action::Catch {
-        action: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         handler: Box::new(move |_e| {
             *handled2.lock().unwrap() = true;
             Action::Pure(Value::Unit)
@@ -484,12 +484,12 @@ fn replace_recovers_undo_stack() {
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
     ex.with_undo = true;
-    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(1)));
     ex.respond("read:2:4", MockOutcome::Value(Value::U64(2)));
 
     // 两个 Syscall 累积 undo → Replace{ target }
     let action = Action::Sequential {
-        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(|_| Action::Sequential {
             current: Box::new(syscall_step(DataOp::Read { fd: 2, len: 4 }, vec![])),
             next: Box::new(|_| Action::Replace {
@@ -501,7 +501,7 @@ fn replace_recovers_undo_stack() {
     assert_eq!(v, Ok(Value::U64(55))); // target 结果（不回原流）
     assert_eq!(
         ex.undo_ops(),
-        vec!["undo(read:2:4)", "undo(gettime)"] // recover：LIFO
+        vec!["undo(read:2:4)", "undo(Close { fd: 999 })"] // recover：LIFO
     );
     assert!(undo.is_empty()); // 撤销栈已清空
 }
@@ -517,7 +517,7 @@ fn undo_stack_lifo_order() {
     ex.with_undo = true;
 
     let action = Action::Sequential {
-        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(|_| Action::Sequential {
             current: Box::new(syscall_step(DataOp::Read { fd: 2, len: 4 }, vec![])),
             next: Box::new(|_| Action::Pure(Value::Unit)),
@@ -530,7 +530,10 @@ fn undo_stack_lifo_order() {
         v
     });
     assert_eq!(v, Ok(Value::Unit));
-    assert_eq!(ex.undo_ops(), vec!["undo(read:2:4)", "undo(gettime)"]);
+    assert_eq!(
+        ex.undo_ops(),
+        vec!["undo(read:2:4)", "undo(Close { fd: 999 })"]
+    );
     assert!(undo.is_empty());
 }
 
@@ -583,7 +586,7 @@ fn scope_nested_cwd_join_and_restore() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(7)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(7)));
 
     // 拼接语义：外层 base "a" → cwd /app/a；内层 base "b" 在 /app/a 上再拼 → /app/a/b。
     // （与解释器内部同源的 canonicalize 语义，先行断言期望拼接结果）
@@ -597,7 +600,7 @@ fn scope_nested_cwd_join_and_restore() {
         base: PathBuf::from("a"),
         inner: Box::new(Action::Scope {
             base: PathBuf::from("b"),
-            inner: Box::new(syscall_step(DataOp::GetTime, vec![])),
+            inner: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             next: Box::new(Action::Pure),
         }),
         next: Box::new(Action::Pure),
@@ -605,7 +608,7 @@ fn scope_nested_cwd_join_and_restore() {
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(7))); // 内层 syscall 正常执行并透传
     assert_eq!(ctx.cwd, PathBuf::from("/app")); // 逐层恢复回原 cwd
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 #[test]
@@ -619,7 +622,7 @@ fn timeout_nested_inner_fires_first() {
     // 内层 20ms 先超时 → 1；外层 500ms 不触发 → 整体返回内层 on_timeout 结果
     let action = Action::Timeout {
         action: Box::new(Action::Timeout {
-            action: Box::new(syscall_step(DataOp::GetTime, vec![])),
+            action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             duration: Duration::from_millis(20),
             on_timeout: Box::new(Action::Pure(Value::U64(1))),
         }),
@@ -628,7 +631,7 @@ fn timeout_nested_inner_fires_first() {
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(1))); // 内层超时优先
-    assert_eq!(ex.ops(), vec!["gettime"]); // 慢 op 已启动后被内层取消
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]); // 慢 op 已启动后被内层取消
 }
 
 #[test]
@@ -642,7 +645,7 @@ fn timeout_nested_outer_fires_first() {
     // 内层 200ms 尚未超时，外层 50ms 先触发 → 2（外层 on_timeout，内层整体被取消）
     let action = Action::Timeout {
         action: Box::new(Action::Timeout {
-            action: Box::new(syscall_step(DataOp::GetTime, vec![])),
+            action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             duration: Duration::from_millis(200),
             on_timeout: Box::new(Action::Pure(Value::U64(1))),
         }),
@@ -651,7 +654,7 @@ fn timeout_nested_outer_fires_first() {
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(2))); // 外层超时优先
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 #[test]
@@ -661,14 +664,14 @@ fn catch_after_partial_undo_keeps_stack() {
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
     ex.with_undo = true;
-    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(1)));
     ex.respond("read:2:4", MockOutcome::Err(SysError::NotFound));
 
     // gettime 成功（压入 undo）→ read 失败 → Catch handler 执行。
     // Catch 只处理错误，不得清空撤销栈：栈内容保留供后续 recover/Replace 使用。
     let action = Action::Catch {
         action: Box::new(Action::Sequential {
-            current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+            current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             next: Box::new(|_| Action::Sequential {
                 current: Box::new(syscall_step(DataOp::Read { fd: 2, len: 4 }, vec![])),
                 next: Box::new(|_| Action::Pure(Value::Unit)),
@@ -688,7 +691,7 @@ fn catch_after_partial_undo_keeps_stack() {
     assert_eq!(v, Ok(Value::U64(7)));
     // 栈仍可用：recover 按 LIFO 执行已压栈的逆操作
     drive(undo.recover());
-    assert_eq!(ex.undo_ops(), vec!["undo(gettime)"]);
+    assert_eq!(ex.undo_ops(), vec!["undo(Close { fd: 999 })"]);
     assert!(undo.is_empty());
 }
 
@@ -760,6 +763,103 @@ fn sleep_advances_virtual_clock() {
     assert_eq!(
         rt.virtual_clock().expect("virtual clock 存在").now(),
         Duration::from_secs(60)
+    );
+}
+
+/// 审计 R1 红灯根因修复（Timeout×virtual-clock 时域统一）：虚拟时钟下
+/// Timeout 以虚拟时间判定 —— 内层 Sleep(10s) 推进虚拟 10s ≥ deadline 50ms，
+/// 视为 Elapsed → 执行 on_timeout（与墙钟路径「future 在 deadline 后完成 →
+/// Elapsed」同构）。algeff-std 侧红灯 err_timeout_keeps_undo_stack_and_registry
+/// 即此语义（此前墙钟竞速虚拟 Sleep，on_timeout 永不触发）。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn timeout_virtual_clock_elapsed_fires_on_timeout() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(Action::Timeout {
+        action: Box::new(Action::Sleep {
+            duration: Duration::from_secs(10),
+            next: Box::new(Action::Pure),
+        }),
+        duration: Duration::from_millis(50),
+        on_timeout: Box::new(Action::Pure(Value::U64(42))),
+    });
+    assert_eq!(v, Ok(Value::U64(42)), "虚拟超时后执行 on_timeout");
+    assert_eq!(
+        rt.virtual_clock().expect("virtual clock 存在").now(),
+        Duration::from_secs(10),
+        "内层 Sleep 的推进保留（post-check 语义）"
+    );
+}
+
+/// 虚拟时钟下 Timeout 的防过度修复：内层在期限内完成（虚拟 10ms ≤ 50ms）→
+/// 返回 inner 结果而非 on_timeout。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn timeout_virtual_clock_within_deadline_returns_inner() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(Action::Timeout {
+        action: Box::new(Action::Sleep {
+            duration: Duration::from_millis(10),
+            next: Box::new(|_| Action::Pure(Value::U64(7))),
+        }),
+        duration: Duration::from_millis(50),
+        on_timeout: Box::new(Action::Pure(Value::U64(42))),
+    });
+    assert_eq!(v, Ok(Value::U64(7)), "期限内完成返回 inner 结果");
+}
+
+/// 虚拟时钟下 Timeout 与墙钟路径的等价性：无时间消耗的 inner（Pure）在
+/// deadline 内完成 → 返回 inner 结果；错误路径原样透传。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn timeout_virtual_clock_syscall_without_time_returns_inner() {
+    let mut ex = MockExecutor::new();
+    // inner 错误注入：Close 载体在虚拟时钟下仍走执行器（仅 GetTime 虚拟化）
+    ex.respond("Close { fd: 999 }", MockOutcome::Err(SysError::NotFound));
+    let mut rt = Runtime::new(Box::new(ex));
+    let v = rt.run_blocking(Action::Timeout {
+        action: Box::new(Action::Pure(Value::U64(5))),
+        duration: Duration::from_millis(50),
+        on_timeout: Box::new(Action::Pure(Value::U64(42))),
+    });
+    assert_eq!(v, Ok(Value::U64(5)));
+    // 错误透传：inner 直接 Err 且未消耗虚拟时间 → 返回 Err（与墙钟路径一致）
+    let v = rt.run_blocking(Action::Timeout {
+        action: Box::new(Action::Syscall {
+            op: DataOp::Close { fd: 999 },
+            resources: Default::default(),
+            next: Box::new(Action::Pure),
+        }),
+        duration: Duration::from_millis(50),
+        on_timeout: Box::new(Action::Pure(Value::U64(42))),
+    });
+    assert!(v.is_err(), "inner 错误原样透传");
+}
+
+/// 审计 R1 状态-MEDIUM-1 修复（Fork 并行分支时钟合并）：并行路径分支内的
+/// Sleep 推进量必须合并回父时钟（sum，与顺序路径「分支依次推进父时钟」
+/// 观察等价）——此前分支克隆时钟被丢弃，同一蓝图并行/顺序调度产生不同
+/// 可观察时钟。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn fork_parallel_merges_branch_virtual_clock() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(Action::Fork {
+        left: Box::new(Action::Sleep {
+            duration: Duration::from_secs(2),
+            next: Box::new(Action::Pure),
+        }),
+        right: Box::new(Action::Sleep {
+            duration: Duration::from_secs(3),
+            next: Box::new(Action::Pure),
+        }),
+        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+    });
+    assert_eq!(v, Ok(Value::Unit));
+    assert_eq!(
+        rt.virtual_clock().expect("virtual clock 存在").now(),
+        Duration::from_secs(5),
+        "并行分支 Sleep 推进量求和合并回父（与顺序路径观察等价）"
     );
 }
 
@@ -1520,7 +1620,7 @@ proptest! {
 fn replace_clears_registry() {
     let mut ex = MockExecutor::new();
     ex.with_undo = true;
-    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(1)));
 
     let undo_log = Arc::clone(&ex.undo_log);
     let mut rt = Runtime::new(Box::new(ex));
@@ -1535,7 +1635,7 @@ fn replace_clears_registry() {
         .is_ok());
 
     let action = Action::Sequential {
-        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(|_| Action::Replace {
             target: Box::new(Action::Pure(Value::U64(42))),
         }),
@@ -1544,7 +1644,7 @@ fn replace_clears_registry() {
     assert_eq!(v, Ok(Value::U64(42)), "Replace 后执行 target 的结果");
     assert_eq!(
         *undo_log.lock().unwrap(),
-        vec!["undo(gettime)".to_string()],
+        vec!["undo(Close { fd: 999 })".to_string()],
         "recover 先执行（LIFO 撤销累积逆操作）"
     );
     assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
@@ -1593,16 +1693,16 @@ fn nested_seq_chain(depth: u64) -> Action {
     }
 }
 
-/// RFC-11 a：安全深度 64 正常执行（与 R4c 固定安全深度一致，远低于守卫阈值
-/// 96 与实测崩溃边界 ~104）——守卫不误伤合法嵌套。
+/// RFC-11 a：安全深度 62 正常执行（迭代 1 复测裁决：取消传播帧膨胀后实测
+/// 80 OK / 88 崩，阈值由 96 降为 64——64 层本身触发守卫）——守卫不误伤合法嵌套。
 #[test]
 fn deep_nesting_under_limit_ok() {
     let mut rt = Runtime::new(Box::new(MockExecutor::new()));
-    let v = rt.run_blocking(nested_seq_chain(64));
+    let v = rt.run_blocking(nested_seq_chain(62));
     assert_eq!(
         v,
         Ok(Value::U64(300)),
-        "64 层嵌套应在守卫阈值（96）之下正常执行，收到 {v:?}"
+        "62 层嵌套应在守卫阈值（64）之下正常执行，收到 {v:?}"
     );
     assert!(rt.undo_stack().is_empty());
 }
@@ -1636,4 +1736,35 @@ fn deep_nesting_catchable() {
         Ok(Value::Str("handled:Other(105)".to_string())),
         "Catch 应捕获深度守卫错误并执行 handler，收到 {v:?}"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 审计 R1 契约-F7 修复：无界分配防御（分配炸弹 → 可捕获 InvalidInput）。
+//
+// `vec![0u8; len]` 在 debug 下分配失败 = 进程级 abort（handle_alloc_error
+// 不可捕获），release 下 OOM abort —— 不受信任蓝图可崩溃宿主进程（与
+// RFC-11 修复前栈溢出同族拒绝服务面）。修复：Alloc 与执行器 Read 族的 len
+// 设上界 `MAX_IO_LEN`，超限返回 `SysError::InvalidInput`（可被 Catch 捕获）。
+// ══════════════════════════════════════════════════════════════════════
+
+/// Alloc 超大 len → 返回可捕获 InvalidInput（而非 OOM abort）。
+#[test]
+fn alloc_huge_len_returns_invalid_input() {
+    let mut rt = Runtime::new(Box::new(MockExecutor::new()));
+    let v = rt.run_blocking(Action::Alloc {
+        len: usize::MAX / 4,
+        next: Box::new(Action::Pure),
+    });
+    assert_eq!(
+        v,
+        Err(SysError::InvalidInput),
+        "超上限 len 应返回可捕获错误，收到 {v:?}"
+    );
+
+    // 边界内正常分配不受影响
+    let v = rt.run_blocking(Action::Alloc {
+        len: 16,
+        next: Box::new(|v| Action::Pure(v)),
+    });
+    assert_eq!(v, Ok(Value::Bytes(vec![0u8; 16])));
 }

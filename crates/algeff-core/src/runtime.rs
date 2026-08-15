@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::action::{Action, DataOp, Id, Signal, Value};
 use crate::error::SysError;
@@ -18,6 +19,12 @@ use crate::syscall::{BoxFuture, SyscallExecutor, UndoOp};
 
 #[cfg(feature = "virtual-clock")]
 use crate::virtual_clock::VirtualClock;
+/// 单次分配/IO 长度上界（审计 R1 契约-F7 修复）：`vec![0u8; len]` 在 debug
+/// 下分配失败 = 进程级 abort（handle_alloc_error 不可捕获），release 下 OOM
+/// abort —— 不受信任蓝图可崩溃宿主进程（与 RFC-11 修复前的栈溢出同族拒绝
+/// 服务面）。取 64MB：远超真实单次 IO/分配需求，远低于危险分配量级。
+/// 超限返回 `SysError::InvalidInput`（可被外层 Catch 捕获）。
+pub const MAX_IO_LEN: usize = 64 * 1024 * 1024;
 
 /// 效果上下文 Γ（pdr.md §5.1.1）：当前状态（cwd + 环境变量）。
 ///
@@ -91,6 +98,18 @@ impl UndoStack {
     /// recoverΓ：按 LIFO 顺序执行全部逆操作（pdr.md §5.1.3）。
     pub async fn recover(&mut self) {
         while let Some(op) = self.ops.pop() {
+            op.await;
+        }
+    }
+
+    /// 回滚 `mark` 之后压入的逆操作（取消传播协议，Timeout 取消用，RFC-08/09）：
+    /// 按 LIFO 顺序执行 `ops[mark..]`（与 `recover` 同序）并把它们弹出；
+    /// `ops[..mark]` 保留——外层效果（Timeout 之前已入栈的 undo）不属于本次
+    /// 回滚范围。`mark >= len` 时为空操作（防御：无内层效果需要回滚）。
+    /// undo 可为异步 IO（决策 D4），故本方法为 async。
+    pub async fn rollback_from(&mut self, mark: usize) {
+        while self.ops.len() > mark {
+            let op = self.ops.pop().expect("len > mark 保证栈非空");
             op.await;
         }
     }
@@ -222,7 +241,9 @@ impl Runtime {
     ///   并清空撤销栈与 registry 句柄/线性标记，next_fd 保留 D1）再执行 target，
     ///   以其结果结束（D10，安全默认：资源不泄漏）；
     /// - `Scope`：cwd 词法规范化入栈，退出时（含 inner 出错）无条件恢复；
-    /// - `Timeout`：`tokio::time::timeout`，`Elapsed` 走 `on_timeout` 分支；
+    /// - `Timeout`：取消传播协议（RFC-08/09/12 残余）——超时触发时广播取消
+    ///   给并行 Fork 分支（结构化并发近似）、有界宽限等待分支 join、回滚
+    ///   inner 已入栈 undo 与新增线性标记，再执行 on_timeout；
     /// - `Catch`：仅处理错误值，不触碰撤销栈（recover 语义在 Replace/recover 路径）；
     /// - `WatchSignal`/`Invoke`：委托执行器，默认 ENOSYS（`Other(38)`）原样透传。
     ///
@@ -238,6 +259,7 @@ impl Runtime {
             &mut self.resource_registry,
             ExecAccess::Shared(self.executor.clone()),
             0,
+            None,
         )
         .await
     }
@@ -258,6 +280,7 @@ impl Runtime {
             resource_registry,
             ExecAccess::Shared(executor),
             0,
+            None,
         ))
     }
 
@@ -274,7 +297,48 @@ impl Runtime {
 /// 已可 Send，但保持最小改动，不把递归 future Send 化（Send 化留待后续）。
 type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// 递归深度守卫阈值（RFC-11 修复，A2 批 7，CTO 批准 96）。
+/// 取消传播协议（RFC-08/09/12 残余修复）的取消令牌：`watch<bool>` 接收端。
+///
+/// 每个 `Action::Timeout` 臂为 inner 子树建立一个取消域：臂持有发送端
+/// （超时触发时 `send(true)` 广播），inner 子树（含 Fork 并行分支）持有
+/// 本接收端克隆。分支在**每个 action 处理前**检查 `is_cancelled()`
+/// （结构化并发近似），`Sleep` 臂额外与 `changed()` 竞速实现可取消等待。
+///
+/// 选择 `watch` 而非 `Notify`：`changed()` 在「值自上次观察后已变更」时
+/// 立即完成——无「先 send 后注册 waiter」的丢失唤醒窗口（Notify 有）；
+/// 且发送端丢弃后接收端仍保留最后值（取消标志粘性：取消一旦广播，迟到
+/// 的分支/恢复执行的分支仍能观察到）。
+///
+/// 每个分支经 `Receiver: Clone` 获得独立接收端（各自 seen 状态，多分支
+/// 并发等待互不干扰）。
+#[derive(Clone)]
+struct CancelToken {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl CancelToken {
+    /// 是否已取消（发送端已广播 `true`）。
+    fn is_cancelled(&self) -> bool {
+        *self.rx.borrow()
+    }
+}
+
+/// 取消哨兵错误：`SysError::Other(125)`（ECANCELED=125，「操作被取消」语义）。
+/// 冻结面 `SysError` 无专用取消变体（14+Other，pdr.md §10.1），复用
+/// `Other(125)` 并在文档注明。该错误只在 Timeout 取消传播的子树内出现，
+/// 由 Timeout 臂消费（丢弃 inner 结果后执行 on_timeout），通常不逃逸到用户；
+/// 仅当用户在取消子树内显式 `Catch` 时才可观察（handler 执行一次后，下个
+/// action 仍被取消——有界）。
+const CANCELLED_ERR: SysError = SysError::Other(125);
+
+/// 取消后等待并行分支 join 的宽限（取消传播协议，RFC-08/09）：
+/// 响应取消的分支（下一 op 边界检查）应毫秒级 join；仅阻塞于不可取消 IO
+/// （如 TcpRead 无数据）的分支会耗尽宽限——此时丢弃 inner（与旧语义近似：
+/// 该分支成为孤儿，但取消标志粘性使它在 IO 完成后于下一 op 边界中止），
+/// 已入栈 undo 与线性标记仍按超时路径回滚。
+const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
+
+/// 递归深度守卫阈值（RFC-11 修复，A2 批 7，CTO 批准 96；迭代 1 复测裁决 64——取消传播帧膨胀，见 resource-notes RFC-11 段）。
 ///
 /// `run_sub_impl` → `interpret_impl` 每层递归在 debug 下消耗 ~13-20KB 栈帧
 /// （Windows 默认 2MB 测试线程栈）。**实测崩溃边界**：本机（Windows debug，
@@ -283,31 +347,161 @@ type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// 栈约 3-4 倍余量。不受信任蓝图 ~百层嵌套即可使宿主进程崩溃（拒绝服务面）。
 ///
 /// 守卫在 `interpret_impl` 递归入口检查，超限返回可捕获错误替代栈溢出。
-/// 阈值取 96：比实测边界（~104）留 ~8% 余量（帧大小随嵌套构造/编译器版本
+/// 阈值初取 96（比实测边界 ~104 留 ~8% 余量）；迭代 1 复测（取消传播帧膨胀实测 80 OK/88 崩）裁决 64。
 /// 波动，保留安全边际），且 r4c 深度 64 安全回归不受影响；统一保守取值保证
-/// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 96 帧余量更大。
+/// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 64 帧余量更大。
 ///
 /// **保证范围（文档化限制）**：守卫保证限于 **≥2MB 栈**（Rust 测试线程/tokio
-/// worker/`std::thread::spawn` 默认 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB，在
+/// worker/`std::thread::spawn` 默认 2MB）——64 帧 × ~20-23KB ≈ 1.3-1.5MB，在
 /// 2MB 栈下留有余量；若宿主在更小栈（如 1MB 主线程栈：实测崩溃边界 ~50-54 帧）
 /// 上执行深嵌套蓝图，**正确缓解**：a. 链接器 /STACK 提升主线程栈；b. 将解释器
 /// 运行在 spawn 线程（受 `RUST_MIN_STACK` 控制）；c. Catch Other(105)。注意
 /// `RUST_MIN_STACK` 只影响 `std::thread::spawn` 新线程、**不影响主线程**（审查
 /// 修正，与 spec/resource-notes.md RFC-11 一致）。否则属用户责任（阈值不随栈
-/// 尺寸动态调整，保持 96）。
-const MAX_NESTING_DEPTH: usize = 96;
+/// 尺寸动态调整，迭代 1 裁决后保持 64）。
+const MAX_NESTING_DEPTH: usize = 64;
 
 /// 深度超限错误：`SysError::Other(105)`（ENOBUFS=105，「嵌套资源耗尽」语义
 /// 近似）。无专用哨兵变体 —— `SysError` 冻结为 14+Other（pdr.md §10.1），
 /// 此处复用 Other(105) 并在文档注明。
 const NESTING_DEPTH_EXCEEDED: SysError = SysError::Other(105);
 
+/// GetTime 虚拟化辅助（审计 R1 契约-F2）：virtual-clock 下 `DataOp::GetTime`
+/// 读逻辑时钟（确定性重放承诺，pdr.md §12.1）——不达物理执行器、不推进
+/// 时钟（读取非推进）；墙钟路径恒 None。
+///
+/// 栈帧纪律：`#[inline(never)]` + Option<Value> 临时不落入解释器帧 ——
+/// RFC-11 深度守卫的嵌套边界取决于每帧栈用量（r5a 边界测试 63/64/65），
+/// 解释器帧越大边界越低；提取后 Syscall 臂只做 match 操作数调用。
+#[cfg(feature = "virtual-clock")]
+#[inline(never)]
+fn virtual_get_time(ctx: &mut Context, op: &DataOp) -> Option<Value> {
+    if matches!(op, DataOp::GetTime) && ctx.virtual_clock_mut().is_some() {
+        ctx.virtual_clock_mut()
+            .map(|vc| Value::U64(vc.now().as_millis() as u64))
+    } else {
+        None
+    }
+}
+
+/// 非 virtual-clock 构建的占位（匹配 Syscall 臂的调用点，恒 None）。
+#[cfg(not(feature = "virtual-clock"))]
+#[inline(never)]
+fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
+    None
+}
+
+/// 虚拟时钟下 `Action::Timeout` 的判定实现（审计 R1 红灯根因修复，时域统一）：
+/// **双通道判定**——墙钟通道（`tokio::time::timeout`，防御真实执行超时：慢
+/// syscall/IO）与虚拟通道（inner 完成后虚拟流逝 ≥ deadline，覆盖 Sleep 的
+/// 瞬时虚拟推进），任一超限即执行 on_timeout：
+/// - `Sleep(10s)` 内层（虚拟推进 10s ≥ 50ms）→ 虚拟通道触发（红灯
+///   `err_timeout_keeps_undo_stack_and_registry` 的场景，此前墙钟竞速虚拟
+///   Sleep 永不触发）；
+/// - 慢 syscall（墙钟 100ms > 10ms）→ 墙钟通道触发（原 `timeout_fires_on_timeout`
+///   语义，VC 下保持）；
+///   Sleep 永不触发）；
+/// - 慢 syscall（墙钟 100ms > 10ms）→ 墙钟通道触发（原 `timeout_fires_on_timeout`
+///   语义，VC 下保持）；
+/// - 瞬时完成的 inner（虚拟 0ms < deadline）→ 返回 inner 结果（错误原样透传）。
+///
+/// 注意：墙钟通道仍有取消语义（真实超时丢弃飞行中 future，RFC-12 残余缺口
+/// 仅此通道适用）；虚拟通道无「飞行中」状态、无取消。
+///
+/// 栈帧纪律：deadline/elapsed 跨 await 存活，必须放在本独立 async fn 内 ——
+/// 若内联进 `interpret_impl` 状态机，会撑大每层递归的状态机帧、压低 RFC-11
+/// 深度守卫的嵌套边界（r5a 边界测试 95/96/97 实测：内联时 95 层即栈溢出）。
+/// 返回 `LocalBoxFuture`（`Box::pin` 堆分配）：解释器状态机帧只存 8B 指针，
+/// 子状态机（含 deadline/elapsed）在堆上，不参与每层递归的栈帧预算。
+#[cfg(feature = "virtual-clock")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn run_virtual_timeout<'a>(
+    inner: Action,
+    on_timeout: Action,
+    duration: Duration,
+    ctx: &'a mut Context,
+    undo: &'a mut UndoStack,
+    reg: &'a mut ResourceRegistry,
+    access: ExecAccess<'a>,
+    depth: usize,
+    cancel: Option<&'a mut CancelToken>,
+) -> LocalBoxFuture<'a, Result<Value, SysError>> {
+    Box::pin(async move {
+        let mut access = access;
+        let mut cancel = cancel;
+        let t0 = match ctx.virtual_clock_mut() {
+            Some(vc) => vc.now(),
+            // 无时钟（理论不可达：Context::new 恒 Some）：退化为纯墙钟路径。
+            None => {
+                return run_sub_impl(
+                    inner,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await
+            }
+        };
+        let deadline = t0.saturating_add(duration);
+        match tokio::time::timeout(
+            duration,
+            run_sub_impl(
+                inner,
+                ctx,
+                undo,
+                reg,
+                access.reborrow(),
+                depth,
+                cancel.as_deref_mut(),
+            ),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                run_sub_impl(
+                    on_timeout,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await
+            }
+            Ok(r) => {
+                let elapsed = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(t0);
+                if elapsed >= deadline {
+                    run_sub_impl(
+                        on_timeout,
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await
+                } else {
+                    r
+                }
+            }
+        }
+    })
+}
 /// 递归执行子 Action（async fn 不可直接自递归，统一 `Box::pin`）。
 /// 非 Send 约束同 `LocalBoxFuture`（见上）。
 ///
 /// `depth`：当前递归深度（解释器维护的嵌套深度计数器，RFC-11 守卫载体）。
 /// 调用方传入自身深度，本函数以 `depth + 1` 进入子解释器 —— 递归入口处
 /// 深度 +1，超 `MAX_NESTING_DEPTH` 时 `interpret_impl` 返回可捕获错误。
+///
+/// `cancel`：取消传播协议（RFC-08/09/12 残余）的取消令牌（可空——非
+/// Timeout 子树为 `None`），向子解释器传递取消域。
 fn run_sub_impl<'a>(
     action: Action,
     ctx: &'a mut Context,
@@ -315,8 +509,129 @@ fn run_sub_impl<'a>(
     reg: &'a mut ResourceRegistry,
     access: ExecAccess<'a>,
     depth: usize,
+    cancel: Option<&'a mut CancelToken>,
 ) -> LocalBoxFuture<'a, Result<Value, SysError>> {
-    Box::pin(async move { interpret_impl(action, ctx, undo, reg, access, depth + 1).await })
+    Box::pin(async move { interpret_impl(action, ctx, undo, reg, access, depth + 1, cancel).await })
+}
+
+/// 可取消 Sleep（取消传播协议，RFC-08/09/12 残余）：已取消 → 立即返回
+/// （由调用方循环顶判定返回 CANCELLED_ERR）；未取消 → sleep 与取消信号竞速，
+/// 取消先到则提前醒来。`changed()` 在值自上次观察后已变更时立即完成（无
+/// 丢失唤醒窗口）；发送端丢弃时返回 Err，同样提前醒来交由循环顶判定
+/// （取消标志粘性保证正确性）。
+///
+/// **提取为独立 async fn 的原因**：`tokio::select!` 会生成大量轮询期栈
+/// 临时量；若内联在 `interpret_impl` 的 match 臂内，会放大解释器每层递归
+/// 的轮询栈帧，压缩 RFC-11 深度守卫（阈值 64，Windows 2MB 栈）的余量
+/// （实测边界从 ~104 降至 ~92 的回归）。独立函数把 select! 轮询栈隔离到
+/// 自身 coroutine，解释器轮询帧保持精简。
+async fn cancellable_sleep(duration: Duration, token: &mut CancelToken) {
+    if token.is_cancelled() {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        _ = token.rx.changed() => {}
+    }
+}
+
+/// 超时等待（取消传播协议核心，RFC-08/09/12 残余）：
+///
+/// 返回 `(是否超时, inner 结果)`：
+/// - `false`：inner 在期限内完成（效果保留，原语义）；
+/// - `true`：已广播取消并完成分支 join 宽限等待——inner 结果被丢弃，
+///   调用方负责回滚 undo 与线性标记后执行 on_timeout。
+///
+/// 超时触发流程：先广播取消（watch 令牌，并行 Fork 分支在下一 op 边界
+/// 检查并快速返回、把部分 registry/undo 合并回父），再有界宽限
+/// （`CANCEL_JOIN_GRACE`）等待 inner join——分支阻塞于不可取消 IO 时耗尽
+/// 宽限后返回 `CANCELLED_ERR`（近似同旧语义，但取消标志粘性使该分支在
+/// IO 完成后于下一 op 边界中止）。
+///
+/// **提取为独立 async fn 的原因**同 `cancellable_sleep`：隔离 `select!`
+/// 轮询栈帧，保护 RFC-11 深度守卫的栈预算。
+async fn wait_timeout<'a>(
+    mut inner: LocalBoxFuture<'a, Result<Value, SysError>>,
+    duration: Duration,
+    cancel_tx: &tokio::sync::watch::Sender<bool>,
+) -> (bool, Result<Value, SysError>) {
+    let sleep = tokio::time::sleep(duration);
+    tokio::pin!(sleep);
+    // 单次 select：两臂均直接返回（clippy never_loop 提示下不包 loop——
+    // 语义等价：inner 先完成 → 未超时；sleep 先到 → 广播取消后宽限等待）。
+    tokio::select! {
+            r = &mut inner => (false, r),
+            _ = &mut sleep => {
+                // 广播取消：并行 Fork 分支检查后快速返回（join 见下）。
+                let _ = cancel_tx.send(true);
+                // 有界宽限：等待并行分支把部分状态/undo 合并回父。
+                let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
+                tokio::pin!(grace);
+                tokio::select! {
+                    r = &mut inner => (true, r),
+                    _ = &mut grace => (true, Err(CANCELLED_ERR)),
+                }
+            }
+        }
+}
+/// 墙钟 Timeout 取消传播实现（RFC-08/09/12 残余统一修复）。
+///
+/// 独立 async fn（非解释器状态机内联）：取消协议的局部状态（watch 通道、
+/// CancelToken、线性快照）若留在 `interpret_impl` 的 match 臂内，会撑大
+/// **每层递归**的状态机帧（RFC-11 深度守卫 95/96/97 边界实测会栈溢出）——
+/// 提取后解释器帧只持一个 BoxFuture 指针。VC 路径见 `run_virtual_timeout`。
+#[allow(clippy::too_many_arguments)]
+async fn run_wall_timeout<'a>(
+    inner: Action,
+    on_timeout: Action,
+    duration: Duration,
+    ctx: &'a mut Context,
+    undo: &'a mut UndoStack,
+    reg: &'a mut ResourceRegistry,
+    mut access: ExecAccess<'a>,
+    depth: usize,
+    cancel: Option<&'a mut CancelToken>,
+) -> Result<Value, SysError> {
+    // 超时触发时不再直接丢弃 inner future（旧行为：已 spawn 的 Fork 分支
+    // 成为孤儿继续执行、持锁分支永不 Unlock、飞行中 Write 的线性标记不
+    // 回滚），而是：
+    //   a) 先广播取消（watch 令牌）——并行 Fork 分支在下一 op 边界检查并
+    //      快速返回，把部分 registry/undo 合并回父（结构化并发近似）；
+    //   b) 有界宽限（CANCEL_JOIN_GRACE）等待 inner join——分支阻塞于不可
+    //      取消 IO 时耗尽宽限后丢弃 inner（取消标志粘性使该分支在 IO 完成
+    //      后于下一 op 边界中止）；
+    //   c) 回滚 inner 已入栈 undo（`rollback_from`，异步可含 IO）——RFC-09：
+    //      持锁分支的 MutexLock undo 被立即执行，锁与仲裁占坑释放，同 id
+    //      立即可重入（不饥饿至 recover）；RFC-08：已合并回父的分支 undo
+    //      一并撤销；
+    //   d) 回滚 inner 期间新增的 A4 线性标记（`rollback_linear_to` 快照差）
+    //      ——RFC-12 残余：飞行中 Write/Own 的预插标记不残留，同路径可重试；
+    //   e) 再执行 on_timeout（原语义：inner 结果被丢弃）。
+    // 超时前完成的 inner：效果全部保留（原语义，回滚不触发）。
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut token = CancelToken { rx: cancel_rx };
+    let undo_mark = undo.len();
+    let linear_snap = reg.snapshot_linear();
+    let inner_fut = run_sub_impl(
+        inner,
+        ctx,
+        undo,
+        reg,
+        access.reborrow(),
+        depth,
+        Some(&mut token),
+    );
+    let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx).await;
+    if !timed_out {
+        // 超时前完成：inner 效果全部保留（原语义）。
+        return inner_result;
+    }
+    // 超时取消：先回滚 inner 已入栈 undo（异步，可含 IO），
+    // 再回滚 inner 新增的线性标记，最后执行 on_timeout。
+    drop(inner_result);
+    undo.rollback_from(undo_mark).await;
+    reg.rollback_linear_to(&linear_snap);
+    run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth, cancel).await
 }
 
 /// 共享执行器通道（CTO 批准方向，D14 阶段 3）：`Runtime` 内部以
@@ -465,7 +780,9 @@ pub fn fork_conflict(reg: &ResourceRegistry, left: &Action, right: &Action) -> b
 ///
 /// 上限 2^16 区间：2^16 × 2^48 = 2^64 恰满 u64 地址空间，序号不溢出；区间
 /// 基数 2^48 远超实际 fd 规模（分配数 ≪ 2^48），且 `merge` 归一化（未分配
-/// 区间游标收敛回基线）使父 `next_fd` 不被抬高。**注意（审查 LOW-2）：序号
+/// 区间游标收敛回基线）使父 `next_fd` 不被抬高；右分支**实际分配**时
+/// `merge` 锚点吸收（RFC-06 修复）使后续轮次偏移锚定根基线，父 `next_fd`
+/// 线性增长而非 Σk·2^48 二次增长。**注意（审查 LOW-2）：序号
 /// 进程级全局、永不回收**——每进程每次 Fork 右分支（含顺序路径）+1，超过
 /// 2^16-1 次即 assert panic（fail-fast 硬限制，长驻高频 Fork 进程的理论边界）。
 /// 进程级全局
@@ -537,13 +854,19 @@ async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> 
 ///
 /// 子任务错误：两分支均跑完后仍合并 registry/undo（部分效果可被外层
 /// Catch/recover 撤销），再返回错误（left 优先）。
+///
+/// 取消传播（RFC-08/09）：`cancel` 为所在 Timeout 域的取消令牌（可空）。
+/// 分支把令牌克隆进 `spawn_blocking` 闭包——取消广播后，分支在下一 op
+/// 边界检查到并快速返回（部分 registry/undo 照常合并回父，由 Timeout 臂
+/// 统一回滚），实现「分支取消时传播给并行子任务」的结构化并发近似。
 async fn run_fork_parallel(
     left: Action,
     right: Action,
-    ctx: &Context,
+    ctx: &mut Context,
     reg: &mut ResourceRegistry,
     undo: &mut UndoStack,
     shared: SharedExecutor,
+    cancel: Option<&mut CancelToken>,
 ) -> Result<(Value, Value), SysError> {
     // 子任务隔离副本（D13）与独立撤销栈。
     let mut l_ctx = ctx.clone();
@@ -557,6 +880,10 @@ async fn run_fork_parallel(
     let mut r_undo = UndoStack::new();
     let l_shared = shared.clone();
     let r_shared = shared.clone();
+    // 取消令牌克隆进分支（watch Receiver 克隆：每分支独立 seen 状态，
+    // 并发等待互不干扰；取消广播后分支在下一 op 边界快速返回）。
+    let mut l_cancel = cancel.map(|c| CancelToken::clone(c));
+    let mut r_cancel = l_cancel.clone();
 
     // R-6：分支执行器快照（锁内短临界区，O(1) Arc 克隆）。
     // - 快照成功（Some）：分支经独立通道独占驱动（物理 IO 真并行，嵌套 Fork
@@ -566,8 +893,9 @@ async fn run_fork_parallel(
     let r_access = branch_snapshot_access(&r_shared).await;
 
     // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化 —— 回退
-    // 通道；快照通道无共享锁竞争）。子任务把（结果, 隔离 registry, 独立撤销栈）
-    // 带回，供完成后合并。子任务在独立阻塞线程（`spawn_blocking`，全新栈）上
+    // 通道；快照通道无共享锁竞争）。子任务把（结果, 隔离 registry, 独立撤销栈,
+    // 隔离 ctx）带回，供完成后合并 —— ctx 带回用于虚拟时钟合并（审计 R1
+    // 状态-MEDIUM-1，见下）。子任务在独立阻塞线程（`spawn_blocking`，全新栈）上
     // 驱动 —— 深度计数器从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫
     // 按线程栈独立生效）。
     let l_task = tokio::task::spawn_blocking(move || {
@@ -578,8 +906,9 @@ async fn run_fork_parallel(
             &mut l_reg,
             l_access,
             0,
+            l_cancel.as_mut(),
         ));
-        (v, l_reg, l_undo)
+        (v, l_reg, l_undo, l_ctx)
     });
     let r_task = tokio::task::spawn_blocking(move || {
         let v = drive(interpret_impl(
@@ -589,12 +918,15 @@ async fn run_fork_parallel(
             &mut r_reg,
             r_access,
             0,
+            r_cancel.as_mut(),
         ));
-        (v, r_reg, r_undo)
+        (v, r_reg, r_undo, r_ctx)
     });
 
-    let (l_res, l_reg, l_undo) = l_task.await.expect("Fork 并行左分支任务 panic");
-    let (r_res, r_reg, r_undo) = r_task.await.expect("Fork 并行右分支任务 panic");
+    #[allow(unused_mut, unused_variables)]
+    let (l_res, l_reg, l_undo, mut l_ctx) = l_task.await.expect("Fork 并行左分支任务 panic");
+    #[allow(unused_mut, unused_variables)]
+    let (r_res, r_reg, r_undo, mut r_ctx) = r_task.await.expect("Fork 并行右分支任务 panic");
 
     // 合并回父（D13「完成后合并回父」/ RFC-A3-2）：
     // fd 不冲突（F1：右分支区间预分割 + D1 单调，子分配 ≥ 自身 next_fd
@@ -606,6 +938,22 @@ async fn run_fork_parallel(
     // undo 再弹 left 的（观察序：right 的效果后发生、先撤销）。
     undo.append(l_undo);
     undo.append(r_undo);
+    // 审计 R1 状态-MEDIUM-1 修复：并行分支的虚拟时钟推进合并回父（sum，与
+    // 顺序路径「分支依次推进父时钟」观察等价）——此前分支克隆时钟被丢弃，
+    // 同一蓝图并行/顺序两种调度产生不同可观察时钟（确定性重放支柱被破坏）。
+    #[cfg(feature = "virtual-clock")]
+    {
+        let base = ctx
+            .virtual_clock_mut()
+            .map(|vc| vc.now())
+            .unwrap_or_default();
+        let l_now = l_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        let r_now = r_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        if let Some(vc) = ctx.virtual_clock_mut() {
+            vc.advance(l_now.saturating_sub(base));
+            vc.advance(r_now.saturating_sub(base));
+        }
+    }
 
     Ok((l_res?, r_res?))
 }
@@ -631,11 +979,18 @@ async fn run_fork_parallel(
 /// - `Replace`：先 `recover()`（清空撤销栈）+ `reg.clear()`（释放 handles 与
 ///   线性标记，next_fd 保留 D1），再执行 target，以其结果结束（D10）；
 /// - `Sleep`：feature `virtual-clock` 时推进逻辑时钟（不真实等待），否则真实等待；
-/// - `Timeout`：`tokio::time::timeout`，`Elapsed` → 执行 on_timeout；
+/// - `Timeout`：取消传播协议（RFC-08/09/12 残余）——超时触发时先广播取消
+///   （watch 令牌，并行 Fork 分支在下一 op 边界检查）、有界宽限等待分支
+///   join、回滚 inner 已入栈 undo（`UndoStack::rollback_from`，异步可含 IO）、
+///   回滚 inner 新增的 A4 线性标记（`rollback_linear_to` 快照差），再执行
+///   on_timeout；超时前完成的 inner 效果全部保留（原语义）；
 /// - `Catch`：Err → handler(e)，Ok 原样返回；不触碰撤销栈（recover 语义在
-///   Replace/recover 路径）；
+///   Replace/recover 路径）；取消子树内 handler 至多执行一次（下个 action
+///   仍被取消，有界）；
 /// - `WatchSignal`/`Invoke`：委托执行器；默认执行器返回 ENOSYS
 ///   （`SysError::Other(38)`），解释器原样透传错误。
+///
+/// `cancel`：取消传播协议的取消令牌（可空——非 Timeout 子树为 `None`）。
 async fn interpret_impl(
     action: Action,
     ctx: &mut Context,
@@ -643,10 +998,11 @@ async fn interpret_impl(
     reg: &mut ResourceRegistry,
     mut access: ExecAccess<'_>,
     depth: usize,
+    mut cancel: Option<&mut CancelToken>,
 ) -> Result<Value, SysError> {
     // RFC-11 深度守卫：递归入口检查嵌套深度，超限返回可捕获错误（`Other(105)`
     // ENOBUFS 语义）替代栈溢出。阈值依据见 `MAX_NESTING_DEPTH`。守卫在
-    // **栈溢出之前**触发（阈值 96 < 实测崩溃边界 ~104），进程不 abort；错误
+    // **栈溢出之前**触发（阈值 64 < 实测崩溃边界 ~80-88），进程不 abort；错误
     // 沿调用链上抛，可被外层 Catch 捕获（拒绝服务面转为可恢复错误）。
     if depth >= MAX_NESTING_DEPTH {
         return Err(NESTING_DEPTH_EXCEEDED);
@@ -654,11 +1010,29 @@ async fn interpret_impl(
     let mut cur = Value::Unit;
     let mut action = action;
     loop {
+        // 取消传播协议（RFC-08/09/12 残余）：Timeout 取消子树内，每个 action
+        // 处理前检查取消标志（结构化并发近似）——已取消则立即返回取消哨兵
+        // 错误，由 Timeout 臂消费（回滚 + on_timeout）。已入栈 undo 与线性
+        // 标记不在此处回滚（留给 Timeout 臂按 `undo_mark`/线性快照统一处理）。
+        if let Some(tok) = cancel.as_deref() {
+            if tok.is_cancelled() {
+                return Err(CANCELLED_ERR);
+            }
+        }
         let (next_cur, next_action) = match action {
             Action::Pure(v) => return Ok(v),
 
             Action::Sequential { current, next } => {
-                let v = run_sub_impl(*current, ctx, undo, reg, access.reborrow(), depth).await?;
+                let v = run_sub_impl(
+                    *current,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await?;
                 let na = next(v);
                 (Value::Unit, na)
             }
@@ -677,23 +1051,36 @@ async fn interpret_impl(
                         return Err(e);
                     }
                 }
-                // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
-                // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径
-                // 再以 Write 模式打开会被 A4 误拒（InvalidInput，标记残留
-                // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
-                // （现有契约）。
-                match exec_via(&mut access, &op, reg).await {
-                    Ok((v, maybe_undo)) => {
-                        if let Some(u) = maybe_undo {
-                            undo.push(u);
-                        }
+                // 审计 R1 契约-F2 修复：virtual-clock 下 GetTime 路由到逻辑
+                // 时钟（确定性重放承诺，pdr.md §12.1；executor 注释「确定性
+                // 方案由 virtual-clock feature 提供」同源）——不达物理执行器、
+                // 不推进时钟（读取非推进）。墙钟路径（无 feature）行为不变。
+                // 栈帧纪律：`virtual_get_time` 为 `#[inline(never)]`，临时值
+                // 直接作为 match 操作数（不绑定解释器帧局部变量）——解释器
+                // 帧越小，RFC-11 深度守卫的嵌套边界越高（r5a 边界测试）。
+                match virtual_get_time(ctx, &op) {
+                    Some(v) => {
                         let na = next(v);
                         (Value::Unit, na)
                     }
-                    Err(e) => {
-                        reg.rollback_linear(&resources);
-                        return Err(e);
-                    }
+                    // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
+                    // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径
+                    // 再以 Write 模式打开会被 A4 误拒（InvalidInput，标记残留
+                    // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
+                    // （现有契约）。
+                    None => match exec_via(&mut access, &op, reg).await {
+                        Ok((v, maybe_undo)) => {
+                            if let Some(u) = maybe_undo {
+                                undo.push(u);
+                            }
+                            let na = next(v);
+                            (Value::Unit, na)
+                        }
+                        Err(e) => {
+                            reg.rollback_linear(&resources);
+                            return Err(e);
+                        }
+                    },
                 }
             }
 
@@ -732,10 +1119,26 @@ async fn interpret_impl(
                     let mut l_reg = reg.clone();
                     let mut r_reg = reg.clone();
                     r_reg.offset_next_fd(fork_fd_region_offset());
-                    let lv =
-                        run_sub_impl(*left, ctx, undo, &mut l_reg, access.reborrow(), depth).await;
-                    let rv =
-                        run_sub_impl(*right, ctx, undo, &mut r_reg, access.reborrow(), depth).await;
+                    let lv = run_sub_impl(
+                        *left,
+                        ctx,
+                        undo,
+                        &mut l_reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await;
+                    let rv = run_sub_impl(
+                        *right,
+                        ctx,
+                        undo,
+                        &mut r_reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await;
                     reg.merge(l_reg);
                     reg.merge(r_reg);
                     let na = combine(lv?, rv?);
@@ -746,7 +1149,16 @@ async fn interpret_impl(
                         ExecAccess::Shared(arc) => arc.clone(),
                         ExecAccess::Direct(_) => unreachable!("并行分支仅 Shared 通道可达"),
                     };
-                    let (lv, rv) = run_fork_parallel(*left, *right, ctx, reg, undo, shared).await?;
+                    let (lv, rv) = run_fork_parallel(
+                        *left,
+                        *right,
+                        ctx,
+                        reg,
+                        undo,
+                        shared,
+                        cancel.as_deref_mut(),
+                    )
+                    .await?;
                     let na = combine(lv, rv);
                     (Value::Unit, na)
                 }
@@ -757,7 +1169,16 @@ async fn interpret_impl(
                 ctx.cwd = reg.canonicalize_path(&base, &old);
                 // finally 模式：inner 无论成功/失败，先恢复 cwd 再传播结果，
                 // 保证异常路径同样恢复（RAII 守卫因 ctx 双重可变借用不可行）。
-                let v = run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth).await;
+                let v = run_sub_impl(
+                    *inner,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await;
                 ctx.cwd = old;
                 let v = v?;
                 let na = next(v);
@@ -765,6 +1186,13 @@ async fn interpret_impl(
             }
 
             Action::Alloc { len, next } => {
+                // 审计 R1 契约-F7 修复：无界分配 → debug 下分配失败 = 进程级
+                // abort（handle_alloc_error 不可捕获）/ release 下 OOM abort，
+                // 不受信任蓝图可崩溃宿主进程（RFC-11 同族拒绝服务面）。
+                // 超上限返回可捕获的 InvalidInput。
+                if len > MAX_IO_LEN {
+                    return Err(SysError::InvalidInput);
+                }
                 let na = next(Value::Bytes(vec![0u8; len]));
                 (Value::Unit, na)
             }
@@ -774,7 +1202,16 @@ async fn interpret_impl(
                 // 标记，next_fd 保留 D1 单调），再执行 target，以其结果结束（不回原流）。
                 undo.recover().await;
                 reg.clear();
-                return run_sub_impl(*target, ctx, undo, reg, access.reborrow(), depth).await;
+                return run_sub_impl(
+                    *target,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await;
             }
 
             Action::Invoke {
@@ -800,7 +1237,14 @@ async fn interpret_impl(
                 }
                 #[cfg(not(feature = "virtual-clock"))]
                 {
-                    tokio::time::sleep(duration).await;
+                    if let Some(tok) = cancel.as_deref_mut() {
+                        // 取消传播协议：Sleep 可被取消打断（结构化并发近似）。
+                        // select! 轮询栈已隔离到 `cancellable_sleep` 独立
+                        // coroutine（保护 RFC-11 深度守卫栈预算，见该函数注释）。
+                        cancellable_sleep(duration, tok).await;
+                    } else {
+                        tokio::time::sleep(duration).await;
+                    }
                 }
                 let na = next(Value::Unit);
                 (Value::Unit, na)
@@ -817,28 +1261,96 @@ async fn interpret_impl(
                 duration,
                 on_timeout,
             } => {
-                match tokio::time::timeout(
-                    duration,
-                    run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth),
-                )
-                .await
+                #[cfg(feature = "virtual-clock")]
                 {
-                    Ok(Ok(v)) => return Ok(v),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_elapsed) => {
-                        return run_sub_impl(*on_timeout, ctx, undo, reg, access.reborrow(), depth)
-                            .await
-                    }
+                    // 审计 R1 红灯根因修复（Timeout×virtual-clock 时域统一）：
+                    // 虚拟时钟下 Timeout 以虚拟时间判定（post-check：inner 完成
+                    // 时虚拟流逝 ≥ deadline 即视作超时，执行 on_timeout），与墙钟
+                    // 路径「future 在 deadline 后完成 → Elapsed」同构。此前用墙钟
+                    // 竞速虚拟 Sleep（瞬时完成）→ on_timeout 永不触发（红灯
+                    // err_timeout_keeps_undo_stack_and_registry）。注意：VC 下
+                    // Sleep 瞬时完成、无「飞行中」状态，故本路径无取消语义
+                    // （RFC-12 残余缺口仅墙钟路径适用）。
+                    // 栈帧纪律：判定逻辑在独立 async fn（`run_virtual_timeout`）
+                    // 内——deadline/elapsed 跨 await 存活，若内联进解释器状态机
+                    // 会撑大**每层递归**的状态机帧（r5a 边界测试 95/96/97 实测
+                    // 崩溃），提取后解释器帧恢复原尺寸。
+                    return run_virtual_timeout(
+                        *inner,
+                        *on_timeout,
+                        duration,
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await;
                 }
+                // ── 取消传播协议（RFC-08/09/12 残余统一修复）──
+                // 超时触发时不再直接丢弃 inner future（旧行为：已 spawn 的
+                // Fork 分支成为孤儿继续执行、持锁分支永不 Unlock、飞行中
+                // Write 的线性标记不回滚），而是：
+                //   a) 先广播取消（watch 令牌）——并行 Fork 分支在下一 op
+                //      边界检查并快速返回，把部分 registry/undo 合并回父
+                //      （结构化并发近似：分支内检查取消标志）；
+                //   b) 有界宽限（CANCEL_JOIN_GRACE）等待 inner join——分支
+                //      阻塞于不可取消 IO（如 TcpRead 无数据）时耗尽宽限后
+                //      丢弃 inner（近似同旧语义，但取消标志粘性使该分支在
+                //      IO 完成后于下一 op 边界中止）；
+                //   c) 回滚 inner 已入栈 undo（`rollback_from`，异步可含 IO）
+                //      ——RFC-09：持锁分支的 MutexLock undo 被立即执行，锁与
+                //      仲裁占坑释放，同 id 立即可重入（不饥饿至 recover）；
+                //      RFC-08：已合并回父的分支 undo 一并撤销；
+                //   d) 回滚 inner 期间新增的 A4 线性标记（`rollback_linear_to`
+                //      快照差）——RFC-12 残余：飞行中 Write/Own 的预插标记
+                //      不残留，同路径可重试；
+                //   e) 再执行 on_timeout（原语义：inner 结果被丢弃）。
+                // 超时前完成的 inner：效果全部保留（原语义，回滚不触发）。
+                // 墙钟 Timeout：取消传播协议在独立 async fn
+                // （`run_wall_timeout`）内实现——局部状态不撑大解释器状态机帧
+                // （RFC-11 守卫栈预算，见该函数注释）。
+                return run_wall_timeout(
+                    *inner,
+                    *on_timeout,
+                    duration,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await;
             }
 
             Action::Catch {
                 action: inner,
                 handler,
-            } => match run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth).await {
+            } => match run_sub_impl(
+                *inner,
+                ctx,
+                undo,
+                reg,
+                access.reborrow(),
+                depth,
+                cancel.as_deref_mut(),
+            )
+            .await
+            {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    return run_sub_impl(handler(e), ctx, undo, reg, access.reborrow(), depth).await
+                    return run_sub_impl(
+                        handler(e),
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await
                 }
             },
         };
@@ -859,8 +1371,9 @@ pub async fn interpret(
     reg: &mut ResourceRegistry,
     ex: &mut dyn SyscallExecutor,
 ) -> Result<Value, SysError> {
-    // 公开入口：深度从 0 起调（冻结签名不可改，depth 仅为 interpret_impl 私有参数）。
-    interpret_impl(action, ctx, undo, reg, ExecAccess::Direct(ex), 0).await
+    // 公开入口：深度从 0 起调（冻结签名不可改，depth 仅为 interpret_impl 私有参数）；
+    // 取消域从 None 起调（顶层无 Timeout 取消上下文）。
+    interpret_impl(action, ctx, undo, reg, ExecAccess::Direct(ex), 0, None).await
 }
 
 // 供外部使用的类型别名

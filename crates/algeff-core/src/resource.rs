@@ -230,7 +230,22 @@ pub struct ResourceRegistry {
     /// 如 concurrency_stress 的 fd 序列断言 [1,2,3]）。一旦发生过任何分配，
     /// 游标只升不降（分配的 fd 可能已逃逸到用户值/执行器轮换映射，不得复用，
     /// D1）。
+    /// RFC-06 修复（merge 锚点吸收）：`merge` 把分支的基线以偏移 0 回灌父
+    /// （见 `merge`），使父记录同一根基线 —— 多轮连续 Fork 的右分支偏移始终
+    /// 锚定根基线，而非被上一轮 merge 抬高的 `next_fd`（分支高位 fd 逃逸，
+    /// D1 必须抬高游标）；消除「每轮 +k·2^48」的二次增长（~362 轮 Σk·2^48
+    /// 溢出 u64，RFC-06）。
     fork_region: Option<(Fd, Fd)>,
+}
+
+/// A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：捕获
+/// `ResourceRegistry` 的 `consumed`（Write 消费）与 `owned_consumed`
+/// （Own 终结）两集。由 `snapshot_linear` 产生、`rollback_linear_to`
+/// 消费（按「时段」回滚取消子树新增的线性标记）。
+#[derive(Default, Clone)]
+pub struct LinearSnapshot {
+    consumed: HashSet<Resource>,
+    owned_consumed: HashSet<Resource>,
 }
 
 impl ResourceRegistry {
@@ -279,6 +294,12 @@ impl ResourceRegistry {
     /// 相等 → 并发区间碰撞。沿用未偏移基线后，区间只取决于全局唯一偏移序号
     /// 与根基线，**与路径无关**：任意嵌套深度下所有并发分支区间互斥。
     ///
+    /// RFC-06 修复配套：`merge` 会把分支的根基线以偏移 0 回灌父注册表（锚点
+    /// 吸收，见 `merge`），因此多轮连续 Fork 下本分支的基线是**根基线**（首次
+    /// 偏移时的 `next_fd`），而非被上一轮 merge 抬高的游标 —— 每轮右分支实际
+    /// 分配只使父 `next_fd` 线性 +2^48（区间位置只由全局唯一序号 k 决定），
+    /// 不再 Σk·2^48 二次增长（RFC-06）。
+    ///
     /// 背景：Fork 并行/顺序路径的左右分支都克隆自父（同源 `next_fd`），若两分支
     /// 都分配新 fd 会得到**相同 fd** —— merge 时 `HashMap::extend` 静默覆盖丢弃
     /// 一侧句柄，执行器内部轮换映射同样碰撞。调用方（A2 解释器）在 spawn 前给
@@ -306,18 +327,38 @@ impl ResourceRegistry {
     /// `offset_next_fd` 预留高位区间但**从未实际分配**，其游标收敛回基线，
     /// 避免父 `next_fd` 被大常数永久抬高（见 `fork_region`）。
     ///
+    /// RFC-06 修复（区间归一化锚点吸收）：`other` 记录过 `fork_region` 时，
+    /// 把其**根基线**以偏移 0 回灌给父（父此前未记录任何基线时）—— 后续轮次
+    /// Fork 右分支的 `offset_next_fd` 沿用此根基线，而非被上一轮 merge 抬高的
+    /// `next_fd`（分支实际分配的高位 fd 已逃逸，D1 必须抬高游标）—— 消除
+    /// 「右分支每次实际分配都使父 `next_fd` 再 +k·2^48」的二次增长（RFC-06：
+    /// ~362 轮 Σk·2^48 溢出 u64，debug panic / release 回绕 → fd 复用）。
+    /// 父已记录基线（自身亦是某 Fork 分支 / 已吸收）时保持不变：S6/A2 保证
+    /// 同一分支树内基线一致。并发区间互斥（区间位置只由全局唯一偏移序号 k
+    /// 决定）语义不变。
+    ///
     /// 由 A2 解释器在 Fork 并行/顺序分支完成后调用（D14 升级 + F1/F2 修复）；
     /// 本方法为加法 API，不改变任何既有方法签名。
     pub fn merge(&mut self, other: Self) {
         self.handles.extend(other.handles);
         self.consumed.extend(other.consumed);
         self.owned_consumed.extend(other.owned_consumed);
-        // F1 归一化：预留区间未实际分配（next_fd 恰为 基线+偏移）→ 收敛回基线。
+        // F1/RFC-06 归一化：预留区间**从未实际分配**（next_fd 恰为 基线+偏移）
+        // → 游标收敛回基线；**实际分配过** → 取 `max(self, 分支分配过的最大
+        // fd + 1)`（= `other.next_fd`：分支 fd 已逃逸到用户值/父句柄表，D1
+        // 不得复用，游标只升不降）。
         let other_next = match other.fork_region {
             Some((base, offset)) if other.next_fd == base + offset => base,
             _ => other.next_fd,
         };
         self.next_fd = self.next_fd.max(other_next);
+        // RFC-06 锚点吸收：见方法文档 —— 区间归一化锚点（根基线）回灌父，
+        // 使后续轮次 offset_next_fd 锚定根基线而非被抬高的 next_fd。
+        if self.fork_region.is_none() {
+            if let Some((base, _)) = other.fork_region {
+                self.fork_region = Some((base, 0));
+            }
+        }
     }
 
     /// 公理 A4 线性检查（运行时断言）：
@@ -369,6 +410,31 @@ impl ResourceRegistry {
                 AccessMode::Read | AccessMode::Append => {}
             }
         }
+    }
+
+    /// 捕获当前 A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：
+    /// `check_linear` 预插入的 Write（`consumed`）/ Own（`owned_consumed`）
+    /// 消费标记两集。快照**不含**句柄表与 `next_fd`——取消回滚只移除取消
+    /// 子树新插入的线性标记，不动句柄（物理清理由 undo 负责）与 D1 单调
+    /// 游标（fd 永不复用）。
+    pub fn snapshot_linear(&self) -> LinearSnapshot {
+        LinearSnapshot {
+            consumed: self.consumed.clone(),
+            owned_consumed: self.owned_consumed.clone(),
+        }
+    }
+
+    /// 回滚线性状态至快照（取消传播协议，`Action::Timeout` 取消回滚用，
+    /// RFC-12 残余）：**移除**取消子树期间新增的 Write/Own 标记（当前集 ∖
+    /// 快照集），子树自身移除的标记（如 Replace 的 `clear`、失败路径的
+    /// `rollback_linear`）保持移除、不回补——只撤销新增，尊重子树自身的
+    /// 状态操作。与 `rollback_linear`（逐批回滚）互补：快照回滚按「时段」
+    /// 而非「批次」工作，适用于无法逐批跟踪的取消路径（inner future 被
+    /// 丢弃/中断后不再有逐批上下文）。
+    pub fn rollback_linear_to(&mut self, snap: &LinearSnapshot) {
+        self.consumed.retain(|r| snap.consumed.contains(r));
+        self.owned_consumed
+            .retain(|r| snap.owned_consumed.contains(r));
     }
 
     /// 公理 A3 / 冲突矩阵（pdr.md §9.1）。保守默认：Append∥Append 视为不可并行
@@ -743,6 +809,35 @@ mod tests {
         assert!(
             n > c2 && n > p1,
             "合并后父 next_fd = max，新分配不冲突（n={n} > c2={c2}）"
+        );
+    }
+
+    #[test]
+    fn merge_right_branch_alloc_anchors_base_no_quadratic_growth() {
+        // RFC-06 回归（确定性门）：右分支在 k<<48 预留区间**实际分配**后，
+        // merge 必须把区间锚点（fork_region 根基线）回灌给父 —— 后续轮次
+        // offset_next_fd 沿用根基线，而非被上一轮 merge 抬高的 next_fd。
+        // 修复前父 next_fd 每轮再 +k·2^48（二次增长，Σk·2^48 在 ~362 轮
+        // 溢出 u64：debug panic / release 回绕 → fd 复用，违反 D1）；修复后
+        // 线性：400 轮后 next_fd 恰为 400·2^48 + 2（每轮仅一跳区间 + 右分支
+        // 实际分配的 2 个 fd，见 merge 锚点吸收）。
+        let mut parent = ResourceRegistry::new();
+        for k in 1..=400u64 {
+            let mut right = parent.clone();
+            right.offset_next_fd(k << 48);
+            let c1 = right.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+            let c2 = right.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+            assert!(
+                c1 >= (k << 48) && c2 == c1 + 1,
+                "右分支 fd 应落入本轮全局唯一区间（k={k}）"
+            );
+            parent.merge(right);
+        }
+        let n = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert_eq!(
+            n,
+            (400u64 << 48) + 2,
+            "400 轮右分支实际分配后父 next_fd 应线性（RFC-06 修复，无 Σk·2^48 二次项）"
         );
     }
 

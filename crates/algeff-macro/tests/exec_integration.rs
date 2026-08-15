@@ -70,7 +70,7 @@ fn describe(op: &DataOp) -> String {
     match op {
         DataOp::Write { fd, .. } => format!("write:{fd}"),
         DataOp::Read { fd, len } => format!("read:{fd}:{len}"),
-        DataOp::GetTime => "gettime".to_string(),
+        DataOp::Close { fd: 999 } => "Close { fd: 999 }".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -149,11 +149,11 @@ fn test_plan_runs() {
 
     // 错误传播：plan! 链中 syscall 返回 Err → interpret 向上传播（宏产物执行语义）。
     // 同时验证 MockExecutor 可配置 Err 响应。
-    ex.respond("gettime", MockOutcome::Err(SysError::NotFound));
-    let action = plan! { syscall_step(DataOp::GetTime) };
+    ex.respond("Close { fd: 999 }", MockOutcome::Err(SysError::NotFound));
+    let action = plan! { syscall_step(DataOp::Close { fd: 999 }) };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Err(SysError::NotFound));
-    assert_eq!(ex.ops(), vec!["gettime"]);
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
 // ── 2. choose! 执行级分支隔离 ────────────────────────────────────────
@@ -166,17 +166,17 @@ fn test_choose_executes_branch() {
         let mut undo = UndoStack::new();
         let mut reg = ResourceRegistry::new();
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
         ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
         let action = choose!(
             true,
-            then: plan! { syscall_step(DataOp::GetTime) },
+            then: plan! { syscall_step(DataOp::Close { fd: 999 }) },
             else: plan! { syscall_step(DataOp::Read { fd: 7, len: 4 }) },
         );
         let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
         assert_eq!(v, Ok(Value::Unit)); // plan! 分支末 next 收敛 Pure(Unit)
-        assert_eq!(ex.ops(), vec!["gettime"]); // 仅 then 分支的 op
+        assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]); // 仅 then 分支的 op
     }
 
     // cond 为 false：只执行 else 分支的 op（对称断言，强化分支隔离）
@@ -185,12 +185,12 @@ fn test_choose_executes_branch() {
         let mut undo = UndoStack::new();
         let mut reg = ResourceRegistry::new();
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
         ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
         let action = choose!(
             false,
-            then: plan! { syscall_step(DataOp::GetTime) },
+            then: plan! { syscall_step(DataOp::Close { fd: 999 }) },
             else: plan! { syscall_step(DataOp::Read { fd: 7, len: 4 }) },
         );
         let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
@@ -247,15 +247,15 @@ fn test_scope_restores_cwd() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Value(Value::U64(7)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(7)));
 
     let action = scope!("/tmp", || plan! {
-        syscall_step(DataOp::GetTime)
+        syscall_step(DataOp::Close { fd: 999 })
     });
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::Unit));
     assert_eq!(ctx.cwd, PathBuf::from("/app")); // 执行后 cwd 恢复原值
-    assert_eq!(ex.ops(), vec!["gettime"]); // inner 确实在 scope 内执行
+    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]); // inner 确实在 scope 内执行
 }
 
 // ── 5. choose! cond 依赖运行时当前值 ─────────────────────────────────
@@ -269,7 +269,7 @@ fn test_choose_cond_value() {
         let is_seven = matches!(v, Value::U64(7));
         choose!(
             is_seven,
-            then: plan! { syscall_step(DataOp::GetTime) },
+            then: plan! { syscall_step(DataOp::Close { fd: 999 }) },
             else: plan! { syscall_step(DataOp::Read { fd: 7, len: 4 }) },
         )
     }
@@ -280,7 +280,7 @@ fn test_choose_cond_value() {
         let mut undo = UndoStack::new();
         let mut reg = ResourceRegistry::new();
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
         ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
         let action = Action::Sequential {
@@ -289,7 +289,7 @@ fn test_choose_cond_value() {
         };
         let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
         assert_eq!(v, Ok(Value::Unit));
-        assert_eq!(ex.ops(), vec!["gettime"]);
+        assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
     }
 
     // 方向 2：前序值 = 8 → cond false → else 分支
@@ -298,7 +298,7 @@ fn test_choose_cond_value() {
         let mut undo = UndoStack::new();
         let mut reg = ResourceRegistry::new();
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
         ex.respond("read:7:4", MockOutcome::Value(Value::Bool(true)));
 
         let action = Action::Sequential {

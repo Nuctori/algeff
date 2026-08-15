@@ -60,6 +60,9 @@ impl SyscallExecutor for MockExecutor {
 
 /// feature 开启时，普通 interpret 路径（无 coeffects 参与）与默认语义一致：
 /// Pure 单位元 + Sequential 值传递 + 无副作用产生（undo 栈空、无 op 记录）。
+/// 注：virtual-clock 下 GetTime 语义改为读虚拟时钟（见 get_time 测试），故
+/// 本测试（含「GetTime 到达执行器」断言）仅在非 virtual-clock 组合下编译。
+#[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn plain_path_unchanged_under_features() {
     let mut ctx = Context::new();
@@ -97,10 +100,12 @@ fn plain_path_unchanged_under_features() {
     assert!(undo.is_empty(), "无 undo 的 syscall 不应压栈");
 }
 
-/// feature 开启时非 Sleep 节点不推进逻辑时钟（虚拟时钟只被 Sleep 驱动）。
+/// virtual-clock 下 GetTime 语义（审计 R1 契约-F2 修复）：时间读操作路由到
+/// 虚拟时钟 `vc.now()`（确定性重放承诺，executor 注释同源），**不**到达
+/// 物理执行器、也**不**推进时钟（读取非推进）。
 #[cfg(feature = "virtual-clock")]
 #[test]
-fn non_sleep_actions_do_not_touch_virtual_clock() {
+fn get_time_reads_virtual_clock_without_advancing() {
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
@@ -120,10 +125,15 @@ fn non_sleep_actions_do_not_touch_virtual_clock() {
         &mut reg,
         &mut ex,
     ));
-    assert_eq!(v, Ok(Value::U64(21)));
+    // 时钟起点 ZERO → 读得 0ms（而非执行器 mock 的 21）
+    assert_eq!(v, Ok(Value::U64(0)));
+    assert!(
+        ex.ops().is_empty(),
+        "virtual-clock 下 GetTime 不得到达物理执行器"
+    );
     assert_eq!(
         ctx.virtual_clock_mut().expect("virtual clock 存在").now(),
         std::time::Duration::ZERO,
-        "非 Sleep 动作不得推进逻辑时钟"
+        "读取 GetTime 不得推进逻辑时钟"
     );
 }

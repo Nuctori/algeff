@@ -118,12 +118,14 @@ def main():
                 if num not in t:
                     issues.append(f"[{p}] 提及性能数据但缺 canonical 数字「{num}」")
 
-    # ---- 6. 深度守卫（96/105/97）----
+    # ---- 6. 深度守卫（64/105/65；96/97 仅历史语境）----
     for p in FILES:
         t = texts[p]
-        if any(x in t for x in ("深度守卫", "阈值 96", "Other(105)", "97 步")):
-            if "96" not in t or "105" not in t or "97" not in t:
-                issues.append(f"[{p}] 提及深度守卫但缺 96/105/97 之一")
+        if any(x in t for x in ("深度守卫", "阈值 64", "Other(105)", "65 步")):
+            if "64" not in t or "105" not in t or "65" not in t:
+                issues.append(f"[{p}] 提及深度守卫但缺 64/105/65 之一")
+        if "≥97 步" in t or "≥ 97 步" in t or "阈值 96（CTO" in t:
+            issues.append(f"[{p}] 深度守卫旧口径（97 步/阈值 96）出现但无迭代 1 更新注记")
 
     # ---- 7. append 24.3% 仅历史语境（canonical 39.1）----
     for p in FILES:

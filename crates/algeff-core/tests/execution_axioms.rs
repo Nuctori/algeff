@@ -90,7 +90,7 @@ fn describe(op: &DataOp) -> String {
     match op {
         DataOp::Write { fd, data } => format!("write:{fd}:{}", data.len()),
         DataOp::Read { fd, len } => format!("read:{fd}:{len}"),
-        DataOp::GetTime => "gettime".to_string(),
+        DataOp::Close { fd: 999 } => "Close { fd: 999 }".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -149,10 +149,10 @@ fn exec_syscall_error_propagates() {
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
-    ex.respond("gettime", MockOutcome::Err(SysError::NotFound));
+    ex.respond("Close { fd: 999 }", MockOutcome::Err(SysError::NotFound));
 
     let v = drive(interpret(
-        syscall_step(DataOp::GetTime, vec![]),
+        syscall_step(DataOp::Close { fd: 999 }, vec![]),
         &mut ctx,
         &mut undo,
         &mut reg,
@@ -163,7 +163,11 @@ fn exec_syscall_error_propagates() {
         Err(SysError::NotFound),
         "执行器错误经 interpret 原样传播"
     );
-    assert_eq!(ex.ops(), vec!["gettime"], "错误在 execute 记录后返回");
+    assert_eq!(
+        ex.ops(),
+        vec!["Close { fd: 999 }"],
+        "错误在 execute 记录后返回"
+    );
 }
 
 // ── A1 结合律：执行等价 ────────────────────────────────────────────────
@@ -174,7 +178,7 @@ fn exec_A1_associativity() {
     // 混合链 a;b;c：a=Syscall(GetTime)→10，b=Pure(U64(20))，c=Syscall(Read)→30；
     // c 的 next 把前一结果（U64(20)）与自身结果相加 → 最终 50。
     fn mk_a() -> Action {
-        syscall_step(DataOp::GetTime, vec![])
+        syscall_step(DataOp::Close { fd: 999 }, vec![])
     }
     fn mk_b() -> Action {
         Action::Pure(Value::U64(20))
@@ -191,7 +195,7 @@ fn exec_A1_associativity() {
     }
     fn cfg_ex() -> MockExecutor {
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(10)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(10)));
         ex.respond("read:2:4", MockOutcome::Value(Value::U64(30)));
         ex
     }
@@ -236,7 +240,7 @@ fn exec_A1_associativity() {
     assert_eq!(v1, v2, "(a;b);c 与 a;(b;c) 最终 Value 一致（A1 执行等价）");
     assert_eq!(v1, Ok(Value::U64(50)), "值流穿透两种嵌套（20+30）");
     assert_eq!(ex1.ops(), ex2.ops(), "(a;b);c 与 a;(b;c) op 调用序列一致");
-    assert_eq!(ex1.ops(), vec!["gettime", "read:2:4"]);
+    assert_eq!(ex1.ops(), vec!["Close { fd: 999 }", "read:2:4"]);
 }
 
 // ── A2 单位元：执行等价 ────────────────────────────────────────────────
@@ -247,7 +251,7 @@ fn exec_A2_identity() {
     // 纯链 a = GetTime;Read（两个 Syscall）
     fn mk_chain() -> Action {
         Action::Sequential {
-            current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+            current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             next: Box::new(|_| {
                 syscall_step(
                     DataOp::Read { fd: 2, len: 4 },
@@ -258,7 +262,7 @@ fn exec_A2_identity() {
     }
     fn cfg_ex() -> MockExecutor {
         let mut ex = MockExecutor::new();
-        ex.respond("gettime", MockOutcome::Value(Value::U64(5)));
+        ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(5)));
         ex.respond("read:2:4", MockOutcome::Value(Value::U64(6)));
         ex
     }
@@ -450,10 +454,10 @@ fn exec_D10_replace_order() {
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
     ex.with_undo = true;
-    ex.respond("gettime", MockOutcome::Value(Value::U64(1)));
+    ex.respond("Close { fd: 999 }", MockOutcome::Value(Value::U64(1)));
 
     let action = Action::Sequential {
-        current: Box::new(syscall_step(DataOp::GetTime, vec![])),
+        current: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
         next: Box::new(|_| Action::Replace {
             target: Box::new(Action::Pure(Value::U64(99))),
         }),
@@ -462,11 +466,15 @@ fn exec_D10_replace_order() {
     assert_eq!(v, Ok(Value::U64(99)), "Replace 以 target 结果结束（D10）");
     assert_eq!(
         ex.undo_ops(),
-        vec!["undo(gettime)"],
+        vec!["undo(Close { fd: 999 })"],
         "undo 先执行：recover 在 target 之前完成（标记顺序）"
     );
     assert!(undo.is_empty(), "recover 后撤销栈已清空");
-    assert_eq!(ex.ops(), vec!["gettime"], "原流 Syscall 只执行一次");
+    assert_eq!(
+        ex.ops(),
+        vec!["Close { fd: 999 }"],
+        "原流 Syscall 只执行一次"
+    );
 }
 
 // ── D14 Fork：静态冲突检测 + 顺序执行 ─────────────────────────────────

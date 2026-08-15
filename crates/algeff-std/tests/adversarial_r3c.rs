@@ -716,33 +716,33 @@ fn r2_flush_regression_parallel_double_write_64_rounds() {
     std::fs::write(&pb, b"0000000000").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 一次 Open 两个文件（父级），此后每轮经并行 Fork 双写。
-    let pb_in = pb.clone();
-    let v = rt
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: pa.clone(),
-                flags: rw_flags(),
-            },
-            vec![wr_path(pa.clone())],
-            move |v| {
-                let fda = fd_of(&v);
-                syscall(
-                    DataOp::Open {
-                        path: pb_in.clone(),
-                        flags: rw_flags(),
-                    },
-                    vec![wr_path(pb_in.clone())],
-                    move |v| Action::Pure(Value::List(vec![Value::Fd(fda), v])),
-                )
-            },
-        ))
-        .unwrap();
-    let (fda, fdb) = pair_of(&v);
-
     for i in 0..64u8 {
         let pay_a = [b'A' + (i % 26); 4];
         let pay_b = [b'B' + (((i as u32 * 7) % 26) as u8); 4];
+        // RFC-05：Replace 使旧 fd 失效（registry 活性唯一真相），每轮重开
+        // 双文件新 fd（顺带覆盖 D10「Replace 后同路径重开正常」）。
+        let pb_in = pb.clone();
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: rw_flags(),
+                },
+                vec![wr_path(pa.clone())],
+                move |v| {
+                    let fda = fd_of(&v);
+                    syscall(
+                        DataOp::Open {
+                            path: pb_in.clone(),
+                            flags: rw_flags(),
+                        },
+                        vec![wr_path(pb_in.clone())],
+                        move |v| Action::Pure(Value::List(vec![Value::Fd(fda), v])),
+                    )
+                },
+            ))
+            .unwrap();
+        let (fda, fdb) = pair_of(&v);
         // 并行 Fork：左右分支各自 Seek(0)+Write 不同文件（资源不相交 → 真
         // 并行，两路 OS 写并发压 blocking pool —— R1 单写顺序组合的加强版）。
         rt.run_blocking(Action::Fork {
@@ -800,9 +800,8 @@ fn r2_flush_regression_parallel_double_write_64_rounds() {
             "第 {i} 轮：b 文件 Write 效果必须立即可观察（并行路径）"
         );
 
-        // Replace：撤销两分支 Write（内容+游标恢复）+ 清 A4 标记，供下一轮
-        // 复用同一 fd（registry 清空后 executor 侧文件映射仍可寻址，RFC-05
-        // 记录行为，与 R1 回归测试同约定）。
+        // Replace：撤销两分支 Write（内容+游标恢复）+ 清 A4 标记；旧 fd 随之
+        // 失效（RFC-05），下一轮重开新 fd 复用同一文件。
         rt.run_blocking(Action::Replace {
             target: Box::new(Action::Pure(Value::Unit)),
         })
@@ -1123,33 +1122,45 @@ fn r2_sendfile_file_target_visibility() {
     std::fs::write(&dst, b"0000000000").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    let dst_in = dst.clone();
-    let v = rt
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: src.clone(),
-                flags: read_only_flags(),
-            },
-            vec![rd_path(src.clone())],
-            move |v| {
-                let sfd = fd_of(&v);
-                syscall(
-                    DataOp::Open {
-                        path: dst_in.clone(),
-                        flags: rw_flags(),
-                    },
-                    vec![wr_path(dst_in.clone())],
-                    move |v| Action::Pure(Value::List(vec![Value::Fd(sfd), v])),
-                )
-            },
-        ))
-        .unwrap();
-    let (sfd, dfd) = pair_of(&v);
-
     for i in 0..64u8 {
         let payload = [b'P' + (i % 26); 4];
         // 外部重写源文件（模拟输入侧更新），SendFile 拷贝前 4 字节到目标。
         std::fs::write(&src, payload).unwrap();
+        // RFC-05：Replace 使旧 fd 失效（registry 活性唯一真相），每轮重开
+        // src/dst 新 fd；dst 显式 Seek 到本轮落点 [4i, 4i+4)（fresh fd 游标 0）。
+        let dst_in = dst.clone();
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: src.clone(),
+                    flags: read_only_flags(),
+                },
+                vec![rd_path(src.clone())],
+                move |v| {
+                    let sfd = fd_of(&v);
+                    syscall(
+                        DataOp::Open {
+                            path: dst_in.clone(),
+                            flags: rw_flags(),
+                        },
+                        vec![wr_path(dst_in.clone())],
+                        move |v| Action::Pure(Value::List(vec![Value::Fd(sfd), v])),
+                    )
+                },
+            ))
+            .unwrap();
+        let (sfd, dfd) = pair_of(&v);
+        let off = 4 * i as usize;
+        rt.run_blocking(syscall(
+            DataOp::Seek {
+                fd: dfd,
+                offset: off as i64,
+                whence: std::io::SeekFrom::Start(0),
+            },
+            vec![rd(dfd)],
+            Action::Pure,
+        ))
+        .unwrap();
         rt.run_blocking(syscall(
             DataOp::SendFile {
                 out: dfd,
@@ -1164,15 +1175,14 @@ fn r2_sendfile_file_target_visibility() {
         // SendFile op 返回后不得依赖任何中间操作兜底——立即同步读目标尾部
         // （第 i 次拷贝落在 [4i, 4i+4)）必须可见新内容；文件长度不足（OS 写
         // 未落盘、文件尚未伸长）同样视为旧内容。
-        let off = 4 * i as usize;
         let got = std::fs::read(&dst).unwrap();
         assert!(
             got.len() >= off + 4 && got[off..off + 4] == payload[..],
             "第 {i} 轮：SendFile op 完成后新内容必须立即可观察（D-039 对齐；\
              修复前无 flush 时此处读到旧内容或文件未伸长）"
         );
-        // 复位 A4（wr(dfd) 每轮至多一次）；registry 清空后 executor 文件
-        // 映射仍可寻址（RFC-05 记录行为）。
+        // 复位 A4（wr(dfd) 每轮至多一次）；旧 fd 随之失效（RFC-05），下一轮
+        // 重开新 fd 复用同一文件。
         rt.run_blocking(Action::Replace {
             target: Box::new(Action::Pure(Value::Unit)),
         })

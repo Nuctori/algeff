@@ -599,8 +599,15 @@ fn fork_sequential_conflict_two_scopes_cwd_not_leaked() {
 /// 打断 Sleep(10s) 触发其 on_timeout；on_timeout 内**再 Timeout**（30ms 打断
 /// Sleep(10s)）收敛 U64(777)；中层（3s）/外层（5s）不误触发（哨兵 555/333
 /// 不得出现）。真实墙钟等待 ≈ 70ms。
+///
+/// 注意（审计 R1 语义裁决）：本测试为**墙钟时序语义**（各层独立 deadline、
+/// 内层真实消耗毫秒级墙钟时间、外层 3s/5s 不触发）。virtual-clock 下虚拟时间
+/// 全局累计（内层 Sleep 瞬时推进 10s+10s，中层 3s/外层 5s 均超限 → 级联触发
+/// 最外层 333）——见 `timeout_nested_3_levels_virtual_clock_cascades`。
+#[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn timeout_nested_3_levels_only_innermost_fires_ontimeout_has_timeout() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let v = rt
         .run_blocking(Action::Timeout {
@@ -636,6 +643,48 @@ fn timeout_nested_3_levels_only_innermost_fires_ontimeout_has_timeout() {
     assert!(rt.undo_stack().is_empty(), "超时路径不产生 undo");
     rt.run_blocking(syscall(DataOp::GetTime, vec![], Action::Pure))
         .unwrap();
+}
+
+/// 3a-VC：virtual-clock 下同一三层嵌套蓝图的**级联语义**（审计 R1 语义裁决，
+/// 双通道判定）。虚拟时间全局累计：最内层 Sleep 瞬时推进 10s（>40ms → 触发
+/// on_timeout 链）、其内再推进 10s（>30ms → 777），此时虚拟流逝 20s —— 中层
+/// 3s 与外层 5s 的 deadline 均已被内层消耗的超限虚拟时间越过，级联触发直至
+/// 最外层 on_timeout（333）胜出。这是确定性语义（虚拟时间如实累计，与墙钟
+/// 「内层真实耗时计入外层」同构）；墙钟路径的独立 deadline 语义见上方 3a。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn timeout_nested_3_levels_virtual_clock_cascades() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt
+        .run_blocking(Action::Timeout {
+            action: Box::new(Action::Timeout {
+                action: Box::new(Action::Timeout {
+                    action: Box::new(Action::Sleep {
+                        duration: std::time::Duration::from_secs(10),
+                        next: Box::new(|_| Action::Pure(Value::U64(999))),
+                    }),
+                    duration: std::time::Duration::from_millis(40),
+                    on_timeout: Box::new(Action::Timeout {
+                        action: Box::new(Action::Sleep {
+                            duration: std::time::Duration::from_secs(10),
+                            next: Box::new(|_| Action::Pure(Value::U64(888))),
+                        }),
+                        duration: std::time::Duration::from_millis(30),
+                        on_timeout: Box::new(Action::Pure(Value::U64(777))),
+                    }),
+                }),
+                duration: std::time::Duration::from_secs(3),
+                on_timeout: Box::new(Action::Pure(Value::U64(555))),
+            }),
+            duration: std::time::Duration::from_secs(5),
+            on_timeout: Box::new(Action::Pure(Value::U64(333))),
+        })
+        .unwrap();
+    assert_eq!(
+        v,
+        Value::U64(333),
+        "虚拟时钟全局累计：内层消耗 20s 虚拟时间，中/外层 deadline 均超限 → 级联至最外层"
+    );
 }
 
 /// 3b：三层 Timeout 下最内层 action 立即出错（Read 不存在 fd）——错误必须

@@ -144,3 +144,18 @@ Windows 动态端口范围默认约 1024–15000（本机 13977 个），TIME_WA
   （本批实测 exit 0）。
 - 文档齐备：本文档 + `perf/baseline-2026-08-15.txt`。
 - CI yaml 校验：A8 交付（`.github/workflows/ci.yml`），不在本批范围。
+
+## 7. 基线文件索引（perf/ 口径与先后关系）
+
+`perf/` 现有三份基线文件，口径与先后关系如下（引用原则：同一臂取最新**未污染**数值）：
+
+| 文件 | 时间/分支 | 口径 | 状态 |
+| --- | --- | --- | --- |
+| `perf/baseline-2026-08-15.txt` | 2026-08-15 18:27（A7 批 2-4，s4/a7） | 主基线：原生参照列 [1]-[4] + Algeff 对比列 [5]-[8]；append **24.3%** 为 D-039 flush 契约（af27ce9）**修复前**旧值 | 部分被 R6 刷新覆盖（append/echo 以 R6 为准） |
+| `perf/baseline-r6-2026-08-16.txt` | 2026-08-16 02:17（audit/r6g） | R6 精简复测：echo/append 两臂（各 3 次取中位数）；append **39.1%**（D-039 flush 契约后诚实值，24.3% 仅为历史参照） | 现行 echo/append 引用口径 |
+| `perf/baseline-it1-pre-2026-08-16.txt` | 2026-08-16 05:1x（iter1/it1-perf，R-6 重构前） | 四臂全量复测（echo/parallel_reads/shared_read/append 各 3-4 次采样）——R-6 锁重构前后对照锚 | ⚠️ **负载污染**（机器重负载下测得，数值显著膨胀，不可作定量基准）；原始采样全量保留，待负载回落后重测，R-6 前后对照以重测值为准 |
+
+先后关系：`baseline-2026-08-15`（批 2-4 主基线）→ `baseline-r6-2026-08-16`（echo/append 两臂刷新）→ `baseline-it1-pre-2026-08-16`（四臂锚，污染待重测）。
+
+- parallel_reads/shared_read 现行引用口径仍为批 4（366.2% / 570.9%）；it1-pre 文件因负载污染不替代任何现行数值。
+- 重测完成后须同步刷新 README §性能、docs/src/derivation.md §9 与 `scripts/check-doc-consistency.py` 的 canonical 数字。

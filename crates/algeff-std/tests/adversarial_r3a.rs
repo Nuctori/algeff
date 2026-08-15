@@ -55,9 +55,6 @@ fn rd(fd: u64) -> ResourceUsage {
 fn wr(fd: u64) -> ResourceUsage {
     TypedResource::<WriteOnly>::new_write(ResourceInner::Fd(fd)).into_usage()
 }
-fn rd_path(path: PathBuf) -> ResourceUsage {
-    TypedResource::<ReadOnly>::new_read(ResourceInner::Path(path)).into_usage()
-}
 fn wr_path(path: PathBuf) -> ResourceUsage {
     TypedResource::<WriteOnly>::new_write(ResourceInner::Path(path)).into_usage()
 }

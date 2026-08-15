@@ -14,9 +14,9 @@
 //!    → put_back 错误恢复 → arbiter WouldBlock → depth guard —— 断言每个修复
 //!    点在混合场景（错误+Catch+Replace / dup 共享 / 仲裁竞争 / 超深嵌套）下
 //!    仍生效（`fix_five_point_regression_single_blueprint`）。
-//! 2. **守卫边界 × 组合**：深度 96 内嵌 Catch → 可捕获；深度 90 + Timeout →
-//!    正常完成；守卫错误经 Timeout 原样透传（`guard_depth96_catch_catchable_...`；
-//!    纯 95/96/97 边界在 core 侧 `adversarial_r5a.rs`）。
+//! 2. **守卫边界 × 组合**：深度 64 内嵌 Catch → 可捕获；深度 58 + Timeout →
+//!    正常完成；守卫错误经 Timeout 原样透传（`guard_depth64_catch_catchable_...`；
+//!    纯 63/64/65 边界在 core 侧 `adversarial_r5a.rs`）。
 //! 3. **组合风暴**：Catch×Fork×Timeout×Scope 混合蓝图 50 轮，每轮轨迹一致
 //!    （左分支超时 42、右分支错误捕获 1、cwd 恢复、写入立即可见），undo 栈
 //!    50 条合并回父、终局 Replace 后栈空 + 全部内容恢复（`combo_storm_...`）。
@@ -110,7 +110,7 @@ fn open_fd(rt: &mut Runtime, path: PathBuf) -> u64 {
 }
 
 /// 深度 depth 的嵌套 Sequential：current 为下一层；叶子返回 U64(300)。
-/// 与 core 侧 `adversarial_r5a.rs` 同构（RFC-11 守卫计数：depth≥96 → Other(105)）。
+/// 与 core 侧 `adversarial_r5a.rs` 同构（RFC-11 守卫计数：depth≥64 → Other(105)；迭代 1 阈值 96→64）。
 fn nested_seq(depth: u64) -> Action {
     if depth == 0 {
         return Action::Pure(Value::U64(300));
@@ -332,7 +332,9 @@ fn fix_five_point_regression_single_blueprint() {
         "阶段1：handler 内 Replace 撤销写副作用，内容恢复"
     );
     let pa_fd = pa_fd.lock().unwrap().expect("阶段1 Open 已执行");
-    let pos = rt
+    // RFC-05：阶段1 handler 内 Replace 已使旧 fd 失效（registry 活性唯一真相）
+    // ——游标复原维度改经重开新 fd 观察（世界恢复至执行前，pos=0）。
+    let e = rt
         .run_blocking(syscall(
             DataOp::Seek {
                 fd: pa_fd,
@@ -342,11 +344,38 @@ fn fix_five_point_regression_single_blueprint() {
             vec![rd(pa_fd)],
             Action::Pure,
         ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "阶段1：Replace 后旧 fd 失效（NotFound）"
+    );
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: pa.clone(),
+                flags: rw_flags(),
+            },
+            vec![wr_path(pa.clone())],
+            Action::Pure,
+        ))
+        .unwrap();
+    let pa2 = fd_of(&v);
+    let pos = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: pa2,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(pa2)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(
         pos,
         Value::U64(0),
-        "阶段1：undo 恢复游标到写前位置 0（非写后 2）"
+        "阶段1：重开新 fd 游标为 0（undo 恢复写前位置；旧 fd 已随 Replace 失效）"
     );
 
     // 2. flush 可见性：阶段 2 写入已落盘（内联断言之外再确认）。
@@ -395,36 +424,36 @@ fn fix_five_point_regression_single_blueprint() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 2：守卫边界 × 组合（纯 95/96/97 边界在 core 侧）
+// 攻击面 2：守卫边界 × 组合（纯 63/64/65 边界在 core 侧）
 // ══════════════════════════════════════════════════════════════════════
 
-/// 守卫 × Catch/Timeout 组合：
-/// - 深度 96 内嵌 Catch → 守卫错误（Other(105)）被捕获（拒绝服务面转可恢复）；
-/// - 深度 90 + Timeout → 在超时窗口内正常完成（守卫不误伤、Timeout 不误触发）；
+/// 守卫 × Catch/Timeout 组合（迭代 1 阈值 64 复测裁决后数值更新）：
+/// - 深度 64 内嵌 Catch → 守卫错误（Other(105)）被捕获（拒绝服务面转可恢复）；
+/// - 深度 58 + Timeout → 在超时窗口内正常完成（守卫不误伤、Timeout 不误触发）；
 /// - 超深蓝图外包 Timeout+Catch → 守卫错误经 Timeout 原样透传（Timeout 只拦截
 ///   Elapsed，不吞错误）并可被外层 Catch 捕获。
 #[test]
-fn guard_depth96_catch_catchable_depth90_timeout_ok() {
+fn guard_depth64_catch_catchable_depth58_timeout_ok() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 深度 96 内嵌 Catch → 可捕获。
+    // 深度 64 内嵌 Catch → 可捕获。
     let v = rt
         .run_blocking(Action::Catch {
-            action: Box::new(nested_seq(96)),
+            action: Box::new(nested_seq(64)),
             handler: Box::new(|e| Action::Pure(Value::Str(format!("caught:{e}")))),
         })
         .unwrap();
     assert_eq!(
         v,
         Value::Str("caught:Other(105)".to_string()),
-        "深度 96 的守卫错误应被 Catch 捕获并执行 handler"
+        "深度 64 的守卫错误应被 Catch 捕获并执行 handler"
     );
     assert!(rt.undo_stack().is_empty(), "守卫错误不残留 undo");
 
-    // 深度 90 + Timeout 组合：正常完成（5s 窗口远大于执行时间）。
+    // 深度 58 + Timeout 组合：正常完成（5s 窗口远大于执行时间）。
     let v = rt
         .run_blocking(Action::Timeout {
-            action: Box::new(nested_seq(90)),
+            action: Box::new(nested_seq(58)),
             duration: Duration::from_secs(5),
             on_timeout: Box::new(Action::Pure(Value::U64(999))),
         })
@@ -432,14 +461,14 @@ fn guard_depth96_catch_catchable_depth90_timeout_ok() {
     assert_eq!(
         v,
         Value::U64(300),
-        "深度 90 在 Timeout 内正常完成（未误触守卫/超时）"
+        "深度 58 在 Timeout 内正常完成（未误触守卫/超时）"
     );
 
     // 守卫错误经 Timeout 原样透传（Timeout 对 Err 不转换），外层 Catch 可捕获。
     let v = rt
         .run_blocking(Action::Catch {
             action: Box::new(Action::Timeout {
-                action: Box::new(nested_seq(96)),
+                action: Box::new(nested_seq(64)),
                 duration: Duration::from_secs(5),
                 on_timeout: Box::new(Action::Pure(Value::U64(999))),
             }),
@@ -593,7 +622,7 @@ fn interact_depth_guard_clean_registry_then_new_blueprint() {
     std::fs::write(&pa, b"ig-original").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 触发深度守卫（深度 200 ≫ 阈值 96）→ Other(105)，进程不 abort。
+    // 触发深度守卫（深度 200 ≫ 阈值 64）→ Other(105)，进程不 abort。
     let e = rt.run_blocking(nested_seq(200)).unwrap_err();
     assert_eq!(e, SysError::Other(105), "超深蓝图应触发深度守卫");
     // 守卫错误零副作用：undo 空、registry 无句柄。
@@ -723,7 +752,10 @@ fn interact_flush_undo_restores_content_and_cursor() {
         .unwrap();
     assert_eq!(pos, Value::U64(7), "写后游标在 7");
 
-    // Replace（D10 = recover + clear）：undo 恢复内容**与游标**。
+    // Replace（D10 = recover + clear）：undo 恢复内容；旧 fd 随之失效（RFC-05，
+    // registry 活性唯一真相）——游标复原维度改经重开新 fd 观察（世界恢复至
+    // 执行前，pos=0；写前位置 5 的游标态随旧 fd 一并失效，A6 双态仍由
+    // rev_undo_restores_file_cursor 经 recover() 路径覆盖）。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
@@ -734,7 +766,7 @@ fn interact_flush_undo_restores_content_and_cursor() {
         b"hello world",
         "undo 恢复写前内容"
     );
-    let pos = rt
+    let e = rt
         .run_blocking(syscall(
             DataOp::Seek {
                 fd,
@@ -744,10 +776,19 @@ fn interact_flush_undo_restores_content_and_cursor() {
             vec![rd(fd)],
             Action::Pure,
         ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "Replace 后旧 fd 失效（NotFound）");
+    let fd2 = open_fd(&mut rt, pa.clone());
+    let pos = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: fd2,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(fd2)],
+            Action::Pure,
+        ))
         .unwrap();
-    assert_eq!(
-        pos,
-        Value::U64(5),
-        "undo 恢复游标到写前位置 5（非写后 7，A6 双态 w;w̄=1）"
-    );
+    assert_eq!(pos, Value::U64(0), "重开新 fd 游标为 0（世界恢复至执行前）");
 }

@@ -293,7 +293,7 @@ fn rev_undo_restores_file_cursor() {
 /// `poll_write` 把数据拷入内部缓冲后立即返回 Ready，OS 写经后台 blocking 任务完成。
 /// executor 若不在 Write op 返回前 `flush`，紧接的同步 `std::fs::read` 会读到写前
 /// 旧内容（并行负载下 blocking pool 饱和拉宽在飞窗口 → 复现率 ~10-17%，见
-/// `rev_undo_restores_file_cursor` 与 `lin_stale_fd_write_after_replace_succeeds`）。
+/// `rev_undo_restores_file_cursor` 与 `lin_stale_fd_write_after_replace_fails`）。
 /// 本测试多轮 Write+立即同步读：任一轮读到旧内容即触发（修复前并行负载下
 /// 复现率 6~17%，本测试放大后 30 跑 13 跑触发）。
 #[test]
@@ -302,25 +302,28 @@ fn rev_write_effect_immediately_observable_via_sync_read() {
     let pa = dir.path().join("obs.txt");
     std::fs::write(&pa, b"0000000000").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let fd = {
-        let v = rt
-            .run_blocking(syscall(
-                DataOp::Open {
-                    path: pa.clone(),
-                    flags: OpenFlags {
-                        read: true,
-                        write: true,
-                        ..Default::default()
-                    },
-                },
-                vec![wr_path(pa.clone())],
-                Action::Pure,
-            ))
-            .unwrap();
-        fd_of(&v)
-    };
     for i in 0..64u8 {
         let payload = [b'A' + (i % 26); 4];
+        // RFC-05 修复后 Replace 使旧 fd 失效（registry 活性唯一真相，见
+        // lin_stale_fd_write_after_replace_fails）——每轮重开新 fd（顺带覆盖
+        // D10「Replace 后同路径重开正常」，见 lin_replace_then_reopen_same_path_ok）。
+        let fd = {
+            let v = rt
+                .run_blocking(syscall(
+                    DataOp::Open {
+                        path: pa.clone(),
+                        flags: OpenFlags {
+                            read: true,
+                            write: true,
+                            ..Default::default()
+                        },
+                    },
+                    vec![wr_path(pa.clone())],
+                    Action::Pure,
+                ))
+                .unwrap();
+            fd_of(&v)
+        };
         rt.run_blocking(syscall(
             DataOp::Seek {
                 fd,
@@ -348,8 +351,8 @@ fn rev_write_effect_immediately_observable_via_sync_read() {
             &payload[..],
             "第 {i} 轮：Write op 完成后效果必须立即可观察"
         );
-        // Replace（D10 = recover + reg.clear）复位 A4 线性标记并撤销本轮 Write，
-        // 供下一轮复用同一 fd（Write 的 WriteOnly 资源每轮只允许一次）。
+        // Replace（D10 = recover + reg.clear）复位 A4 线性标记并撤销本轮 Write 与
+        // Open（旧 fd 随之失效，RFC-05）——下一轮重开新 fd 复用同一文件。
         rt.run_blocking(Action::Replace {
             target: Box::new(Action::Pure(Value::Unit)),
         })
@@ -528,12 +531,15 @@ fn lin_fork_conflict_double_write_then_parent_blocked() {
     );
 }
 
-/// D10 泄漏对抗：Replace（recover + reg.clear）后，**旧 fd 应已死亡**——
-/// 任何经解释器使用旧 fd 的操作都应失败（registry 句柄已释放）。实测：
-/// executor 侧 `files` 映射仍持有强引用（RFC-05 已知残留），旧 fd Write
-/// 仍成功且物理落盘——D10「资源不泄漏」的可观察偏差证据。
+/// D10 泄漏对抗（RFC-05 修复后）：Replace（recover + reg.clear）后，**旧 fd
+/// 应已死亡**——任何经解释器使用旧 fd 的操作都应失败（NotFound）。修复前
+/// executor 侧 `files` 映射仍持旧 fd 的 Arc 强引用，旧 fd Write 仍成功且物理
+/// 落盘（历史偏差测试 `lin_stale_fd_write_after_replace_succeeds` 记录；R2
+/// `r1_stale_fd_write_after_replace_recheck` 复现）；修复后 executor 以
+/// registry 为 fd 活性唯一真相，旧 fd 任何操作（Write/Read/Close）一律
+/// NotFound。
 #[test]
-fn lin_stale_fd_write_after_replace_succeeds() {
+fn lin_stale_fd_write_after_replace_fails() {
     let dir = tempfile::tempdir().unwrap();
     let pa = dir.path().join("stale.txt");
     std::fs::write(&pa, b"seed-data").unwrap();
@@ -576,24 +582,243 @@ fn lin_stale_fd_write_after_replace_succeeds() {
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), b"seed-data", "内容已恢复");
 
-    // 偏差（RFC-05 已知残留的 E2E 证据）：executor.files 仍持 Arc → 旧 fd 可写
-    let v = rt.run_blocking(syscall(
-        DataOp::Write {
-            fd,
-            data: b"ZZ".to_vec(),
-        },
-        vec![wr(fd)],
-        Action::Pure,
-    ));
-    assert!(
-        v.is_ok(),
-        "偏差证实：Replace 后旧 fd Write 仍成功（executor 侧句柄残留）"
+    // 修复后（RFC-05）：旧 fd 写必须失败（NotFound）——executor 不得绕过
+    // registry 直接使用残留的工作对象缓存。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"ZZ".to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "修复后：Replace 后旧 fd Write 必须失败（registry 已失效）"
     );
-    assert_ne!(
+    assert_eq!(
         std::fs::read(&pa).unwrap(),
         b"seed-data",
-        "旧 fd 的写确实物理落盘——恢复后的状态被再次破坏"
+        "旧 fd 写失败 → 恢复后的内容不再被破坏"
     );
+}
+
+/// RFC-05 修复配套：Replace 后旧 fd 的 Read / Close 同样失败（NotFound）。
+/// 修复前 Read 经 `self.files` 直达物理句柄仍可读；Close 经 executor 内部
+/// 映射 remove 分支「成功关闭」已失效 fd（registry remove 为 no-op）——修复
+/// 后统一以 registry 活性判定：旧 fd 任何操作均 NotFound，恢复后的状态不再
+/// 被触碰。
+#[test]
+fn lin_stale_fd_read_close_fail_after_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("stale-rc.txt");
+    std::fs::write(&pa, b"seed-data").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let fd = {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: OpenFlags {
+                        read: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                },
+                vec![wr_path(pa.clone())],
+                Action::Pure,
+            ))
+            .unwrap();
+        fd_of(&v)
+    };
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+
+    // Replace 后：registry 句柄已释放、内容已恢复
+    assert!(rt.registry().lookup(fd).is_none(), "registry 句柄已释放");
+    assert_eq!(std::fs::read(&pa).unwrap(), b"seed-data", "内容已恢复");
+
+    // 旧 fd Read → NotFound（修复前经 self.files 直达仍可读）
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Read { fd, len: 4 },
+            vec![rd(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "Replace 后旧 fd Read 应失败（registry 已失效）"
+    );
+    // 旧 fd Close → NotFound（修复前经 executor 内部映射 remove 会成功）
+    let e = rt
+        .run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "Replace 后旧 fd Close 应失败（registry 已失效）"
+    );
+    // 内容未被任何失败操作破坏
+    assert_eq!(std::fs::read(&pa).unwrap(), b"seed-data", "内容保持恢复态");
+}
+
+/// RFC-05 修复配套：Replace 后同路径重开正常（D10「资源状态恢复至执行前」+
+/// A4 复位）：新 fd 完全可用（Write 物理生效），旧 fd 彻底失效。既有
+/// `conc_repeat_blueprint_100_rounds_deterministic` 覆盖多轮 fd 序列，本测试
+/// 做单轮内容级验证。
+#[test]
+fn lin_replace_then_reopen_same_path_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("reopen.txt");
+    std::fs::write(&pa, b"seed-data").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let fd0 = {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: rw_flags(),
+                },
+                vec![wr_path(pa.clone())],
+                Action::Pure,
+            ))
+            .unwrap();
+        fd_of(&v)
+    };
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+
+    // 同路径重开：新 fd（D1 单调不复用），完整可用
+    let fd1 = {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: rw_flags(),
+                },
+                vec![wr_path(pa.clone())],
+                Action::Pure,
+            ))
+            .unwrap();
+        fd_of(&v)
+    };
+    assert_ne!(fd0, fd1, "重开分配新 fd（D1 不复用）");
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: fd1,
+            data: b"new".to_vec(),
+        },
+        vec![wr(fd1)],
+        Action::Pure,
+    ))
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"newd-data",
+        "重开句柄写生效：游标 0 覆写 seed 前 3 字节（see→new，d-data 保留）"
+    );
+    // 旧 fd 仍彻底失效
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd: fd0,
+                data: b"ZZ".to_vec(),
+            },
+            vec![wr(fd0)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "旧 fd 仍失效（NotFound）");
+    assert_eq!(std::fs::read(&pa).unwrap(), b"newd-data", "旧 fd 写未落盘");
+}
+
+/// RFC-05 修复配套：Fork 并行分支内 Replace 的隔离性（D13）。左分支
+/// Replace 只清**分支 registry**——其旧 fd 写失败（NotFound）；父级 registry
+/// 与右分支的同一逻辑 fd 仍存活可用。修复不得以共享缓存（self.files）的
+/// 全局失效为代价（只读校验，不删共享条目）。左分支资源与右分支不相交 →
+/// can_parallel=true → 真并行路径；run_fork_parallel 在两分支均完成后才
+/// 返回错误 → 右分支效果与两分支 registry 均已合并回父。
+#[test]
+fn conc_fork_parallel_branch_replace_isolation() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("iso-a.txt");
+    let pb = dir.path().join("iso-b.txt");
+    std::fs::write(&pa, b"seed").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    // 父级打开 pa → fd_a（Fork 后两分支 registry 克隆均含 fd_a）
+    let fda = {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: rw_flags(),
+                },
+                vec![wr_path(pa.clone())],
+                Action::Pure,
+            ))
+            .unwrap();
+        fd_of(&v)
+    };
+
+    // 并行 Fork：左分支 Replace + 旧 fd 写（应 NotFound，左优先传播错误）；
+    // 右分支 Open pb + Write（独立资源）。
+    let bp = Action::Fork {
+        left: Box::new(Action::Sequential {
+            current: Box::new(Action::Replace {
+                target: Box::new(Action::Pure(Value::Unit)),
+            }),
+            next: Box::new(move |_| {
+                syscall(
+                    DataOp::Write {
+                        fd: fda,
+                        data: b"L".to_vec(),
+                    },
+                    vec![wu(fda)],
+                    Action::Pure,
+                )
+            }),
+        }),
+        right: Box::new(open_write_pure(pb.clone(), b"R")),
+        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+    };
+    let e = rt.run_blocking(bp).unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "左分支 Replace 后旧 fd Write 应 NotFound（左优先传播）"
+    );
+
+    // 隔离性证据：分支级 Replace 未波及父级与右分支
+    assert!(
+        rt.registry().lookup(fda).is_some(),
+        "父级 fd_a 仍存活（D13：分支级 Replace 只清分支 registry）"
+    );
+    assert_eq!(std::fs::read(&pb).unwrap(), b"R", "右分支写物理生效");
+    assert_eq!(std::fs::read(&pa).unwrap(), b"seed", "左分支旧 fd 写未落盘");
+
+    // 父级继续使用 fd_a 正常（executor 共享缓存未被分支级 Replace 破坏）
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: fda,
+            data: b"P".to_vec(),
+        },
+        vec![wr(fda)],
+        Action::Pure,
+    ))
+    .unwrap();
+    assert_eq!(std::fs::read(&pa).unwrap(), b"Peed", "父级 fd_a 写生效");
 }
 
 // ══════════════════════════════════════════════════════════════════════

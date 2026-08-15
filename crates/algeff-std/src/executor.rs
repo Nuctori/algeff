@@ -21,12 +21,21 @@
 //!   Wait/Kill 以 pid 为键，天然隐藏轮换。
 //! - **`&self` 型操作**（`TcpListener::accept`、`UdpSocket::recv_from/send_to`、
 //!   `TcpStream::shutdown` 之外）：直接经 registry 查找。
+//!
+//! ## fd 活性（RFC-05 修复）
+//! registry 是 fd 活性的唯一真相：`Replace`（D10：recover + `reg.clear()`）清空
+//! 注册表后，旧 fd 在 executor 内部映射中仍可见（历史可观察反例：旧 fd Write
+//! 成功且物理落盘）。修复：所有经内部映射直达物理句柄的操作先校验 registry
+//! 活性，失效 → `NotFound`；**只读校验、不删除共享缓存条目**（Fork 并行分支
+//! 共享执行器缓存但各持 registry 克隆 D13，分支级 Replace 后另一分支的同 fd
+//! 必须仍可用——删除共享条目会破坏隔离）。
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use algeff_core::runtime::MAX_IO_LEN;
 use algeff_core::{
     AccessMode, BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceArbiter,
     ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoOp, Value,
@@ -260,6 +269,22 @@ impl TokioExecutor {
             .copied()
     }
 
+    /// RFC-05 修复（fd 活性）：文件工作对象缓存（`self.files`）是否已失效。
+    /// registry 是 fd 活性的唯一真相——`Replace`（D10：recover + `reg.clear()`）
+    /// 清空注册表后，旧 fd 在 `self.files` 中仍可见（历史可观察反例：旧 fd
+    /// Write 成功且物理落盘），所有经缓存直达物理句柄的路径必须先过本校验，
+    /// 失效 → `NotFound`（与轮换型句柄经 `reg.take` 天然 NotFound 的行为对齐）。
+    /// **只读校验、不删除缓存条目**：Fork 并行分支共享执行器缓存但各持 registry
+    /// 克隆（D13），分支级 Replace 后另一分支的同 fd 仍须可用——按本分支 registry
+    /// 删共享条目会破坏隔离。
+    fn file_fd_stale(&self, fd: u64, reg: &ResourceRegistry) -> bool {
+        self.files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd)
+            && reg.lookup(fd).is_none()
+    }
+
     /// 轮换型句柄操作后放回：注册表分配新 fd（D1 单调），更新逻辑映射。
     fn put_back(&mut self, fd: u64, handle: ResourceHandle, reg: &mut ResourceRegistry) {
         let new_fd = reg.allocate(handle);
@@ -386,7 +411,8 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
-        // undo=None：物理关闭由 Arc Drop 保证；Fd 表残留清理列入 RFC-05。
+        // undo=None：物理关闭由 Arc Drop 保证；旧 fd 失效由 RFC-05 修复兜底
+        // （registry 活性校验，见 file_fd_stale）。
         Ok((Value::Fd(fd), None))
     }
 
@@ -396,6 +422,10 @@ impl TokioExecutor {
         len: usize,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
+        // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
+        if self.file_fd_stale(fd, reg) {
+            return Err(SysError::NotFound);
+        }
         // 锁内查表（短临界区）：克隆 Arc 后锁即释放，物理 IO 在 per-fd 锁上进行。
         let file = self
             .files
@@ -405,6 +435,9 @@ impl TokioExecutor {
             .cloned();
         if let Some(m) = file {
             let mut g = m.lock().await;
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut buf = vec![0u8; len];
             let n = g.read(&mut buf).await.map_err(to_sys_err)?;
             buf.truncate(n);
@@ -416,6 +449,11 @@ impl TokioExecutor {
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .contains_key(&fd);
         if is_pipe_reader {
+            // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
+            // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut arc = self.take_pipe_reader(fd, reg)?;
             let mut buf = vec![0u8; len];
             let n = {
@@ -445,6 +483,10 @@ impl TokioExecutor {
         data: &[u8],
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
+        // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
+        if self.file_fd_stale(fd, reg) {
+            return Err(SysError::NotFound);
+        }
         // 文件：Full 撤销（<1MB 写前读原内容）或 BestEffort（大文件，undo=None）。
         let file = self
             .files
@@ -488,7 +530,9 @@ impl TokioExecutor {
                     // 若 op 返回时 OS 写仍在飞，调用方随后经 std::fs::read 等同步
                     // 观察会读到写前旧内容。对抗套件两处因此 flaky：
                     // rev_undo_restores_file_cursor（Write 后写可见性断言）与
-                    // lin_stale_fd_write_after_replace_succeeds（旧 fd 写落盘断言），
+                    // lin_stale_fd_write_after_replace_fails（RFC-05 修复后旧 fd
+                    // 写失败断言；修复前为 lin_stale_fd_write_after_replace_succeeds
+                    // 的旧 fd 写落盘断言——随修复反转），
                     // 并行负载下 blocking pool 饱和拉宽在飞窗口 → 复现率 6~17%
                     // （实测）；新回归测试 rev_write_effect_immediately_observable_via_sync_read
                     // 放大后 30 跑 13 跑触发。
@@ -577,7 +621,12 @@ impl TokioExecutor {
         fd: u64,
         offset: i64,
         whence: &std::io::SeekFrom,
+        reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
+        // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
+        if self.file_fd_stale(fd, reg) {
+            return Err(SysError::NotFound);
+        }
         let m = self
             .files
             .lock()
@@ -768,7 +817,8 @@ impl TokioExecutor {
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let listener = TcpListener::bind(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpListener(Arc::new(listener)));
-        // undo=None：关闭由 Arc Drop 保证；Fd 表残留清理列入 RFC-05。
+        // undo=None：关闭由 Arc Drop 保证；旧 fd 失效由 RFC-05 修复兜底
+        // （registry 活性校验，见 file_fd_stale）。
         Ok((Value::Fd(fd), None))
     }
 
@@ -810,6 +860,11 @@ impl TokioExecutor {
         len: usize,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
+        // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
+        // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
+        if len > MAX_IO_LEN {
+            return Err(SysError::InvalidInput);
+        }
         let mut arc = self.take_tcp_stream(fd, reg)?;
         let mut buf = vec![0u8; len];
         let n = {
@@ -925,6 +980,9 @@ impl TokioExecutor {
             ResourceHandle::UdpSocket(s) => s,
             _ => return Err(SysError::InvalidInput),
         };
+        if len > MAX_IO_LEN {
+            return Err(SysError::InvalidInput);
+        }
         let mut buf = vec![0u8; len];
         let (n, addr) = sock.recv_from(&mut buf).await.map_err(to_sys_err)?;
         buf.truncate(n);
@@ -1139,6 +1197,13 @@ impl TokioExecutor {
         prot: &MmapProt,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
+                      // 审计 R2-F3 修复：读入前校验文件大小上限（tokio::fs::read 按文件全量
+                      // 读入——蓝图对宿主大文件 Mmap 即触发与文件等大的分配，debug 下分配
+                      // 失败 = 进程级 abort，与 R7-⑤ 修前同族拒绝服务面）。
+        let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
+        if meta.len() > MAX_IO_LEN as u64 {
+            return Err(SysError::InvalidInput);
+        }
         let mut bytes = tokio::fs::read(path).await.map_err(to_sys_err)?;
         // 按 len 截断（medium-7）：映射长度语义；文件短于 len 时返回实际长度。
         if bytes.len() > len {
@@ -1278,7 +1343,11 @@ impl TokioExecutor {
             // 同 fd 读写 → 自拷贝（无意义）；拒绝（InvalidInput）。
             return Err(SysError::InvalidInput);
         }
-        // 输入侧：文件（seek + read）。
+        // 输入侧：文件（seek + read）。RFC-05 修复：文件 fd 须在 registry 中
+        // 存活（registry 是 fd 活性唯一真相；Replace 后旧 fd 失效 → NotFound）。
+        if self.file_fd_stale(input, reg) {
+            return Err(SysError::NotFound);
+        }
         let in_file = self
             .files
             .lock()
@@ -1291,6 +1360,9 @@ impl TokioExecutor {
             g.seek(std::io::SeekFrom::Start(offset as u64))
                 .await
                 .map_err(to_sys_err)?;
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut buf = vec![0u8; len];
             let mut filled = 0usize;
             while filled < buf.len() {
@@ -1303,7 +1375,11 @@ impl TokioExecutor {
             buf.truncate(filled);
             buf
         };
-        // 输出侧：文件 / TCP 流 / 管道写端。
+        // 输出侧：文件 / TCP 流 / 管道写端。RFC-05 修复：文件输出 fd 同样须在
+        // registry 中存活（流/管道输出经 take 天然校验，文件路径需显式校验）。
+        if self.file_fd_stale(out, reg) {
+            return Err(SysError::NotFound);
+        }
         // 锁内查表（短临界区）：绑定局部后再进入分支，映射锁不在 await/&mut self
         // 期间持有（R-6：状态访问持锁、物理 IO 锁外）。
         let out_file = self
@@ -1439,34 +1515,42 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
-        if let Some(cur) = self
-            .stream_fds
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&new_fd)
-        {
-            reg.remove(cur);
-        } else if let Some(cur) = self
-            .pipe_reader_fds
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&new_fd)
-        {
-            reg.remove(cur);
-        } else if let Some(cur) = self
-            .pipe_writer_fds
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&new_fd)
-        {
-            reg.remove(cur);
-        } else {
-            let _ = reg.take(new_fd);
+        // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
+        // RFC-05 修复：new_fd 已在 registry 失效（Replace 后旧 fd）→ 不再触碰
+        // 共享缓存（D13 隔离：另一分支的同 fd 仍存活），由下方 op_dup 对
+        // old_fd 的 registry 校验统一判定（new 失效 + old 存活 → 仍按 POSIX
+        // dup2 语义成功，仅不清理共享缓存）。
+        let cur_new = self.translated_fd(new_fd).unwrap_or(new_fd);
+        if reg.lookup(cur_new).is_some() {
+            if let Some(cur) = self
+                .stream_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
+                reg.remove(cur);
+            } else if let Some(cur) = self
+                .pipe_reader_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
+                reg.remove(cur);
+            } else if let Some(cur) = self
+                .pipe_writer_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
+                reg.remove(cur);
+            } else {
+                let _ = reg.take(new_fd);
+            }
+            self.files
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd);
         }
-        self.files
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&new_fd);
         // 决策 D1（fd 全局单调、永不复用）使 Dup2 无法精确落到 new_fd：
         // 语义退化为「先关 new_fd，再复制 old_fd 到新 fd」（注释）。
         let (v, undo) = self.op_dup(old_fd, reg).await?;
@@ -1478,6 +1562,15 @@ impl TokioExecutor {
         fd: u64,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
+        // RFC-05 修复：关闭前先校验 registry 活性——Replace（reg.clear()）后旧
+        // fd 在 executor 内部映射（files/stream/pipe）中仍残留，直接 remove 会
+        // 「成功关闭」已失效 fd（可观察反例）；以 registry 为唯一真相：失效 →
+        // NotFound，且**不触碰共享缓存**（D13：分支级 Replace 后另一分支同 fd
+        // 仍存活）。轮换型 fd 经 translated_fd 映射到当前注册表 fd 判定。
+        let cur = self.translated_fd(fd).unwrap_or(fd);
+        if reg.lookup(cur).is_none() {
+            return Err(SysError::NotFound);
+        }
         if let Some(cur) = self
             .stream_fds
             .lock()
@@ -1512,7 +1605,8 @@ impl TokioExecutor {
         } else {
             return Err(SysError::NotFound);
         }
-        // undo=None：关闭不可逆；Fd 表残留清理列入 RFC-05。
+        // undo=None：关闭不可逆；旧 fd 失效由 RFC-05 修复兜底（op_close 先校验
+        // registry 活性，失效 fd 的 Close → NotFound）。
         Ok((Value::Unit, None))
     }
 }
@@ -1544,7 +1638,9 @@ impl SyscallExecutor for TokioExecutor {
                 DataOp::Read { fd, len } => self.op_read(*fd, *len, registry).await,
                 DataOp::Write { fd, data } => self.op_write(*fd, data, registry).await,
                 DataOp::Close { fd } => self.op_close(*fd, registry).await,
-                DataOp::Seek { fd, offset, whence } => self.op_seek(*fd, *offset, whence).await,
+                DataOp::Seek { fd, offset, whence } => {
+                    self.op_seek(*fd, *offset, whence, registry).await
+                }
                 DataOp::Stat { path } => self.op_stat(path).await,
                 DataOp::Chmod { path, mode } => self.op_chmod(path, *mode).await,
                 DataOp::Chown { path, uid, gid } => self.op_chown(path, *uid, *gid).await,
@@ -1929,5 +2025,54 @@ mod tests {
             SysError::CrossDevice,
             "kind=CrossesDevices → EXDEV(18) → CrossDevice（非 AlreadyExists）"
         );
+    }
+
+    /// R-6：`fork_snapshot` 契约——TokioExecutor 必须返回 `Some`（快照通道
+    /// 启用），且快照与父共享内部状态表 Arc（O(1) 克隆，不复制物理句柄）：
+    /// 父先分配文件 fd，快照实例立即可见（共享 `files` 映射）——这正是
+    /// run_fork_parallel 分支在预开 fd 上并行读的前提；同一 fd 的游标仍经共享
+    /// per-fd 锁串行（快照读后父读 EOF，游标语义不变）。
+    #[tokio::test]
+    async fn fork_snapshot_shares_state_and_enables_branch_channel() {
+        let mut ex = TokioExecutor::new();
+        let mut snap = ex
+            .fork_snapshot()
+            .expect("TokioExecutor 必须支持快照（R-6 快照通道）");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("snap_share.bin");
+        std::fs::write(&p, b"hello").expect("setup");
+        let mut reg = ResourceRegistry::default();
+        // 父侧 Open（DataOp 局部变量：execute 返回的 BoxFuture 借用 op，
+        // 临时值在语句末 drop 会悬垂，须绑定到局部）。
+        let op = DataOp::Open {
+            path: p.clone(),
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+        };
+        let (v, _) = ex
+            .execute(&op, &mut reg)
+            .await
+            .expect("父侧 Open");
+        let fd = match v {
+            Value::Fd(f) => f,
+            other => panic!("期望 Fd，得到 {other:?}"),
+        };
+        // 快照侧同 fd 读（共享 files 表与 per-fd 锁）。
+        let op = DataOp::Read { fd, len: 5 };
+        let (v, _) = snap
+            .execute(&op, &mut reg)
+            .await
+            .expect("快照共享 fd 读取");
+        assert_eq!(v, Value::Bytes(b"hello".to_vec()));
+        // 父侧再读：同 fd 游标已推进 → EOF（快照与父共享 per-fd 锁/游标，
+        // 游标语义串行不变）。
+        let op = DataOp::Read { fd, len: 5 };
+        let (v2, _) = ex
+            .execute(&op, &mut reg)
+            .await
+            .expect("父共享 fd 读取");
+        assert_eq!(v2, Value::Bytes(vec![]), "同 fd 游标共享：快照读后父读 EOF");
     }
 }

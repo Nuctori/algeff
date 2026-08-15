@@ -125,7 +125,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 
 ## 4 关键决策推导
 
-### 4.1 深度守卫阈值 96 的实测-裁决链（RFC-11 / D-051 / D-052 / D-054 / D-055）
+### 4.1 深度守卫阈值的实测-裁决链（RFC-11 / D-051 / D-052 / D-054 / D-055；迭代 1：96→64）
 
 | 环节 | 事实 | 证据 |
 | --- | --- | --- |
@@ -134,15 +134,17 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | 实测 | 未守卫探针：深度 **104 Ok / 108 abort**（0xc00000fd）→ 崩溃边界 ~104–108；原定阈值 128 在 2MB 栈下晚于崩溃触发（128 帧 ≈2.2MB+ 已越过边界，守卫自身先崩） | D-052 上下文（A2 批 7 `444b6708`） |
 | 裁决 | 阈值取 **96** = 实测边界 104 留 ~8% 余量（帧大小随嵌套构造/编译器版本波动）；错误 = `Err(SysError::Other(105))`（ENOBUFS 语义近似，冻结面内零契约变更），可被外层 Catch 捕获 | D-052（supervisor 裁决 `f0de9812`） |
 | 方向勘误 | 左结合形式 `(a;b);c` 型 current 嵌套**先触及阈值**（消耗深度 = 链长 − 1）；右结合 `a;(b;c)` 型 next-CPS 延续**恒为深度 1**；超限行为不在 P1 结合律承诺内 | D-053/D-054 + `spec/proof-obligations.md` P1 行 |
-| 范围修正 | 守卫保证限于 ≥2MB 栈；Windows 主线程默认 1MB（实测崩溃边界 ~50–54 帧），55~95 层会在守卫触发前 abort → 属用户责任；正确缓解 = 链接器 `/STACK` / spawn 线程（`RUST_MIN_STACK` 只影响新线程）/ Catch Other(105) | D-055（`b756e03`） |
+| 范围修正 | 守卫保证限于 ≥2MB 栈；Windows 主线程默认 1MB（实测崩溃边界 ~50–54 帧），55~63 层会在守卫触发前 abort → 属用户责任；正确缓解 = 链接器 `/STACK` / spawn 线程（`RUST_MIN_STACK` 只影响新线程）/ Catch Other(105) | D-055（`b756e03`）+ 迭代 1 阈值 64 后更新 |
+| 迭代 1 复测（2026-08-16） | 取消传播协议（RFC-08/09）加入后解释器状态机帧膨胀：实测 80 OK / 88 崩（每层 ~23KB，96 已无安全余量）→ 阈值 **96→64**（64 安全、余量 ~25%）；帧优化列为阶段 2 迭代项 | D-081 + `spec/resource-notes.md` §10 RFC-11 |
 
 **深度公式（D-054 勘误后）**：
 
-- 左结合链（`adapters::seq()` 左折叠，current 嵌套）：解释深度 = 链长 − 1；链长 **L ≥ 97** →
-  `Err(Other(105))`，用户需改右结合（and_then CPS）或 Catch。
+- 左结合链（`adapters::seq()` 左折叠，current 嵌套）：解释深度 = 链长 − 1；链长 **L ≥ 65** →
+  `Err(Other(105))`（迭代 1 阈值 96→64 后口径；原 97 为阈值 96 时数值），用户需改右结合
+  （and_then CPS）或 Catch。
 - 右结合链（next-CPS 延续）：恒深 1，不受守卫限制（受内存约束）。
-- 实测安全深度：64（`deep_nesting_under_limit_ok`，与 R4c 一致）；回归对照
-  `nested_sequential_64_deep_recursive_frames_values_flow`。
+- 实测安全深度：62（`deep_nesting_under_limit_ok`、`nested_sequential_62_deep_...`）；
+  回归对照 `guard_boundary_63_ok_64_65_err`、`depth_guard_seq_64_ok_65_err`。
 
 ### 4.2 Fork 并行：静态冲突判定 → 双路径（D6/D14/D17）
 
@@ -245,7 +247,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | RFC-08 | Timeout 内并行 Fork 孤儿分支副作用不可撤销（P4/A6 边界反例） | 已登记（R2 编号修正）；**阶段 3+** | 取消传播/分支取消协议 |
 | RFC-09 | Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover（可恢复，非永久毒化） | 已登记（R3）；**阶段 3+** | 取消传播协议 |
 | RFC-10 | Windows 错误码未映射 POSIX 语义（Other(80) vs AlreadyExists 等） | **已修复**（R5 后，fdd0cfe：executor 层 `to_sys_err` + `normalize_windows_errno`，冻结面零改动） | ErrorKind 优先 + Win32/WSA 码表兑底 |
-| RFC-11 | 解释器嵌套蓝图递归栈溢出（进程级 abort） | **已修复**（R4→A2 批 7，阈值 96 深度守卫，D-052） | — |
+| RFC-11 | 解释器嵌套蓝图递归栈溢出（进程级 abort） | **已修复**（R4→A2 批 7，深度守卫，D-052；迭代 1 复测裁决阈值 96→64） | — |
 
 另：审计期内另有 2 项**非 RFC 编号**缺陷已修复——R1 游标撤销（D-031）、R3 SendFile flush
 （D-046）。合计审计共修复 3 项缺陷；R5 后新增修复 RFC-10（Windows 错误码归一化，fdd0cfe）——共 4 项。

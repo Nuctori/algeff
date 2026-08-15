@@ -9,9 +9,10 @@
 //!    - 深度 5 不规则 Fork 树 → 全 fd 两两不相交 + 执行器映射读回正确；
 //!    - 同一 Runtime 50 轮 Fork 连续执行 → fd 紧凑单调（归一化生效，无爆涨）；
 //!    - 1000 个顺序冲突 Fork → 区间序号单调、fd 不碰撞、next_fd 不爆涨；
-//!    - **已知缺陷 RFC-06**：右分支有分配的连续 Fork 使 next_fd 呈二次增长
-//!      （每轮 +k·2^48），~360 轮后 u64 溢出（debug panic / release 回绕），
-//!      阶段 3+ 修复（`ResourceRegistry::offset_next_fd` / merge 归一化）；
+//!    - **RFC-06（已修复）**：右分支有分配的连续 Fork 曾使 next_fd 二次增长
+//!      （每轮 +k·2^48），~360 轮后 u64 溢出（debug panic / release 回绕）——
+//!      `ResourceRegistry::merge` 锚点吸收修复（分支 fork_region 根基线回灌父，
+//!      后续轮次偏移锚定根基线，父 next_fd 线性增长；见 spec §10 RFC-06）；
 //!    - **已知缺陷 RFC-07**：管道半端（PipeReader/PipeWriter）经 Fork registry
 //!      Clone（D13）共享 Arc，分支内对管道 IO 时 executor 的 `Arc::get_mut`
 //!      失败 → InvalidInput（文件工作对象是 Arc<Mutex<File>>，不受影响）。
@@ -26,7 +27,7 @@
 //! 3. **R1 修复回归**：
 //!    - 游标撤销在嵌套 Sequential + Replace 组合下仍成立；
 //!    - put_back 错误循环（TcpShutdown try_unwrap 分支）10 次后 fd 仍可用；
-//!    - RFC-05 偏差（Replace 后旧 fd 可写）在新代码上仍复现 + 分支级 Replace
+//!    - RFC-05 已修复（Replace 后旧 fd 写失败 NotFound）+ 分支级 Replace
 //!      不清父级 A4 状态的隔离语义。
 //! 4. **Fork 顺序/并行错误路径**：左分支 Err → 右分支副作用发生 → 错误传播
 //!    → Catch 捕获后右分支 merge 的句柄仍可见。
@@ -407,16 +408,16 @@ fn fd_1000_conflict_forks_region_seq_and_fd_monotonic() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 1d【已知缺陷记录 RFC-06】：右分支有分配的连续 Fork 使父 next_fd 每轮
-// 抬高 k·2^48（k = 全局区间序号，二次增长），~360 轮后 base + k<<48 溢出
-// u64（debug panic / release 回绕 → fd 碰撞）。修复点
-// （ResourceRegistry::offset_next_fd / merge 的区间归一化）不在本审计允许的
-// 最小修复范围（runtime.rs / executor.rs）内，只记录不修（R1 RFC-05 先例：
-// 以「断言偏差可复现」的测试记录，修复后测试会失败提醒更新）。
+// 攻击面 1d【RFC-06 已修复】：右分支有分配的连续 Fork —— `ResourceRegistry`
+// merge 锚点吸收（分支 fork_region 根基线回灌父，后续轮次偏移锚定根基线）
+// 后，父 next_fd 线性增长（每轮恰跨一个 2^48 区间），不再 Σk·2^48 二次增长
+// （~362 轮 u64 溢出，debug panic / release 回绕 → fd 复用，违反 D1）。
+// 确定性回归门（精确线性公式）见 resource.rs 单测
+// `merge_right_branch_alloc_anchors_base_no_quadratic_growth`。
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn fd_region_quadratic_growth_known_deviation() {
+fn fd_region_right_branch_alloc_linear_not_quadratic() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let mut seen = std::collections::HashSet::new();
     for _ in 0..30u64 {
@@ -431,8 +432,8 @@ fn fd_region_quadratic_growth_known_deviation() {
                     // 左分支声明 wu(wfd) 与右分支 rd(wfd) 冲突 → 顺序路径；
                     // 左分支 op 改用 PipeOpen（新建管道，不与父管道 Arc 共享——
                     // 分支内对父管道半端 IO 会触发 RFC-07 的 Arc::get_mut 失败）；
-                    // 右分支 PipeOpen 在 k<<48 区间**实际分配 2 个 fd** →
-                    // merge 归一化失效（游标已被移动）→ 父 next_fd 抬高 k·2^48。
+                    // 右分支 PipeOpen 在 k<<48 区间**实际分配 2 个 fd**（修复后
+                    // 偏移锚定根基线，父 next_fd 线性增长）。
                     Action::Fork {
                         left: Box::new(syscall(
                             DataOp::PipeOpen {
@@ -456,67 +457,77 @@ fn fd_region_quadratic_growth_known_deviation() {
             ))
             .unwrap();
         let (rfd, wfd) = pair_of(&v);
-        assert!(seen.insert(rfd), "父管道 rfd 碰撞");
-        assert!(seen.insert(wfd), "父管道 wfd 碰撞");
+        assert!(seen.insert(rfd), "父管道 rfd 碰撞（D1）");
+        assert!(seen.insert(wfd), "父管道 wfd 碰撞（D1）");
     }
-    // 30 轮实际只分配 30×4 = 120 个 fd（父 2 + 左分支 2 + 右分支 2 每轮），但
-    // next_fd 已被抬高到 ≥ Σk·2^48（k ≥ 1 且递增，Σ ≥ 465）≈ 2^56 —— 每个
-    // 右分支的**一次分配**永久消耗 2^48 地址空间（D1 单调的代价，RFC-06）。
+    // 30 轮实际分配 30×4 = 120 个 fd；修复后右分支 fd 落在锚定根基线的独立
+    // 区间（[k·2^48, (k+1)·2^48)），父 next_fd 线性量级（≈ k_max·2^48；
+    // 修复前 Σk·2^48 ≥ 2^56 且随轮次发散）。
     let n = rt
         .registry()
         .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(
-        n >= (1u64 << 50),
-        "已知缺陷（记录）：90 次分配后 next_fd 应已爆涨到 ≥ 2^50，实测 {n}"
+        n < (1u64 << 62),
+        "30 轮右分支实际分配后 next_fd 应保持线性量级（< 2^62），实测 {n}"
     );
 }
 
-/// 已知缺陷（debug 构建实证，RFC-06）：右分支有分配的连续 Fork 在 ~360 轮内使
-/// `base + k<<48` 溢出 u64 → debug 构建触发 panic（release 构建静默回绕，
-/// next_fd 回到小值 → 与既有句柄碰撞）。本测试用 catch_unwind 捕获并记录
-/// 该 panic（修复点在 resource.rs，本审计范围外，只记录不修）。
-#[cfg(debug_assertions)]
+/// RFC-06 已修复（回归）：右分支有分配的连续 Fork 400 轮 —— debug 不再
+/// ~362 轮溢出 panic，release 不再回绕复用 fd。修复前 Σ_{k≤n} k·2^48 在
+/// n≈362 轮溢出 u64（debug panic / release 回绕 → fd 碰撞，违反 D1）；修复
+/// 后 merge 锚点吸收使每轮父 next_fd 线性 +2^48（区间锚定根基线），400 轮
+/// ≈ 2^57 无溢出，父管道 fd 逐轮唯一。
 #[test]
-fn fd_region_seq_overflow_panics_under_500_rounds() {
+fn fd_region_seq_no_overflow_or_reuse_400_rounds() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for _ in 0..500u64 {
-            let _ = rt
-                .run_blocking(syscall(
-                    DataOp::PipeOpen {
-                        flags: PipeFlags::default(),
-                    },
-                    vec![],
-                    move |v| {
-                        let (_rfd, wfd) = pair_of(&v);
-                        // 左分支与右分支同 PipeOpen（同 quadratic 测试：分支内
-                        // 不触碰父管道半端，避开 RFC-07；两分支都分配 → 右分支
-                        // k<<48 区间不被归一化 → next_fd 二次增长）。
-                        Action::Fork {
-                            left: Box::new(syscall(
-                                DataOp::PipeOpen {
-                                    flags: PipeFlags::default(),
-                                },
-                                vec![wu(wfd)],
-                                Action::Pure,
-                            )),
-                            right: Box::new(syscall(
-                                DataOp::PipeOpen {
-                                    flags: PipeFlags::default(),
-                                },
-                                vec![rd(wfd)],
-                                Action::Pure,
-                            )),
-                            combine: Box::new(|_, _| Action::Pure(Value::Unit)),
-                        }
-                    },
-                ))
-                .expect("round");
-        }
-    }));
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..400u64 {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::PipeOpen {
+                    flags: PipeFlags::default(),
+                },
+                vec![],
+                move |v| {
+                    let (rfd, wfd) = pair_of(&v);
+                    // 左分支与右分支同 PipeOpen（同 quadratic 测试：分支内
+                    // 不触碰父管道半端，避开 RFC-07；两分支都实际分配 → 右
+                    // 分支 k<<48 区间分配后，merge 锚点吸收保证下轮偏移锚定
+                    // 根基线，父 next_fd 线性增长）。
+                    Action::Fork {
+                        left: Box::new(syscall(
+                            DataOp::PipeOpen {
+                                flags: PipeFlags::default(),
+                            },
+                            vec![wu(wfd)],
+                            Action::Pure,
+                        )),
+                        right: Box::new(syscall(
+                            DataOp::PipeOpen {
+                                flags: PipeFlags::default(),
+                            },
+                            vec![rd(wfd)],
+                            Action::Pure,
+                        )),
+                        combine: Box::new(move |_, _| {
+                            Action::Pure(Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]))
+                        }),
+                    }
+                },
+            ))
+            .expect("round");
+        let (rfd, wfd) = pair_of(&v);
+        assert!(seen.insert(rfd), "父管道 rfd 碰撞（D1 违反）");
+        assert!(seen.insert(wfd), "父管道 wfd 碰撞（D1 违反）");
+    }
+    // 400 轮右分支实际分配后 next_fd 线性量级（≈ k_max·2^48 ≈ 2^57）：修复
+    // 前 Σk·2^48 在 ~362 轮即溢出（debug panic / release 回绕 fd 复用）。
+    let n = rt
+        .registry()
+        .allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
     assert!(
-        outcome.is_err(),
-        "已知缺陷（记录）：500 轮内应触发 u64 溢出 panic（attempt to add with overflow）"
+        n < (1u64 << 62),
+        "400 轮后 next_fd 应保持线性量级（< 2^62），实测 {n}"
     );
 }
 
@@ -806,64 +817,121 @@ fn r1_cursor_undo_nested_seq_replace() {
     let (fda, fdb) = pair_of(&v);
 
     // 嵌套 Sequential：内层 current = Sequential{ Seek(fda,0) → Write "XY" }，
-    // 外层 next = Write(fdb, "PQ") → Replace。
-    let v = rt
-        .run_blocking(Action::Sequential {
-            current: Box::new(Action::Sequential {
-                current: Box::new(syscall(
-                    DataOp::Seek {
-                        fd: fda,
-                        offset: 0,
-                        whence: std::io::SeekFrom::Start(0),
-                    },
-                    vec![rd(fda)],
-                    move |_| {
-                        syscall(
-                            DataOp::Write {
-                                fd: fda,
-                                data: b"XY".to_vec(),
-                            },
-                            vec![wr(fda)],
-                            Action::Pure,
-                        )
-                    },
-                )),
-                next: Box::new(move |_| {
+    // 外层 next = Write(fdb, "PQ") → Replace。RFC-05 修复后 Replace =
+    // recover + reg.clear() 在 target 执行**前**完成——旧 fd 已失效，target
+    // 不得再触碰（旧实现 target 内 Seek 旧 fd 观察游标；修复后该路径 NotFound）。
+    rt.run_blocking(Action::Sequential {
+        current: Box::new(Action::Sequential {
+            current: Box::new(syscall(
+                DataOp::Seek {
+                    fd: fda,
+                    offset: 0,
+                    whence: std::io::SeekFrom::Start(0),
+                },
+                vec![rd(fda)],
+                move |_| {
                     syscall(
                         DataOp::Write {
-                            fd: fdb,
-                            data: b"PQ".to_vec(),
+                            fd: fda,
+                            data: b"XY".to_vec(),
                         },
-                        vec![wr(fdb)],
-                        move |_| Action::Replace {
-                            target: Box::new(syscall(
+                        vec![wr(fda)],
+                        Action::Pure,
+                    )
+                },
+            )),
+            next: Box::new(move |_| {
+                syscall(
+                    DataOp::Write {
+                        fd: fdb,
+                        data: b"PQ".to_vec(),
+                    },
+                    vec![wr(fdb)],
+                    move |_| Action::Replace {
+                        target: Box::new(Action::Pure(Value::Unit)),
+                    },
+                )
+            }),
+        }),
+        next: Box::new(Action::Pure),
+    })
+    .unwrap();
+
+    // 双写生效后 Replace：内容恢复 + 旧 fd 失效（RFC-05）+ 路径重开游标为 0
+    // （世界恢复至执行前，A6 双态）。
+    assert_eq!(std::fs::read(&pa).unwrap(), orig_a, "a 内容恢复");
+    assert_eq!(std::fs::read(&pb).unwrap(), orig_b, "b 内容恢复");
+    assert!(rt.undo_stack().is_empty(), "Replace 后撤销栈空");
+
+    // RFC-05：Replace 后旧 fd 任何操作均 NotFound（registry 活性唯一真相，
+    // lin_stale_fd_read_close_fail_after_replace 的单 fd 变体；本测试为嵌套
+    // Sequential + 双文件变体）。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Seek {
+                fd: fda,
+                offset: 0,
+                whence: std::io::SeekFrom::Current(0),
+            },
+            vec![rd(fda)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e, SysError::NotFound, "Replace 后旧 fd 失效（NotFound）");
+
+    // A6 游标维：重开新 fd 后游标为写前位置 0（世界恢复至执行前）。
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: pa.clone(),
+                flags: OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            },
+            vec![wr_path(pa.clone())],
+            move |v| {
+                let fda2 = fd_of(&v);
+                syscall(
+                    DataOp::Open {
+                        path: pb.clone(),
+                        flags: OpenFlags {
+                            read: true,
+                            write: true,
+                            ..Default::default()
+                        },
+                    },
+                    vec![wr_path(pb.clone())],
+                    move |v| {
+                        let fdb2 = fd_of(&v);
+                        Action::Sequential {
+                            current: Box::new(syscall(
                                 DataOp::Seek {
-                                    fd: fda,
+                                    fd: fda2,
                                     offset: 0,
                                     whence: std::io::SeekFrom::Current(0),
                                 },
-                                vec![rd(fda)],
+                                vec![rd(fda2)],
                                 move |pos_a| {
                                     syscall(
                                         DataOp::Seek {
-                                            fd: fdb,
+                                            fd: fdb2,
                                             offset: 0,
                                             whence: std::io::SeekFrom::Current(0),
                                         },
-                                        vec![rd(fdb)],
+                                        vec![rd(fdb2)],
                                         move |pos_b| Action::Pure(Value::List(vec![pos_a, pos_b])),
                                     )
                                 },
                             )),
-                        },
-                    )
-                }),
-            }),
-            next: Box::new(Action::Pure),
-        })
+                            next: Box::new(Action::Pure),
+                        }
+                    },
+                )
+            },
+        ))
         .unwrap();
-
-    // 双写生效后 Replace：内容恢复 + 两文件游标都回到写前位置（0）。
     let (pos_a, pos_b) = match &v {
         Value::List(l) => (
             match l[0] {
@@ -877,11 +945,11 @@ fn r1_cursor_undo_nested_seq_replace() {
         ),
         other => panic!("{other:?}"),
     };
-    assert_eq!(std::fs::read(&pa).unwrap(), orig_a, "a 内容恢复");
-    assert_eq!(std::fs::read(&pb).unwrap(), orig_b, "b 内容恢复");
-    assert_eq!(pos_a, 0, "a 游标恢复（A6 双态：Seek(Current) 可观察）");
-    assert_eq!(pos_b, 0, "b 游标恢复");
-    assert!(rt.undo_stack().is_empty(), "Replace 后撤销栈空");
+    assert_eq!(
+        pos_a, 0,
+        "重开后 a 游标为写前位置 0（A6 双态：Seek(Current) 可观察）"
+    );
+    assert_eq!(pos_b, 0, "重开后 b 游标为写前位置 0（A6 双态）");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -992,8 +1060,8 @@ fn r1_putback_tcp_shutdown_10_rounds_fd_still_usable() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 3c：RFC-05 偏差回归 —— Replace 后旧 fd 可写在新代码上仍复现
-// （已知偏差，无需修复，确认测试记录仍准确）；另验证分支级 Replace 只
+// 攻击面 3c：RFC-05 回归 —— Replace 后旧 fd 写失败（修复验证，与 R1
+// lin_stale_fd_write_after_replace_fails 一致）；另验证分支级 Replace 只
 // 清分支 registry（父级 A4 状态隔离保留）。
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1073,24 +1141,28 @@ fn r1_stale_fd_write_after_replace_recheck() {
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), seed, "父级 Replace 已恢复内容");
 
-    // RFC-05 偏差复现：executor.files 仍持有旧 fd 强引用 → 旧 fd 可写且
-    // 物理落盘（与 R1 lin_stale_fd_write_after_replace_succeeds 记录一致）。
-    let v = rt.run_blocking(syscall(
-        DataOp::Write {
-            fd,
-            data: b"ZZ".to_vec(),
-        },
-        vec![wr(fd)],
-        Action::Pure,
-    ));
-    assert!(
-        v.is_ok(),
-        "偏差复现：父级 Replace 后旧 fd Write 仍成功（executor 侧句柄残留，RFC-05）"
+    // RFC-05 已修复：父级 Replace 后旧 fd Write 必须失败（NotFound）——registry
+    // 是 fd 活性唯一真相，executor 侧 files 缓存不得绕过（与 R1
+    // lin_stale_fd_write_after_replace_fails 一致）。
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"ZZ".to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "RFC-05 修复后：父级 Replace 后旧 fd Write 必须失败"
     );
-    assert_ne!(
+    assert_eq!(
         std::fs::read(&pa).unwrap(),
         seed,
-        "偏差复现：旧 fd 的写确实物理落盘"
+        "旧 fd 写失败 → 恢复后的内容不再被破坏"
     );
 }
 
@@ -1381,13 +1453,16 @@ fn time_timeout_inner_parallel_fork_completes() {
     }
 }
 
-/// 【已知缺陷记录 RFC-05 先例式】Timeout 内并行 Fork 超时后：spawn_blocking
-/// 分支成为孤儿任务继续执行（tokio::time::timeout 只 drop fork future，不取消
-/// 已 spawn 的分支），其副作用（Open 创建文件）不可撤销（undo 栈空、
-/// Replace 无法恢复）、句柄泄漏。记录行为，不修复（语义上 Timeout 对
-/// 并行分支无取消保证，pdr §2.1 未声明；修复需分支取消机制，超范围）。
-/// 注：R2 修正了构造错误——孤儿 Open 此前用 read-only flags（文件不存在 →
-/// NotFound，副作用不发生）；现改为 create 能力使缺陷场景真实复现。
+/// 【RFC-08 修复后断言翻转（迭代 1 取消传播协议）】Timeout 内并行 Fork
+/// 超时后：取消广播（watch 令牌）→ 孤儿分支在下一 op 边界中止 → Open
+/// 副作用不再发生（修复前：spawn_blocking 分支成为孤儿继续执行、副作用
+/// 不可撤销、句柄泄漏）。
+///
+/// 语义分叉（审计 R2 适配）：virtual-clock 下 Sleep 瞬时完成——左分支在
+/// 超时前即执行 Open（无「飞行中窗口」，post-check 语义、无取消），文件
+/// **被创建**是正确行为（见 `time_timeout_parallel_fork_virtual_clock_postcheck`）；
+/// 本测试（墙钟语义）依赖 Sleep 提供真实超时窗口。
+#[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1395,7 +1470,7 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     let pb = dir.path().join("orphan-b.txt");
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 左分支 Sleep(400ms) 后 Open —— 超时（100ms）后分支继续在后台执行。
+    // 左分支 Sleep(400ms) 后 Open —— 超时（100ms）后分支应响应取消中止。
     let pa_in = pa.clone();
     let v = rt
         .run_blocking(Action::Timeout {
@@ -1427,15 +1502,18 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
         .unwrap();
     assert_eq!(v, Value::U64(42), "Timeout 触发");
 
-    // 等待孤儿分支完成：其 Open 真实执行（文件被创建）—— 效果不可撤销。
+    // 等待原孤儿窗口：取消传播后分支在 Sleep 后下一 op 边界中止，
+    // Open 不执行 → 文件不被创建（修复前被创建）。
     std::thread::sleep(Duration::from_millis(900));
-    assert!(pa.exists(), "孤儿分支的 Open 副作用发生（文件被创建）");
-    assert!(rt.undo_stack().is_empty(), "孤儿效果未入撤销栈");
+    assert!(
+        !pa.exists(),
+        "RFC-08 修复后：孤儿分支响应取消，Open 副作用不发生（文件未被创建）"
+    );
+    assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo");
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert!(pa.exists(), "Replace 无法撤销孤儿分支的副作用（记录）");
 
     // 父级继续执行不受影响（孤儿 fd 未并入父 registry，父 next_fd 未抬高）。
     std::fs::write(&pb, b"BBB").unwrap();
@@ -1453,6 +1531,57 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
         ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"BBB".to_vec()), "父级执行正常");
+}
+
+/// virtual-clock 语义（审计 R2 适配）：Sleep 瞬时完成 → 无飞行中窗口 →
+/// 取消传播的「中止飞行中副作用」场景不成立（post-check：inner 完整执行、
+/// 效果保留）。左分支在超时判定前已完成 Open → 文件**被创建**（与墙钟语义
+/// 的「文件不创建」分叉，均为各自语义下的正确行为）。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn time_timeout_parallel_fork_virtual_clock_postcheck() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("orphan-vc.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let pa_in = pa.clone();
+    let v = rt
+        .run_blocking(Action::Timeout {
+            action: Box::new(Action::Fork {
+                left: Box::new(Action::Sequential {
+                    current: Box::new(Action::Sleep {
+                        duration: Duration::from_millis(400),
+                        next: Box::new(Action::Pure),
+                    }),
+                    next: Box::new(move |_| {
+                        syscall(
+                            DataOp::Open {
+                                path: pa_in.clone(),
+                                flags: rw_flags(),
+                            },
+                            vec![wr_path(pa_in.clone())],
+                            Action::Pure,
+                        )
+                    }),
+                }),
+                right: Box::new(Action::Pure(Value::Unit)),
+                combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+            }),
+            duration: Duration::from_millis(100),
+            on_timeout: Box::new(Action::Pure(Value::U64(42))),
+        })
+        .unwrap();
+    assert_eq!(v, Value::U64(42), "虚拟通道判定超时（post-check）");
+
+    // VC post-check：inner（Fork 分支的 Open）已完整执行 → 文件被创建。
+    assert!(
+        pa.exists(),
+        "VC post-check 语义：inner 效果保留，Open 已执行（文件被创建）"
+    );
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
 }
 
 /// Sleep(0)：立即完成（不挂起、next 正常执行）。
