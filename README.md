@@ -37,7 +37,7 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 | 文档（`docs/` mdBook + `spec/` 形式化） | 已齐备（G3 门禁） | — | — |
 
 - 测试合计：`cargo test --workspace` 78 个全绿（74 个测试函数 + 4 个 doc-test）。
-- 发布准备（G4 前置）：三个 crate 发布面经 `cargo package --list` 校验通过；`algeff-std` 的 `cargo publish --dry-run` 因 `Cargo.toml` 中 path 依赖 `algeff-core` 缺 `version` 被 cargo 拒绝——需 CTO 批准补版本号后解除。
+- 发布准备（G4 终验）：`algeff-core` / `algeff-macro` 的 `cargo publish --dry-run --registry crates-io` 全绿；RFC-1 已落地（`algeff-std` 的 path 依赖补 `version = 0.1.0`），但 `algeff-std` 的 dry-run 仍被 cargo 发布依赖校验拒绝（`no matching package named 'algeff-core' found`）——因 `algeff-core` 0.1.0 尚未真实发布到 crates.io，属 cargo 固有的发布顺序约束（先真实发布 core、镜像同步后 std 自然解除）。可用 `scripts/release.sh --allow-unpublished-deps` 预览 std 的打包/编译面。
 
 ## 快速开始
 
