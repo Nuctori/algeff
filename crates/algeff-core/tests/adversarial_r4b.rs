@@ -127,7 +127,7 @@ fn err_all_14_variants_and_other_passthrough_exact() {
     for (i, expected) in variants.iter().enumerate() {
         let mut rt = Runtime::new(Box::new(FixedErrorExecutor { err: *expected }));
         let got = rt
-            .run_blocking(syscall(DataOp::GetTime, vec![], Action::Pure))
+            .run_blocking(syscall(DataOp::Close { fd: 999 }, vec![], Action::Pure))
             .unwrap_err();
         assert_eq!(&got, expected, "第 {i} 个错误变体必须原样透传（相等语义）");
         assert_eq!(got.code(), expected.code(), "第 {i} 个：errno 映射一致");
@@ -147,7 +147,7 @@ fn err_sequential_propagates_and_skips_remaining_steps() {
 
     let e = rt
         .run_blocking(Action::Sequential {
-            current: Box::new(syscall(DataOp::GetTime, vec![], move |v| {
+            current: Box::new(syscall(DataOp::Close { fd: 999 }, vec![], move |v| {
                 n1.fetch_add(1, Ordering::SeqCst);
                 Action::Pure(v)
             })),
@@ -183,7 +183,7 @@ fn err_catch_handler_receives_exact_variant_and_recovers() {
         let mut rt = Runtime::new(Box::new(FixedErrorExecutor { err: expected }));
         let v = rt
             .run_blocking(Action::Catch {
-                action: Box::new(syscall(DataOp::GetTime, vec![], Action::Pure)),
+                action: Box::new(syscall(DataOp::Close { fd: 999 }, vec![], Action::Pure)),
                 handler: Box::new(move |e| Action::Pure(Value::Str(format!("caught:{e}")))),
             })
             .unwrap();
@@ -235,7 +235,7 @@ fn err_repeated_failures_never_push_undo() {
     }));
     for i in 0..5 {
         let e = rt
-            .run_blocking(syscall(DataOp::GetTime, vec![], Action::Pure))
+            .run_blocking(syscall(DataOp::Close { fd: 999 }, vec![], Action::Pure))
             .unwrap_err();
         assert_eq!(e, SysError::StorageFull, "第 {i} 次透传一致");
         assert!(rt.undo_stack().is_empty(), "第 {i} 次：错误不产生 undo");
@@ -383,8 +383,8 @@ fn two_runtimes_distinct_executors_isolated_and_parallel_fork() {
     // 生效（D9 独立性在并行路径同样成立）。
     let v = rt_a
         .run_blocking(Action::Fork {
-            left: Box::new(syscall(DataOp::GetTime, vec![], Action::Pure)),
-            right: Box::new(syscall(DataOp::GetTime, vec![], Action::Pure)),
+            left: Box::new(syscall(DataOp::Close { fd: 999 }, vec![], Action::Pure)),
+            right: Box::new(syscall(DataOp::Close { fd: 999 }, vec![], Action::Pure)),
             combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
         })
         .unwrap();

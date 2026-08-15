@@ -20,7 +20,10 @@ impl VirtualClock {
     }
 
     pub fn advance(&mut self, d: Duration) {
-        self.offset += d;
+        // 审计 R1 契约-F8 修复：Duration 加法溢出（debug/release 均无条件
+        // panic）是用户可控崩溃面（连续 Sleep 的 duration 之和超上限）——
+        // 饱和加法，溢出封顶而非 panic。
+        self.offset = self.offset.saturating_add(d);
     }
 
     pub fn set(&mut self, t: Duration) {
@@ -40,5 +43,16 @@ mod tests {
         assert_eq!(c.now(), Duration::from_secs(5));
         c.set(Duration::from_secs(1));
         assert_eq!(c.now(), Duration::from_secs(1));
+    }
+
+    /// 审计 R1 契约-F8 修复：Duration 加法溢出（debug/release 均无条件 panic）
+    /// 是用户可控崩溃面（virtual-clock 下连续 Sleep 的 duration 之和超上限）
+    /// —— advance 改为饱和加法，溢出封顶而非 panic。
+    #[test]
+    fn advance_saturates_on_overflow() {
+        let mut c = VirtualClock::new();
+        c.advance(Duration::MAX);
+        c.advance(Duration::from_secs(1));
+        assert_eq!(c.now(), Duration::MAX, "溢出应饱和封顶而非 panic");
     }
 }

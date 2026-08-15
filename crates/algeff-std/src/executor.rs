@@ -31,6 +31,7 @@ use algeff_core::{
     AccessMode, BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceArbiter,
     ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoOp, Value,
 };
+use algeff_core::runtime::MAX_IO_LEN;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Child;
@@ -344,6 +345,9 @@ impl TokioExecutor {
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         if let Some(m) = self.files.get(&fd) {
             let mut g = m.lock().await;
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut buf = vec![0u8; len];
             let n = g.read(&mut buf).await.map_err(to_sys_err)?;
             buf.truncate(n);
@@ -351,6 +355,9 @@ impl TokioExecutor {
         }
         if self.pipe_reader_fds.contains_key(&fd) {
             let mut arc = self.take_pipe_reader(fd, reg)?;
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut buf = vec![0u8; len];
             let n = {
                 // 被 Dup 共享时无法 &mut → InvalidInput（注释）。
@@ -717,6 +724,9 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let mut arc = self.take_tcp_stream(fd, reg)?;
+        if len > MAX_IO_LEN {
+            return Err(SysError::InvalidInput);
+        }
         let mut buf = vec![0u8; len];
         let n = {
             // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
@@ -831,6 +841,9 @@ impl TokioExecutor {
             ResourceHandle::UdpSocket(s) => s,
             _ => return Err(SysError::InvalidInput),
         };
+        if len > MAX_IO_LEN {
+            return Err(SysError::InvalidInput);
+        }
         let mut buf = vec![0u8; len];
         let (n, addr) = sock.recv_from(&mut buf).await.map_err(to_sys_err)?;
         buf.truncate(n);
@@ -1145,6 +1158,9 @@ impl TokioExecutor {
             g.seek(std::io::SeekFrom::Start(offset as u64))
                 .await
                 .map_err(to_sys_err)?;
+            if len > MAX_IO_LEN {
+                return Err(SysError::InvalidInput);
+            }
             let mut buf = vec![0u8; len];
             let mut filled = 0usize;
             while filled < buf.len() {

@@ -82,6 +82,56 @@ async fn file_write_read_roundtrip() {
     assert_eq!(v, Value::Bytes(b"hello world".to_vec()));
 }
 
+// ── a2. Dup2 降级语义固化（审计 R1 契约-F6）──────────────────────────────
+
+/// Dup2 语义因决策 D1（fd 全局单调、永不复用）退化为「先关 new_fd，再复制
+/// old_fd 到新 fd」：结果 fd 恒 ≠ new_fd（POSIX dup2 的「精确落到 new_fd」
+/// 不可实现）。审计发现全仓库 0 个 dup2 测试——本测试固化降级行为，防止
+/// 未来实现漂移（若引入 fd 固定区违反 D1，本断言需随契约裁决同步更新）。
+#[tokio::test]
+async fn dup2_degrades_to_close_then_dup() {
+    let mut ex = TokioExecutor::new();
+    let mut reg = ResourceRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup2.txt");
+    std::fs::write(&path, b"dup2-payload").unwrap();
+
+    let v = ex
+        .execute(
+            &DataOp::Open {
+                path: path.clone(),
+                flags: OpenFlags {
+                    read: true,
+                    ..Default::default()
+                },
+            },
+            &mut reg,
+        )
+        .await
+        .unwrap();
+    let old_fd = fd_of(&v.0);
+
+    // new_fd 取一个未占用的高编号：降级语义下结果 fd 是单调递增新 fd，非 new_fd。
+    let new_fd = 10_000;
+    let (v, _undo) = ex
+        .execute(&DataOp::Dup2 { old_fd, new_fd }, &mut reg)
+        .await
+        .unwrap();
+    let got = fd_of(&v);
+    assert_ne!(
+        got, new_fd,
+        "D1 单调不复用：dup2 结果 fd 恒 ≠ new_fd（降级语义，文档化）"
+    );
+    assert!(got > old_fd, "新 fd 单调递增");
+
+    // 降级后的 dup 语义仍成立：新 fd 与 old_fd 共享同一工作对象（读回同内容）。
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: got, len: 12 }, &mut reg)
+        .await
+        .unwrap();
+    assert_eq!(v, Value::Bytes(b"dup2-payload".to_vec()));
+}
+
 // ── b. Write 撤销恢复文件原内容 ────────────────────────────────────────
 
 #[tokio::test]

@@ -11,6 +11,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "virtual-clock")]
+use std::time::Duration;
 use crate::action::{Action, DataOp, Id, Signal, Value};
 use crate::error::SysError;
 use crate::resource::{ResourceRegistry, ResourceSet};
@@ -18,6 +20,12 @@ use crate::syscall::{BoxFuture, SyscallExecutor, UndoOp};
 
 #[cfg(feature = "virtual-clock")]
 use crate::virtual_clock::VirtualClock;
+/// 单次分配/IO 长度上界（审计 R1 契约-F7 修复）：`vec![0u8; len]` 在 debug
+/// 下分配失败 = 进程级 abort（handle_alloc_error 不可捕获），release 下 OOM
+/// abort —— 不受信任蓝图可崩溃宿主进程（与 RFC-11 修复前的栈溢出同族拒绝
+/// 服务面）。取 64MB：远超真实单次 IO/分配需求，远低于危险分配量级。
+/// 超限返回 `SysError::InvalidInput`（可被外层 Catch 捕获）。
+pub const MAX_IO_LEN: usize = 64 * 1024 * 1024;
 
 /// 效果上下文 Γ（pdr.md §5.1.1）：当前状态（cwd + 环境变量）。
 ///
@@ -302,6 +310,89 @@ const MAX_NESTING_DEPTH: usize = 96;
 /// 此处复用 Other(105) 并在文档注明。
 const NESTING_DEPTH_EXCEEDED: SysError = SysError::Other(105);
 
+/// GetTime 虚拟化辅助（审计 R1 契约-F2）：virtual-clock 下 `DataOp::GetTime`
+/// 读逻辑时钟（确定性重放承诺，pdr.md §12.1）——不达物理执行器、不推进
+/// 时钟（读取非推进）；墙钟路径恒 None。
+///
+/// 栈帧纪律：`#[inline(never)]` + Option<Value> 临时不落入解释器帧 ——
+/// RFC-11 深度守卫的嵌套边界取决于每帧栈用量（r5a 边界测试 95/96/97），
+/// 解释器帧越大边界越低；提取后 Syscall 臂只做 match 操作数调用。
+#[cfg(feature = "virtual-clock")]
+#[inline(never)]
+fn virtual_get_time(ctx: &mut Context, op: &DataOp) -> Option<Value> {
+    if matches!(op, DataOp::GetTime) && ctx.virtual_clock_mut().is_some() {
+        ctx.virtual_clock_mut()
+            .map(|vc| Value::U64(vc.now().as_millis() as u64))
+    } else {
+        None
+    }
+}
+
+/// 非 virtual-clock 构建的占位（匹配 Syscall 臂的调用点，恒 None）。
+#[cfg(not(feature = "virtual-clock"))]
+#[inline(never)]
+fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
+    None
+}
+
+/// 虚拟时钟下 `Action::Timeout` 的判定实现（审计 R1 红灯根因修复，时域统一）：
+/// **双通道判定**——墙钟通道（`tokio::time::timeout`，防御真实执行超时：慢
+/// syscall/IO）与虚拟通道（inner 完成后虚拟流逝 ≥ deadline，覆盖 Sleep 的
+/// 瞬时虚拟推进），任一超限即执行 on_timeout：
+/// - `Sleep(10s)` 内层（虚拟推进 10s ≥ 50ms）→ 虚拟通道触发（红灯
+///   `err_timeout_keeps_undo_stack_and_registry` 的场景，此前墙钟竞速虚拟
+///   Sleep 永不触发）；
+/// - 慢 syscall（墙钟 100ms > 10ms）→ 墙钟通道触发（原 `timeout_fires_on_timeout`
+///   语义，VC 下保持）；
+/// - 瞬时完成的 inner（虚拟 0ms < deadline）→ 返回 inner 结果（错误原样透传）。
+/// 注意：墙钟通道仍有取消语义（真实超时丢弃飞行中 future，RFC-12 残余缺口
+/// 仅此通道适用）；虚拟通道无「飞行中」状态、无取消。
+///
+/// 栈帧纪律：deadline/elapsed 跨 await 存活，必须放在本独立 async fn 内 ——
+/// 若内联进 `interpret_impl` 状态机，会撑大每层递归的状态机帧、压低 RFC-11
+/// 深度守卫的嵌套边界（r5a 边界测试 95/96/97 实测：内联时 95 层即栈溢出）。
+/// 返回 `LocalBoxFuture`（`Box::pin` 堆分配）：解释器状态机帧只存 8B 指针，
+/// 子状态机（含 deadline/elapsed）在堆上，不参与每层递归的栈帧预算。
+#[cfg(feature = "virtual-clock")]
+#[inline(never)]
+fn run_virtual_timeout<'a>(
+    inner: Action,
+    on_timeout: Action,
+    duration: Duration,
+    ctx: &'a mut Context,
+    undo: &'a mut UndoStack,
+    reg: &'a mut ResourceRegistry,
+    access: ExecAccess<'a>,
+    depth: usize,
+) -> LocalBoxFuture<'a, Result<Value, SysError>> {
+    Box::pin(async move {
+        let mut access = access;
+        let t0 = match ctx.virtual_clock_mut() {
+            Some(vc) => vc.now(),
+            // 无时钟（理论不可达：Context::new 恒 Some）：退化为纯墙钟路径。
+            None => return run_sub_impl(inner, ctx, undo, reg, access.reborrow(), depth).await,
+        };
+        let deadline = t0.saturating_add(duration);
+        match tokio::time::timeout(
+            duration,
+            run_sub_impl(inner, ctx, undo, reg, access.reborrow(), depth),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth).await
+            }
+            Ok(r) => {
+                let elapsed = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(t0);
+                if elapsed >= deadline {
+                    run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth).await
+                } else {
+                    r
+                }
+            }
+        }
+    })
+}
 /// 递归执行子 Action（async fn 不可直接自递归，统一 `Box::pin`）。
 /// 非 Send 约束同 `LocalBoxFuture`（见上）。
 ///
@@ -506,7 +597,7 @@ fn fork_fd_region_offset() -> u64 {
 async fn run_fork_parallel(
     left: Action,
     right: Action,
-    ctx: &Context,
+    ctx: &mut Context,
     reg: &mut ResourceRegistry,
     undo: &mut UndoStack,
     shared: SharedExecutor,
@@ -525,7 +616,8 @@ async fn run_fork_parallel(
     let r_shared = shared.clone();
 
     // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化）。
-    // 子任务把（结果, 隔离 registry, 独立撤销栈）带回，供完成后合并。
+    // 子任务把（结果, 隔离 registry, 独立撤销栈, 隔离 ctx）带回，供完成后合并
+    // —— ctx 带回用于虚拟时钟合并（审计 R1 状态-MEDIUM-1，见下）。
     // 子任务在独立阻塞线程（`spawn_blocking`，全新栈）上驱动 —— 深度计数器
     // 从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫按线程栈独立生效）。
     let l_task = tokio::task::spawn_blocking(move || {
@@ -537,7 +629,7 @@ async fn run_fork_parallel(
             ExecAccess::Shared(l_shared),
             0,
         ));
-        (v, l_reg, l_undo)
+        (v, l_reg, l_undo, l_ctx)
     });
     let r_task = tokio::task::spawn_blocking(move || {
         let v = drive(interpret_impl(
@@ -548,11 +640,13 @@ async fn run_fork_parallel(
             ExecAccess::Shared(r_shared),
             0,
         ));
-        (v, r_reg, r_undo)
+        (v, r_reg, r_undo, r_ctx)
     });
 
-    let (l_res, l_reg, l_undo) = l_task.await.expect("Fork 并行左分支任务 panic");
-    let (r_res, r_reg, r_undo) = r_task.await.expect("Fork 并行右分支任务 panic");
+    #[allow(unused_mut, unused_variables)]
+    let (l_res, l_reg, l_undo, mut l_ctx) = l_task.await.expect("Fork 并行左分支任务 panic");
+    #[allow(unused_mut, unused_variables)]
+    let (r_res, r_reg, r_undo, mut r_ctx) = r_task.await.expect("Fork 并行右分支任务 panic");
 
     // 合并回父（D13「完成后合并回父」/ RFC-A3-2）：
     // fd 不冲突（F1：右分支区间预分割 + D1 单调，子分配 ≥ 自身 next_fd
@@ -564,6 +658,19 @@ async fn run_fork_parallel(
     // undo 再弹 left 的（观察序：right 的效果后发生、先撤销）。
     undo.append(l_undo);
     undo.append(r_undo);
+    // 审计 R1 状态-MEDIUM-1 修复：并行分支的虚拟时钟推进合并回父（sum，与
+    // 顺序路径「分支依次推进父时钟」观察等价）——此前分支克隆时钟被丢弃，
+    // 同一蓝图并行/顺序两种调度产生不同可观察时钟（确定性重放支柱被破坏）。
+    #[cfg(feature = "virtual-clock")]
+    {
+        let base = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or_default();
+        let l_now = l_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        let r_now = r_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        if let Some(vc) = ctx.virtual_clock_mut() {
+            vc.advance(l_now.saturating_sub(base));
+            vc.advance(r_now.saturating_sub(base));
+        }
+    }
 
     Ok((l_res?, r_res?))
 }
@@ -635,23 +742,36 @@ async fn interpret_impl(
                         return Err(e);
                     }
                 }
-                // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
-                // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径
-                // 再以 Write 模式打开会被 A4 误拒（InvalidInput，标记残留
-                // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
-                // （现有契约）。
-                match exec_via(&mut access, &op, reg).await {
-                    Ok((v, maybe_undo)) => {
-                        if let Some(u) = maybe_undo {
-                            undo.push(u);
-                        }
+                // 审计 R1 契约-F2 修复：virtual-clock 下 GetTime 路由到逻辑
+                // 时钟（确定性重放承诺，pdr.md §12.1；executor 注释「确定性
+                // 方案由 virtual-clock feature 提供」同源）——不达物理执行器、
+                // 不推进时钟（读取非推进）。墙钟路径（无 feature）行为不变。
+                // 栈帧纪律：`virtual_get_time` 为 `#[inline(never)]`，临时值
+                // 直接作为 match 操作数（不绑定解释器帧局部变量）——解释器
+                // 帧越小，RFC-11 深度守卫的嵌套边界越高（r5a 边界测试）。
+                match virtual_get_time(ctx, &op) {
+                    Some(v) => {
                         let na = next(v);
                         (Value::Unit, na)
                     }
-                    Err(e) => {
-                        reg.rollback_linear(&resources);
-                        return Err(e);
-                    }
+                    // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
+                    // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径
+                    // 再以 Write 模式打开会被 A4 误拒（InvalidInput，标记残留
+                    // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
+                    // （现有契约）。
+                    None => match exec_via(&mut access, &op, reg).await {
+                        Ok((v, maybe_undo)) => {
+                            if let Some(u) = maybe_undo {
+                                undo.push(u);
+                            }
+                            let na = next(v);
+                            (Value::Unit, na)
+                        }
+                        Err(e) => {
+                            reg.rollback_linear(&resources);
+                            return Err(e);
+                        }
+                    },
                 }
             }
 
@@ -723,6 +843,13 @@ async fn interpret_impl(
             }
 
             Action::Alloc { len, next } => {
+                // 审计 R1 契约-F7 修复：无界分配 → debug 下分配失败 = 进程级
+                // abort（handle_alloc_error 不可捕获）/ release 下 OOM abort，
+                // 不受信任蓝图可崩溃宿主进程（RFC-11 同族拒绝服务面）。
+                // 超上限返回可捕获的 InvalidInput。
+                if len > MAX_IO_LEN {
+                    return Err(SysError::InvalidInput);
+                }
                 let na = next(Value::Bytes(vec![0u8; len]));
                 (Value::Unit, na)
             }
@@ -775,6 +902,32 @@ async fn interpret_impl(
                 duration,
                 on_timeout,
             } => {
+                #[cfg(feature = "virtual-clock")]
+                {
+                    // 审计 R1 红灯根因修复（Timeout×virtual-clock 时域统一）：
+                    // 虚拟时钟下 Timeout 以虚拟时间判定（post-check：inner 完成
+                    // 时虚拟流逝 ≥ deadline 即视作超时，执行 on_timeout），与墙钟
+                    // 路径「future 在 deadline 后完成 → Elapsed」同构。此前用墙钟
+                    // 竞速虚拟 Sleep（瞬时完成）→ on_timeout 永不触发（红灯
+                    // err_timeout_keeps_undo_stack_and_registry）。注意：VC 下
+                    // Sleep 瞬时完成、无「飞行中」状态，故本路径无取消语义
+                    // （RFC-12 残余缺口仅墙钟路径适用）。
+                    // 栈帧纪律：判定逻辑在独立 async fn（`run_virtual_timeout`）
+                    // 内——deadline/elapsed 跨 await 存活，若内联进解释器状态机
+                    // 会撑大**每层递归**的状态机帧（r5a 边界测试 95/96/97 实测
+                    // 崩溃），提取后解释器帧恢复原尺寸。
+                    return run_virtual_timeout(
+                        *inner,
+                        *on_timeout,
+                        duration,
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                    )
+                    .await;
+                }
                 match tokio::time::timeout(
                     duration,
                     run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth),
