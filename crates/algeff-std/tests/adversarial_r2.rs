@@ -945,7 +945,10 @@ fn r1_cursor_undo_nested_seq_replace() {
         ),
         other => panic!("{other:?}"),
     };
-    assert_eq!(pos_a, 0, "重开后 a 游标为写前位置 0（A6 双态：Seek(Current) 可观察）");
+    assert_eq!(
+        pos_a, 0,
+        "重开后 a 游标为写前位置 0（A6 双态：Seek(Current) 可观察）"
+    );
     assert_eq!(pos_b, 0, "重开后 b 游标为写前位置 0（A6 双态）");
 }
 
@@ -1454,6 +1457,12 @@ fn time_timeout_inner_parallel_fork_completes() {
 /// 超时后：取消广播（watch 令牌）→ 孤儿分支在下一 op 边界中止 → Open
 /// 副作用不再发生（修复前：spawn_blocking 分支成为孤儿继续执行、副作用
 /// 不可撤销、句柄泄漏）。
+///
+/// 语义分叉（审计 R2 适配）：virtual-clock 下 Sleep 瞬时完成——左分支在
+/// 超时前即执行 Open（无「飞行中窗口」，post-check 语义、无取消），文件
+/// **被创建**是正确行为（见 `time_timeout_parallel_fork_virtual_clock_postcheck`）；
+/// 本测试（墙钟语义）依赖 Sleep 提供真实超时窗口。
+#[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1522,6 +1531,57 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
         ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"BBB".to_vec()), "父级执行正常");
+}
+
+/// virtual-clock 语义（审计 R2 适配）：Sleep 瞬时完成 → 无飞行中窗口 →
+/// 取消传播的「中止飞行中副作用」场景不成立（post-check：inner 完整执行、
+/// 效果保留）。左分支在超时判定前已完成 Open → 文件**被创建**（与墙钟语义
+/// 的「文件不创建」分叉，均为各自语义下的正确行为）。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn time_timeout_parallel_fork_virtual_clock_postcheck() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("orphan-vc.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let pa_in = pa.clone();
+    let v = rt
+        .run_blocking(Action::Timeout {
+            action: Box::new(Action::Fork {
+                left: Box::new(Action::Sequential {
+                    current: Box::new(Action::Sleep {
+                        duration: Duration::from_millis(400),
+                        next: Box::new(Action::Pure),
+                    }),
+                    next: Box::new(move |_| {
+                        syscall(
+                            DataOp::Open {
+                                path: pa_in.clone(),
+                                flags: rw_flags(),
+                            },
+                            vec![wr_path(pa_in.clone())],
+                            Action::Pure,
+                        )
+                    }),
+                }),
+                right: Box::new(Action::Pure(Value::Unit)),
+                combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+            }),
+            duration: Duration::from_millis(100),
+            on_timeout: Box::new(Action::Pure(Value::U64(42))),
+        })
+        .unwrap();
+    assert_eq!(v, Value::U64(42), "虚拟通道判定超时（post-check）");
+
+    // VC post-check：inner（Fork 分支的 Open）已完整执行 → 文件被创建。
+    assert!(
+        pa.exists(),
+        "VC post-check 语义：inner 效果保留，Open 已执行（文件被创建）"
+    );
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
 }
 
 /// Sleep(0)：立即完成（不挂起、next 正常执行）。

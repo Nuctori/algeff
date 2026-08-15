@@ -338,7 +338,7 @@ const CANCELLED_ERR: SysError = SysError::Other(125);
 /// 已入栈 undo 与线性标记仍按超时路径回滚。
 const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
 
-/// 递归深度守卫阈值（RFC-11 修复，A2 批 7，CTO 批准 96）。
+/// 递归深度守卫阈值（RFC-11 修复，A2 批 7，CTO 批准 96；迭代 1 复测裁决 64——取消传播帧膨胀，见 resource-notes RFC-11 段）。
 ///
 /// `run_sub_impl` → `interpret_impl` 每层递归在 debug 下消耗 ~13-20KB 栈帧
 /// （Windows 默认 2MB 测试线程栈）。**实测崩溃边界**：本机（Windows debug，
@@ -347,7 +347,7 @@ const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
 /// 栈约 3-4 倍余量。不受信任蓝图 ~百层嵌套即可使宿主进程崩溃（拒绝服务面）。
 ///
 /// 守卫在 `interpret_impl` 递归入口检查，超限返回可捕获错误替代栈溢出。
-/// 阈值取 96：比实测边界（~104）留 ~8% 余量（帧大小随嵌套构造/编译器版本
+/// 阈值初取 96（比实测边界 ~104 留 ~8% 余量）；迭代 1 复测（取消传播帧膨胀实测 80 OK/88 崩）裁决 64。
 /// 波动，保留安全边际），且 r4c 深度 64 安全回归不受影响；统一保守取值保证
 /// 最弱平台（Windows 2MB 栈）安全 —— Linux 8MB 栈下 96 帧余量更大。
 ///
@@ -358,7 +358,7 @@ const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
 /// 运行在 spawn 线程（受 `RUST_MIN_STACK` 控制）；c. Catch Other(105)。注意
 /// `RUST_MIN_STACK` 只影响 `std::thread::spawn` 新线程、**不影响主线程**（审查
 /// 修正，与 spec/resource-notes.md RFC-11 一致）。否则属用户责任（阈值不随栈
-/// 尺寸动态调整，保持 96）。
+/// 尺寸动态调整，迭代 1 裁决后保持 64）。
 const MAX_NESTING_DEPTH: usize = 64;
 
 /// 深度超限错误：`SysError::Other(105)`（ENOBUFS=105，「嵌套资源耗尽」语义
@@ -522,7 +522,7 @@ fn run_sub_impl<'a>(
 ///
 /// **提取为独立 async fn 的原因**：`tokio::select!` 会生成大量轮询期栈
 /// 临时量；若内联在 `interpret_impl` 的 match 臂内，会放大解释器每层递归
-/// 的轮询栈帧，压缩 RFC-11 深度守卫（阈值 96，Windows 2MB 栈）的余量
+/// 的轮询栈帧，压缩 RFC-11 深度守卫（阈值 64，Windows 2MB 栈）的余量
 /// （实测边界从 ~104 降至 ~92 的回归）。独立函数把 select! 轮询栈隔离到
 /// 自身 coroutine，解释器轮询帧保持精简。
 async fn cancellable_sleep(duration: Duration, token: &mut CancelToken) {
@@ -965,7 +965,7 @@ async fn interpret_impl(
 ) -> Result<Value, SysError> {
     // RFC-11 深度守卫：递归入口检查嵌套深度，超限返回可捕获错误（`Other(105)`
     // ENOBUFS 语义）替代栈溢出。阈值依据见 `MAX_NESTING_DEPTH`。守卫在
-    // **栈溢出之前**触发（阈值 96 < 实测崩溃边界 ~104），进程不 abort；错误
+    // **栈溢出之前**触发（阈值 64 < 实测崩溃边界 ~80-88），进程不 abort；错误
     // 沿调用链上抛，可被外层 Catch 捕获（拒绝服务面转为可恢复错误）。
     if depth >= MAX_NESTING_DEPTH {
         return Err(NESTING_DEPTH_EXCEEDED);

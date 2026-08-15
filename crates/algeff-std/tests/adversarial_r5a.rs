@@ -15,7 +15,7 @@
 //!    点在混合场景（错误+Catch+Replace / dup 共享 / 仲裁竞争 / 超深嵌套）下
 //!    仍生效（`fix_five_point_regression_single_blueprint`）。
 //! 2. **守卫边界 × 组合**：深度 96 内嵌 Catch → 可捕获；深度 90 + Timeout →
-//!    正常完成；守卫错误经 Timeout 原样透传（`guard_depth96_catch_catchable_...`；
+//!    正常完成；守卫错误经 Timeout 原样透传（`guard_depth64_catch_catchable_...`；
 //!    纯 95/96/97 边界在 core 侧 `adversarial_r5a.rs`）。
 //! 3. **组合风暴**：Catch×Fork×Timeout×Scope 混合蓝图 50 轮，每轮轨迹一致
 //!    （左分支超时 42、右分支错误捕获 1、cwd 恢复、写入立即可见），undo 栈
@@ -110,7 +110,7 @@ fn open_fd(rt: &mut Runtime, path: PathBuf) -> u64 {
 }
 
 /// 深度 depth 的嵌套 Sequential：current 为下一层；叶子返回 U64(300)。
-/// 与 core 侧 `adversarial_r5a.rs` 同构（RFC-11 守卫计数：depth≥96 → Other(105)）。
+/// 与 core 侧 `adversarial_r5a.rs` 同构（RFC-11 守卫计数：depth≥64 → Other(105)；迭代 1 阈值 96→64）。
 fn nested_seq(depth: u64) -> Action {
     if depth == 0 {
         return Action::Pure(Value::U64(300));
@@ -618,7 +618,7 @@ fn interact_depth_guard_clean_registry_then_new_blueprint() {
     std::fs::write(&pa, b"ig-original").unwrap();
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 触发深度守卫（深度 200 ≫ 阈值 96）→ Other(105)，进程不 abort。
+    // 触发深度守卫（深度 200 ≫ 阈值 64）→ Other(105)，进程不 abort。
     let e = rt.run_blocking(nested_seq(200)).unwrap_err();
     assert_eq!(e, SysError::Other(105), "超深蓝图应触发深度守卫");
     // 守卫错误零副作用：undo 空、registry 无句柄。
