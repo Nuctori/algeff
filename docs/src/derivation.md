@@ -209,7 +209,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 
 总量：`cargo test --workspace` **300 个测试函数**（约 292 个 `#[test]`/`#[tokio::test]` +
 8 条 doc-test 断言；40 个测试二进制 + 3 个 doc-test 运行）。特性测试（coeffects/virtual-clock）
-由 feature 门控，CI 双平台补跑。
+由 feature 门控，CI 三平台补跑（并含 release 编译验证）。
 
 ### 6.2 审计协议（5 轮串行）
 
