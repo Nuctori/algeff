@@ -349,7 +349,9 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 
 ### RFC-05：Replace 后旧 fd 仍可写（句柄活性反例，R1 对抗发现，登记补录）
 
+
 `Replace`（D10：recover + `reg.clear()`）后，executor 内部 `files`/流映射表仍持旧 fd 的 Arc 强引用——旧 fd Write 成功且物理落盘（`adversarial_r1.rs::lin_stale_fd_write_after_replace_succeeds` 实证；R2 `adversarial_r2.rs::r1_stale_fd_write_after_replace_recheck` 复现确认）。D10「资源不泄漏」与 P4「资源状态恢复至执行前」在**句柄活性维度**有可观察反例：A4 线性标记已清（Replace 后同资源可再写），但物理句柄残留可绕过。修复方向（阶段 3+，RFC-05 原记录于决策链 D-031 与 §9.2 上下文，本条目为登记表补录）：executor↔registry 通道（execute 返回的 undo 携带句柄回收信息，或 Replace 时 executor 同步失效表项）。修复后 `lin_stale_fd_write_after_replace_succeeds` 断言需反转（旧 fd Write 应失败）。
+
 ### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）
 
 右分支在 `k<<48` 预留区间（`offset_next_fd`，F1/S6/A2 全局唯一区间）**实际分配
