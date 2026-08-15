@@ -14,7 +14,7 @@ Algeff（Algebraic Effects）将 Unix 系统效应从「指令（动词）」代
 2. **命题**：P1–P5 五条可证明性质建立于公理之上（幺半群、并行交换律、写隔离、撤销双态、无死锁）；
 3. **契约冻结**：D1–D19 十九项决策把承诺边界钉死在 `contracts.md`，作为 8 Agent 并行开发的唯一接口事实来源；
 4. **实现**：三层 crate（core 解释器 / std tokio 执行器 / macro 语法糖），约 2000+1200+300 行；
-5. **验证**：305 个测试函数（约 297 个二进制测试 + 8 条 doc-test）+ 41 个测试二进制，叠加
+5. **验证**：309 个测试函数（约 301 个二进制测试 + 8 条 doc-test）+ 42 个测试二进制，叠加
    `tla/scheduler.tla` 模型检测；
 6. **审计**：5 轮「对抗审计（120 个 E2E 测试）× 形式逻辑审计」串行收官——P1/P2/P3/P5 终判
    「有效（附声明前提）」，P4 部分收敛（差距 RFC-05，阶段 3+ 已裁决）。
@@ -206,8 +206,8 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | 对抗 E2E | `tests/adversarial_r{1..5}.rs` | 120 个测试（R1=17、R2=19、R3=28、R4=32、R5=24） |
 | 模型检测 | `tla/scheduler.tla` | TLC 通过 `TypeOK`/`ExclusiveHold`/`ExactHold`/`NoCircularWait` 4 不变式 + `Progress` 时序属性 |
 
-总量：`cargo test --workspace` **305 个测试函数**（约 297 个 `#[test]`/`#[tokio::test]` +
-8 条 doc-test 断言；41 个测试二进制 + 3 个 doc-test 运行）。特性测试（coeffects/virtual-clock）
+总量：`cargo test --workspace` **309 个测试函数**（约 301 个 `#[test]`/`#[tokio::test]` +
+8 条 doc-test 断言；42 个测试二进制 + 3 个 doc-test 运行）。特性测试（coeffects/virtual-clock）
 由 feature 门控，CI 三平台补跑（并含 release 编译验证）。
 
 ### 6.2 审计协议（5 轮串行）
@@ -309,7 +309,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 
 ## 10 结论与后续工作
 
-收官（P1/P2/P3/P5 有效附声明、P4 部分收敛且差距明确）、305 测试全绿、契约冻结。并行性能为
+收官（P1/P2/P3/P5 有效附声明、P4 部分收敛且差距明确）、309 测试全绿、契约冻结。并行性能为
 **已知开放面**（RFC-10 跨平台错误语义已修复），本阶段不提供稳定性承诺。
 
 **阶段 3+ 工作清单**：
