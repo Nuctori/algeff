@@ -125,6 +125,12 @@ def main():
             if "96" not in t or "105" not in t or "97" not in t:
                 issues.append(f"[{p}] 提及深度守卫但缺 96/105/97 之一")
 
+    # ---- 7. append 24.3% 仅历史语境（canonical 39.1）----
+    for p in FILES:
+        t = texts[p]
+        if "24.3%" in t and "修复前旧数" not in t and "39.1" not in t:
+            issues.append(f"[{p}] 24.3% 出现但无「修复前旧数」/39.1 语境（append canonical 现为 39.1）")
+
     if issues:
         print("=== 差异清单（{} 项）===".format(len(issues)))
         for i in issues:
