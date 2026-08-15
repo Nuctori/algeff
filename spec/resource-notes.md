@@ -116,6 +116,12 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   §10 登记 RFC-09（Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover，可恢复；
   R3c 风暴实测 240/240 轮超时、undo_len=1，修复方向=取消传播协议，阶段 3+）
   与 LOW（arbiter 重试退避在 executor 锁内 → 争用风暴下全分支串行化放大）。
+- s11/rfc10：RFC-10 修复（A5 执行器层 Windows 错误码归一化，executor.rs 冻结面外）
+  ——`to_sys_err` + `#[cfg(windows)] normalize_windows_errno` 将 Win32/WSA 原生码
+  映射到 POSIX errno（ErrorKind 优先 + 码表兜底；Unix 纯透传），全部物理 IO 错误
+  转换点接入；新增 `tests/rfc10_windows_errno.rs`（跨平台真实路径，UDP 面原「未测」
+  补齐），`adversarial_r4b.rs` 两处 Windows 容忍断言收紧为无条件 `AlreadyExists`；
+  §10 RFC-10 登记段更新为已修复。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -430,7 +436,45 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 ### RFC-10：Windows 原生错误码未映射至 POSIX 语义（R4b 对抗发现）
 
-`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE，**未测**——登记表引用的测试仅覆盖文件面，UDP 面待补断言）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
+`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非
+`AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`
+（WSAEADDRINUSE）；TCP 连接被拒返回 `Other(10061)`（WSAECONNREFUSED）。根因：
+冻结面 `SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），而
+`From<io::Error>` 取 `raw_os_error()` 直接透传——Windows 上该值属 Win32/WSA 命名空间
+（ERROR_FILE_EXISTS=80、WSAEADDRINUSE=10048 等），未转换即退化为 `Other(n)`。影响：
+跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体
+（破坏 Catch 穷尽性匹配的跨平台可移植性）。
+
+**已修复（A5 执行器层归一化，executor.rs，冻结面外）**：error.rs 属冻结面（契约
+contracts.md），按修复方向二在 `TokioExecutor` 域内新增统一转换入口 `to_sys_err`
+（io::Error → SysError）与 `#[cfg(windows)] normalize_windows_errno`（Win32/WSA 码 →
+POSIX errno 映射表：ERROR_FILE_EXISTS=80 / ERROR_ALREADY_EXISTS=183→EEXIST=17、
+ERROR_ACCESS_DENIED=5→EACCES=13、ERROR_FILE_NOT_FOUND=2 / ERROR_PATH_NOT_FOUND=3→ENOENT=2、
+WSAEADDRINUSE=10048→EADDRINUSE=98、WSAECONNREFUSED=10061→ECONNREFUSED=111、
+WSAECONNRESET=10054→ECONNRESET=104、WSAETIMEDOUT=10060→ETIMEDOUT=110、
+WSAEWOULDBLOCK=10035→EAGAIN=11 等）。策略：优先 std 已解码的 `ErrorKind`
+（`decode_error_kind` 在 Windows 上已将上述码解码为语义 kind，实测 raw=80→
+AlreadyExists、10048→AddrInUse、10061→ConnectionRefused），兜底经码表归一化后再走
+`from_errno`；Unix 上纯透传（行为与冻结面 `From<io::Error>` 完全一致）。全部物理 IO
+错误转换点（op_open/op_read/op_write/op_seek/op_stat/op_truncate/op_unlink/
+op_rename/op_mkdir/op_rmdir/op_read_dir/op_tcp_bind/op_tcp_accept/op_tcp_connect/
+op_tcp_read/op_tcp_write/op_tcp_shutdown/op_udp_bind/op_udp_recv_from/op_udp_send_to/
+op_spawn/op_wait/op_kill/op_mmap/op_send_file）已接入。修复后：create_new 撞已存在 →
+`AlreadyExists`、UDP 端口占用 → `Other(98)`（EADDRINUSE，14 错误集无 AddrInUse 变体，
+与 Unix 真实 errno 一致）、TCP 连接被拒 → `ConnectionRefused`，跨平台一致。
+
+**测试证据**：
+- 新增 `crates/algeff-std/tests/rfc10_windows_errno.rs`（跨平台真实路径）：
+  `create_new_existing_maps_to_already_exists`、
+  `udp_bind_port_in_use_maps_to_eaddr_inuse`（UDP 面原「未测」已补齐断言）、
+  `tcp_connect_refused_maps_to_connection_refused`；
+- `executor.rs` 单测（`#[cfg(windows)]`）：`to_sys_err_maps_windows_codes_to_posix_semantics`
+  （`from_raw_os_error(80/183/5/2/10048/10061/10054/10060)` 构造模拟，本机 Windows 真实执行）、
+  `normalize_windows_errno_mapping_table`（码表直测，含未映射码透传）；
+- 收紧断言：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison` 与
+  `open_flags_8_combination_matrix_real_files`（(7) 用例）由「Windows 容忍 Other(80)」
+  改为无条件断言 `AlreadyExists`（Linux 上 create_new 撞存在文件本就直接 EEXIST，
+  跨平台成立）。
 
 ### RFC-11：解释器嵌套蓝图无递归深度上限 → 进程级栈溢出（R4c 对抗发现）
 
