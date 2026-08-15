@@ -354,8 +354,14 @@ fn invoke_in_parallel_fork_branches_shared_channel_records_merged() {
     // 两条记录均落地（顺序无关，按 foreign_id 检索断言）。
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2, "并行两分支 invoke 各调用一次");
-    let rec_11 = calls.iter().find(|(id, _, _)| *id == 11).expect("左分支记录");
-    let rec_22 = calls.iter().find(|(id, _, _)| *id == 22).expect("右分支记录");
+    let rec_11 = calls
+        .iter()
+        .find(|(id, _, _)| *id == 11)
+        .expect("左分支记录");
+    let rec_22 = calls
+        .iter()
+        .find(|(id, _, _)| *id == 22)
+        .expect("右分支记录");
     assert_eq!(rec_11.1, vec![rd(1)], "左分支 captures 原样");
     assert!(rec_11.2, "左分支 deterministic=true 原样");
     assert_eq!(rec_22.1, vec![wr(2)], "右分支 captures 原样");

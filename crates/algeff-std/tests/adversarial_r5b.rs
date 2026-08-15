@@ -109,7 +109,11 @@ fn read_chain(fd: u64, k: usize, content: Arc<Vec<u8>>) -> Action {
     }
     let expected = content[k];
     Action::Sequential {
-        current: Box::new(syscall(DataOp::Read { fd, len: 1 }, vec![rd(fd)], Action::Pure)),
+        current: Box::new(syscall(
+            DataOp::Read { fd, len: 1 },
+            vec![rd(fd)],
+            Action::Pure,
+        )),
         next: Box::new(move |v| {
             let b = match v {
                 Value::Bytes(b) => b,
@@ -210,7 +214,11 @@ fn catch_error_handled_then_100_node_read_chain_continues() {
         Value::U64(100),
         "错误处理后 100 节点链完整执行（错误不中断后续蓝图）"
     );
-    assert_eq!(rt.undo_stack().len(), 1, "失败 action 的 Write undo 按契约保留");
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "失败 action 的 Write undo 按契约保留"
+    );
     assert_eq!(
         &std::fs::read(&pa).unwrap()[0..3],
         b"TMP",
@@ -436,7 +444,11 @@ fn fork_parallel_two_scopes_distinct_bases_3_rounds_isolated() {
             "第 {round} 轮右分支 fd 读回保真"
         );
         round_pairs.push((lfd, rfd));
-        assert_eq!(rt.undo_stack().len(), (round as usize + 1) * 2, "每轮 2 条 Write undo 累积");
+        assert_eq!(
+            rt.undo_stack().len(),
+            (round as usize + 1) * 2,
+            "每轮 2 条 Write undo 累积"
+        );
     }
 
     // 一次 Replace 逆序恢复全部 6 个文件（LIFO：右先左后，跨轮交错）。
@@ -710,7 +722,10 @@ fn default_enosys_watchsignal_invoke_10_rounds_stable_no_undo_pressure() {
             .unwrap_err();
         assert_eq!(e, SysError::Other(38), "第 {i} 轮 watch_signal ENOSYS");
         assert_eq!(e.code(), 38, "第 {i} 轮 errno 稳定");
-        assert!(rt.undo_stack().is_empty(), "第 {i} 轮 watch_signal 不压 undo");
+        assert!(
+            rt.undo_stack().is_empty(),
+            "第 {i} 轮 watch_signal 不压 undo"
+        );
 
         let e = rt
             .run_blocking(Action::Invoke {
@@ -839,7 +854,11 @@ fn blueprint_reuse_two_runtimes_twice_each_four_identical_results() {
     // 每 Runtime 的 fd 独立单调（D1）：A/B 各自从 0 起分配（D9 隔离：
     // executor/registry 每 Runtime 独立），同 Runtime 两次执行 fd 递增。
     assert_eq!(fds_a, vec![0, 1], "A 同 Runtime 两次：fd 从 0 起单调");
-    assert_eq!(fds_b, vec![0, 1], "B 同 Runtime 两次：fd 从 0 起单调（独立注册表）");
+    assert_eq!(
+        fds_b,
+        vec![0, 1],
+        "B 同 Runtime 两次：fd 从 0 起单调（独立注册表）"
+    );
     assert!(fds_a[1] > fds_a[0] && fds_b[1] > fds_b[0], "各自单调");
 
     // 蓝图四路复用后文件未被任何一次执行改动（只读）。
@@ -899,7 +918,11 @@ fn write_blueprint_reuse_two_runtimes_undo_independent() {
     })
     .unwrap();
     assert!(rt_a.undo_stack().is_empty(), "A 已恢复");
-    assert_eq!(rt_b.undo_stack().len(), 1, "B 的 undo 不受 A 的 Replace 影响");
+    assert_eq!(
+        rt_b.undo_stack().len(),
+        1,
+        "B 的 undo 不受 A 的 Replace 影响"
+    );
     // A 的 undo 把 0-1 字节恢复为写前 "wr"（undo 日志捕获的是 A 写时的物理
     // 状态）——文件物理上回到写前内容；B 的运行时状态（undo/注册表）未动。
     assert_eq!(
@@ -915,11 +938,11 @@ fn write_blueprint_reuse_two_runtimes_undo_independent() {
         Value::Fd(f) => f,
         _ => unreachable!(),
     };
-    assert!(rt_a.registry().lookup(fa).is_none(), "A Replace 释放 A 句柄");
     assert!(
-        rt_b.registry().lookup(fb).is_some(),
-        "B 句柄保留（隔离）"
+        rt_a.registry().lookup(fa).is_none(),
+        "A Replace 释放 A 句柄"
     );
+    assert!(rt_b.registry().lookup(fb).is_some(), "B 句柄保留（隔离）");
     // B 自行 Replace：undo 日志捕获的是 B 写时的物理状态（当时 0-1 已是 A 的
     // "XX"）→ 写回 "XX"。记录偏差：**跨 Runtime 物理别名（两 Runtime 写同一
     // 文件同一区域）时 undo 日志按物理写前状态捕获，两次撤销不构成恒等**
