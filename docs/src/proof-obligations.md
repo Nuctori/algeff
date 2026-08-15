@@ -24,7 +24,8 @@ pdr.md §四 公理 A1–A7 与 §六 命题 P1–P5 的每一条形式化声明
 | --- | --- | --- | --- | --- |
 | R0（基线） | 既有 25 二进制测试 | proofs.md P1-P5 数学证明 | 见下 | 初始状态 |
 | R1 | ✅ 完成（adversarial_r1.rs 17 测试，5d24166） | ✅ 完成（formal-convergence：P1 有效、P2-P5 缺口已归因） | 游标撤销新证据；Replace 旧 fd 反例（RFC-05） | 4 处未收敛点已派发修复 |
-| R2 | 进行中（audit/r2） | 待派 | — | — |
+| R2 | ✅ 完成（adversarial_r2.rs 19 测试，2eb7312）：fd 区间压力/arbiter 争用/R1 回归/错误路径/时间面/资源计数 + RFC-06/07/08 登记 + flaky 修复（写后 flush，D-039） | ✅ 完成（formal-convergence）：P2 收敛为「有效（附声明前提）」；A3 陈述已并入 Sym(f)+Δ-覆盖；RFC-06→D1 边界反例、RFC-08→P4/A6 部分可撤销反例 | RFC-06（fd 二次增长 u64 溢出）、RFC-07（管道半端）、RFC-08（Timeout 孤儿分支） | 3 处登记级未收敛点已修（A3 陈述/P2 同步、总表刷新、RFC-08 编号） |
+| R3 | 进行中（audit/r3） | 待派 | — | — |
 
 ## 义务明细
 
