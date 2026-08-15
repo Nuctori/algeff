@@ -424,8 +424,7 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 ### LOW：arbiter 重试退避发生在 executor 锁内 → 争用风暴下全分支串行化放大
 
-`ResourceArbiter` 有限重试（1ms × 8 次退避）在 executor 的仲裁锁
-（`self.arbiter.lock()`）持锁期间执行：争用风暴下所有分支的仲裁被串行化
+`ResourceArbiter` 有限重试（1ms × 8 次退避）在 **executor 共享锁**（`runtime.rs::exec_via` 的 `Arc<tokio::sync::Mutex>` guard，覆盖整个 execute 含物理 IO await）持锁期间执行——arbiter 自身的 std Mutex guard 是语句级临时（`lock().unwrap().try_claim()` 结束即释放），退避 sleep 实际发生在共享锁持锁期间：争用风暴下所有分支的仲裁被串行化
 ——一个分支退避 sleep 阻塞后续分支进入仲裁，整体吞吐被退避总和放大（R3c
 风暴 8 分支 × 30 轮下可观察）。记录（阶段 3+ 优化）：退避移出锁内（先释放
 仲裁锁再 sleep，或仲裁器内部异步退避队列）。对正确性无影响（退避有界、无
