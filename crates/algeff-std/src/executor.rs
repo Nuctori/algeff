@@ -329,11 +329,26 @@ impl TokioExecutor {
                 if readable {
                     orig.truncate(filled);
                     file.write_all(data).await?;
+                    // 写后必须 flush（R1 flaky 根因）：tokio::fs::File 的 write_all
+                    // 是**异步落盘**——poll_write 把数据拷入内部缓冲后立即返回
+                    // Ready(Ok(n))，OS 写经 spawn_mandatory_blocking 在后台完成。
+                    // 若 op 返回时 OS 写仍在飞，调用方随后经 std::fs::read 等同步
+                    // 观察会读到写前旧内容。对抗套件两处因此 flaky：
+                    // rev_undo_restores_file_cursor（Write 后写可见性断言）与
+                    // lin_stale_fd_write_after_replace_succeeds（旧 fd 写落盘断言），
+                    // 并行负载下 blocking pool 饱和拉宽在飞窗口 → 复现率 6~17%
+                    // （实测）；新回归测试 rev_write_effect_immediately_observable_via_sync_read
+                    // 放大后 30 跑 13 跑触发。
+                    // flush 使 Write 完成 ⇔ OS 已落盘（A4/A6 可观察性契约）。
+                    file.flush().await?;
                     // 撤销：恢复原区域 + 截断回写前长度（D15：仅捕获物理数据）。
                     // 审计 R1（对抗测试 rev_undo_restores_file_cursor）：A6 双态
                     // w;w̄ = 1 要求**全部可观察状态**复原——游标（经 Seek(Current)
                     // 可观察）也必须回到写前位置。修复：恢复内容与长度后 seek 回
                     // `pos`（此前游标停留在 pos+orig.len()，破坏撤销双态）。
+                    // 注：undo 闭包首步 seek 前无需再排空——tokio AsyncSeekExt 的
+                    // seek future 会先 poll_complete 排空在飞操作；此处 flush 已保证
+                    // 文件进入 undo 时处于 Idle。
                     let undo_file = m.clone();
                     let undo: UndoOp = Box::pin(async move {
                         let mut g = undo_file.lock().await;
@@ -347,10 +362,12 @@ impl TokioExecutor {
                     Some(undo)
                 } else {
                     file.write_all(data).await?;
+                    file.flush().await?;
                     None // 写前读失败（如只写句柄）→ 降级 BestEffort。
                 }
             } else {
                 file.write_all(data).await?;
+                file.flush().await?;
                 None // BestEffort（pdr.md §11.2）：大文件（≥1MB）不撤销。
             };
             return Ok((Value::Unit, undo));

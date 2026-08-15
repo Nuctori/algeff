@@ -289,6 +289,79 @@ fn rev_undo_restores_file_cursor() {
     assert_eq!(pos, Value::U64(0), "撤销后游标应回到写前位置（A6 双态）");
 }
 
+/// R1 flaky 根因回归（写后可见性）：tokio::fs::File 的 `write_all` 是**异步落盘**——
+/// `poll_write` 把数据拷入内部缓冲后立即返回 Ready，OS 写经后台 blocking 任务完成。
+/// executor 若不在 Write op 返回前 `flush`，紧接的同步 `std::fs::read` 会读到写前
+/// 旧内容（并行负载下 blocking pool 饱和拉宽在飞窗口 → 复现率 ~10-17%，见
+/// `rev_undo_restores_file_cursor` 与 `lin_stale_fd_write_after_replace_succeeds`）。
+/// 本测试多轮 Write+立即同步读：任一轮读到旧内容即触发（修复前并行负载下
+/// 复现率 6~17%，本测试放大后 30 跑 13 跑触发）。
+#[test]
+fn rev_write_effect_immediately_observable_via_sync_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let pa = dir.path().join("obs.txt");
+    std::fs::write(&pa, b"0000000000").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let fd = {
+        let v = rt
+            .run_blocking(syscall(
+                DataOp::Open {
+                    path: pa.clone(),
+                    flags: OpenFlags {
+                        read: true,
+                        write: true,
+                        ..Default::default()
+                    },
+                },
+                vec![wr_path(pa.clone())],
+                Action::Pure,
+            ))
+            .unwrap();
+        fd_of(&v)
+    };
+    for i in 0..64u8 {
+        let payload = [b'A' + (i % 26); 4];
+        rt.run_blocking(syscall(
+            DataOp::Seek {
+                fd,
+                offset: 0,
+                whence: std::io::SeekFrom::Start(0),
+            },
+            vec![rd(fd)],
+            Action::Pure,
+        ))
+        .unwrap();
+        rt.run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: payload.to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap();
+        // Write op 返回后不得依赖任何中间操作兜底——同步读必须立即可见新内容
+        // （修复前此处读到的是上一轮 payload 或初始内容）。
+        let got = std::fs::read(&pa).unwrap();
+        assert_eq!(
+            &got[0..4],
+            &payload[..],
+            "第 {i} 轮：Write op 完成后效果必须立即可观察"
+        );
+        // Replace（D10 = recover + reg.clear）复位 A4 线性标记并撤销本轮 Write，
+        // 供下一轮复用同一 fd（Write 的 WriteOnly 资源每轮只允许一次）。
+        rt.run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&pa).unwrap(),
+            b"0000000000",
+            "第 {i} 轮：Replace 撤销后内容恢复"
+        );
+    }
+}
+
 /// Rename 撤销后原路径可再 Open：a→b，Replace（undo 反向 Rename b→a），
 /// 原路径 a 重新可 Open 且内容保留。
 #[test]
