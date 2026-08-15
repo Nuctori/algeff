@@ -86,7 +86,7 @@
 
 因此任何子任务的 Write 都作用于隔离副本/经串行化隔离，不可能影响兄弟分支的 Read。∎（Fork）
 
-**工程实现链**：`ResourceRegistry::clone`（D13，已冻结）→ `Arc::make_mut`（A2/A3 交付）→ `Action::Fork` 解释（A2 交付）。
+**工程实现链**：`ResourceRegistry::clone`（D13，已冻结）→ `Arc::make_mut`（**阶段 3 设计，未实现**——resource-notes §9 评估推迟）→ `Action::Fork` 解释（A2 交付）。
 
 **Rust 测试映射（A6 建议）**
 
