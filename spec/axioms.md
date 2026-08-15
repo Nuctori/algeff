@@ -81,12 +81,9 @@
 ```
 ∀ a, b, f.  Δ(a) ∩ Δ(b) = ∅  ∧  Sym(f)  ∧  Cov(Δ)
       ⇒  Fork(a,b,f) ≡ Fork(b,a,f)
-（Cov(Δ)：a 的每个效果只读写 Δ(a) 内资源——Δ-覆盖前提，proofs.md P2 引理依赖）
-      ⇒  Fork(a,b,f) ≡ Fork(b,a,f)
 ```
 
-（注 1：数学审计 M1——「不存在 Write/Own 模式重叠」为冗余合取：`Δ(a)∩Δ(b)=∅` 已蕴含无共享键，模式重叠无从谈起；保留 pdr.md 原文措辞于此，工程判定以 Δ 不相交为准。
-注 2：数学审计 R2——`Sym(f) := ∀x,y. f(x,y) = f(y,x)`（combine 对称）与 `Cov(Δ)`（Δ-覆盖）为 R1 发现的隐含前提，现并入形式化陈述；proofs.md P2 已同步。）
+注 2：数学审计 R2——`Sym(f) := ∀x,y. f(x,y) = f(y,x)`（combine 对称）与 `Cov(Δ)`（Δ-覆盖：a 的每个效果只读写 Δ(a) 内资源，proofs.md P2 引理依赖）为 R1 发现的隐含前提，现并入形式化陈述；proofs.md P2 已同步。）
 
 注意（pdr.md §四 A3 原文）：Append 并行虽然 OS 保证原子追加，但追加顺序不确定，违反确定性原则；Append∥Append 仅在结果对顺序不敏感时允许，否则降级顺序执行。
 
