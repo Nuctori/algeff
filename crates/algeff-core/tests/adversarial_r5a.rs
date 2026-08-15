@@ -64,7 +64,7 @@ fn nested_seq(depth: u64) -> Action {
 fn guard_boundary_63_ok_64_65_err() {
     let mut rt = Runtime::new(Box::new(NoopExecutor));
 
-    // 下沿：94/95 均正常执行（95 是阈值下沿 —— 叶子恰在 depth 95）。
+    // 下沿：62/63 均正常执行（63 是阈值下沿 —— 叶子恰在 depth 63）。
     assert_eq!(
         rt.run_blocking(nested_seq(62)).unwrap(),
         Value::U64(300),
@@ -76,7 +76,7 @@ fn guard_boundary_63_ok_64_65_err() {
         "深度 63（阈值下沿）应正常执行，守卫不误伤合法嵌套"
     );
 
-    // 上沿：96/97 均在深度 96 触发守卫 → Err(Other(105))（ENOBUFS 语义近似）。
+    // 上沿：64/65 均在深度 64 触发守卫 → Err(Other(105))（ENOBUFS 语义近似）。
     assert_eq!(
         rt.run_blocking(nested_seq(64)).unwrap_err(),
         SysError::Other(105),

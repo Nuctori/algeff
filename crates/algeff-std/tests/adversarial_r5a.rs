@@ -14,9 +14,9 @@
 //!    → put_back 错误恢复 → arbiter WouldBlock → depth guard —— 断言每个修复
 //!    点在混合场景（错误+Catch+Replace / dup 共享 / 仲裁竞争 / 超深嵌套）下
 //!    仍生效（`fix_five_point_regression_single_blueprint`）。
-//! 2. **守卫边界 × 组合**：深度 96 内嵌 Catch → 可捕获；深度 90 + Timeout →
+//! 2. **守卫边界 × 组合**：深度 64 内嵌 Catch → 可捕获；深度 58 + Timeout →
 //!    正常完成；守卫错误经 Timeout 原样透传（`guard_depth64_catch_catchable_...`；
-//!    纯 95/96/97 边界在 core 侧 `adversarial_r5a.rs`）。
+//!    纯 63/64/65 边界在 core 侧 `adversarial_r5a.rs`）。
 //! 3. **组合风暴**：Catch×Fork×Timeout×Scope 混合蓝图 50 轮，每轮轨迹一致
 //!    （左分支超时 42、右分支错误捕获 1、cwd 恢复、写入立即可见），undo 栈
 //!    50 条合并回父、终局 Replace 后栈空 + 全部内容恢复（`combo_storm_...`）。
@@ -420,7 +420,7 @@ fn fix_five_point_regression_single_blueprint() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 攻击面 2：守卫边界 × 组合（纯 95/96/97 边界在 core 侧）
+// 攻击面 2：守卫边界 × 组合（纯 63/64/65 边界在 core 侧）
 // ══════════════════════════════════════════════════════════════════════
 
 /// 守卫 × Catch/Timeout 组合（迭代 1 阈值 64 复测裁决后数值更新）：
