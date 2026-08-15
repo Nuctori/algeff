@@ -655,6 +655,93 @@ fn open_exclusive_existing_fails_no_state_poison() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 攻击面 4d：同路径 Write 模式重开（R6-F2 / RFC-12，audit/r6 §3 锁定的同
+// 路径盲区）——exclusive 撞已存在失败后，同一 Runtime **同路径**以 Write 模式
+// 重开必须成功。修复前 InvalidInput：`check_linear` 在 syscall 执行前预插入的
+// 路径 Write 标记在物理失败后残留毒化；上方 r4b 原测试只覆盖了异路径重开。
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn failed_exclusive_open_same_path_write_reopen_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("exists.txt");
+    std::fs::write(&p, b"original").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: p.clone(),
+                flags: OpenFlags {
+                    write: true,
+                    create: true,
+                    exclusive: true,
+                    ..Default::default()
+                },
+            },
+            vec![wr_path(p.clone())],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::AlreadyExists,
+        "exclusive 撞已存在失败（RFC-10 归一化）"
+    );
+    assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
+    assert!(rt.registry().lookup(0).is_none(), "失败不分配 fd");
+
+    // RFC-12 修复：同路径以 Write 模式重开成功（修复前 InvalidInput ——
+    // 失败 Open(w) 预插入的路径 Write 标记残留毒化）。
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: p.clone(),
+                flags: OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+            },
+            vec![wr_path(p.clone())],
+            Action::Pure,
+        ))
+        .unwrap();
+    let fd = fd_of(&v);
+
+    // 重开后可写（真实全链路：写生效 + A4 至多一次仍成立，标记计数不重复消费）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd,
+            data: b"patched".to_vec(),
+        },
+        vec![wr(fd)],
+        Action::Pure,
+    ))
+    .unwrap();
+    let e2 = rt
+        .run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"again".to_vec(),
+            },
+            vec![wr(fd)],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e2, SysError::InvalidInput, "成功路径 A4 至多一次不变");
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "被 A4 拦截的二写不产生 undo（栈中仅剩首次成功写的 undo）"
+    );
+    assert!(
+        std::fs::read(&p).unwrap().starts_with(b"patched"),
+        "重开后的写真实生效（物理文件）"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 攻击面 4c：truncate 打开后长度 0；写入从 0 增长；recover（Write undo）
 // 复原回长度 0。
 // ══════════════════════════════════════════════════════════════════════

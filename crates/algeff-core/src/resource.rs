@@ -346,6 +346,30 @@ impl ResourceRegistry {
         Ok(())
     }
 
+    /// 失败路径线性标记回滚（RFC-12，R6-F2 修复）：`check_linear` 在 syscall
+    /// **执行前**预插入 Write/Own 消费标记；物理执行失败时这些标记必须回滚
+    /// （与 A7 仲裁「失败回滚」同原则）——否则失败后同路径再以 Write 模式
+    /// 重试会被 A4 误拒（`InvalidInput`，线性标记残留毒化）。
+    ///
+    /// 前置条件：仅当 `check_linear` 对同一批 `resources` **全部返回 Ok** 之后
+    /// 调用。此时每个 Write/Own 标记都是本批新插入的（Write 至多一次、Own
+    /// 终结——重复插入会返回 Err 且不进入执行阶段），故恰好移除一个标记是
+    /// 安全的：不会误删早前成功 syscall 的消费记录。Read/Append 不插标记，
+    /// 无操作。成功路径行为不变（公理 A4：Write/Own 恰好消费一次）。
+    pub fn rollback_linear(&mut self, resources: &ResourceSet) {
+        for u in resources {
+            match u.mode {
+                AccessMode::Write => {
+                    self.consumed.remove(&u.resource);
+                }
+                AccessMode::Own => {
+                    self.owned_consumed.remove(&u.resource);
+                }
+                AccessMode::Read | AccessMode::Append => {}
+            }
+        }
+    }
+
     /// 公理 A3 / 冲突矩阵（pdr.md §9.1）。保守默认：Append∥Append 视为不可并行
     /// （除非调用方声明顺序无关）。
     pub fn can_parallel(&self, a: &ResourceSet, b: &ResourceSet) -> bool {
