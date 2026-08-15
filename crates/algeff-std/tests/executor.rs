@@ -124,12 +124,57 @@ async fn dup2_degrades_to_close_then_dup() {
     );
     assert!(got > old_fd, "新 fd 单调递增");
 
-    // 降级后的 dup 语义仍成立：新 fd 与 old_fd 共享同一工作对象（读回同内容）。
-    let (v, _) = ex
-        .execute(&DataOp::Read { fd: got, len: 12 }, &mut reg)
+    assert_eq!(v, Value::Bytes(b"dup2-payload".to_vec()));
+}
+
+// ── a3. MAX_IO_LEN 超限不泄漏句柄（审计 R2-F3 修复）────────────────────────
+
+/// 超限 len 的 Read 必须在 **take 之前** 拒绝（管道/TCP 路径）：修复前
+/// `take_pipe_reader` 已从注册表移除句柄，随后超限早退 → 读半端被 drop
+/// （对端 EOF）、注册表条目丢失、映射残留陈旧项 → 同 fd 后续操作 NotFound
+/// （句柄被销毁）。修复后：超限 → InvalidInput，同 fd 仍可正常读写。
+#[tokio::test]
+async fn oversized_len_read_does_not_destroy_pipe_handle() {
+    let mut ex = TokioExecutor::new();
+    let mut reg = ResourceRegistry::new();
+
+    let v = ex
+        .execute(
+            &DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            &mut reg,
+        )
         .await
         .unwrap();
-    assert_eq!(v, Value::Bytes(b"dup2-payload".to_vec()));
+    let (rfd, wfd) = match v.0 {
+        Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),
+        other => panic!("{other:?}"),
+    };
+
+    // 超限 len → InvalidInput（可捕获错误，非分配 abort）
+    let e = exec_err(&mut ex, &mut reg, &DataOp::Read { fd: rfd, len: usize::MAX / 4 }).await;
+    assert_eq!(e, SysError::InvalidInput, "超限 len 返回 InvalidInput");
+
+    // 句柄未被销毁：写端可写、读端可读回（修复前此处 NotFound/写端 EOF）
+    ex.execute(
+        &DataOp::Write {
+            fd: wfd,
+            data: b"still-alive".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: rfd, len: 11 }, &mut reg)
+        .await
+        .unwrap();
+    assert_eq!(
+        v,
+        Value::Bytes(b"still-alive".to_vec()),
+        "超限失败后同 fd 仍可读（句柄未被泄漏销毁）"
+    );
 }
 
 // ── b. Write 撤销恢复文件原内容 ────────────────────────────────────────

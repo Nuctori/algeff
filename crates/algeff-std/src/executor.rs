@@ -379,10 +379,12 @@ impl TokioExecutor {
             return Ok((Value::Bytes(buf), None));
         }
         if self.pipe_reader_fds.contains_key(&fd) {
-            let mut arc = self.take_pipe_reader(fd, reg)?;
+            // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
+            // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
             if len > MAX_IO_LEN {
                 return Err(SysError::InvalidInput);
             }
+            let mut arc = self.take_pipe_reader(fd, reg)?;
             let mut buf = vec![0u8; len];
             let n = {
                 // 被 Dup 共享时无法 &mut → InvalidInput（注释）。
@@ -760,10 +762,12 @@ impl TokioExecutor {
         len: usize,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let mut arc = self.take_tcp_stream(fd, reg)?;
+        // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
+        // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
         if len > MAX_IO_LEN {
             return Err(SysError::InvalidInput);
         }
+        let mut arc = self.take_tcp_stream(fd, reg)?;
         let mut buf = vec![0u8; len];
         let n = {
             // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
@@ -1059,6 +1063,13 @@ impl TokioExecutor {
         prot: &MmapProt,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
+        // 审计 R2-F3 修复：读入前校验文件大小上限（tokio::fs::read 按文件全量
+        // 读入——蓝图对宿主大文件 Mmap 即触发与文件等大的分配，debug 下分配
+        // 失败 = 进程级 abort，与 R7-⑤ 修前同族拒绝服务面）。
+        let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
+        if meta.len() > MAX_IO_LEN as u64 {
+            return Err(SysError::InvalidInput);
+        }
         let mut bytes = tokio::fs::read(path).await.map_err(to_sys_err)?;
         // 按 len 截断（medium-7）：映射长度语义；文件短于 len 时返回实际长度。
         if bytes.len() > len {

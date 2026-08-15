@@ -12,8 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "virtual-clock")]
-use std::time::Duration;
 use crate::action::{Action, DataOp, Id, Signal, Value};
 use crate::error::SysError;
 use crate::resource::{ResourceRegistry, ResourceSet};
@@ -427,28 +425,67 @@ fn run_virtual_timeout<'a>(
     reg: &'a mut ResourceRegistry,
     access: ExecAccess<'a>,
     depth: usize,
+    cancel: Option<&'a mut CancelToken>,
 ) -> LocalBoxFuture<'a, Result<Value, SysError>> {
     Box::pin(async move {
         let mut access = access;
+        let mut cancel = cancel;
         let t0 = match ctx.virtual_clock_mut() {
             Some(vc) => vc.now(),
             // 无时钟（理论不可达：Context::new 恒 Some）：退化为纯墙钟路径。
-            None => return run_sub_impl(inner, ctx, undo, reg, access.reborrow(), depth).await,
+            None => {
+                return run_sub_impl(
+                    inner,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await
+            }
         };
         let deadline = t0.saturating_add(duration);
         match tokio::time::timeout(
             duration,
-            run_sub_impl(inner, ctx, undo, reg, access.reborrow(), depth),
+            run_sub_impl(
+                inner,
+                ctx,
+                undo,
+                reg,
+                access.reborrow(),
+                depth,
+                cancel.as_deref_mut(),
+            ),
         )
         .await
         {
             Err(_elapsed) => {
-                run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth).await
+                run_sub_impl(
+                    on_timeout,
+                    ctx,
+                    undo,
+                    reg,
+                    access.reborrow(),
+                    depth,
+                    cancel.as_deref_mut(),
+                )
+                .await
             }
             Ok(r) => {
                 let elapsed = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(t0);
                 if elapsed >= deadline {
-                    run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth).await
+                    run_sub_impl(
+                        on_timeout,
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await
                 } else {
                     r
                 }
@@ -1120,7 +1157,6 @@ async fn interpret_impl(
                 duration,
                 on_timeout,
             } => {
-<<<<<<< HEAD
                 #[cfg(feature = "virtual-clock")]
                 {
                     // 审计 R1 红灯根因修复（Timeout×virtual-clock 时域统一）：
@@ -1144,25 +1180,10 @@ async fn interpret_impl(
                         reg,
                         access.reborrow(),
                         depth,
+                        cancel.as_deref_mut(),
                     )
                     .await;
                 }
-                // VC 构建下上方恒 return，此处为墙钟路径（`#[allow]`：cfg 剥离
-                // 后不可达性编译器无法跨 feature 感知）。
-                #[allow(unreachable_code)]
-                match tokio::time::timeout(
-                    duration,
-                    run_sub_impl(*inner, ctx, undo, reg, access.reborrow(), depth),
-                )
-                .await
-                {
-                    Ok(Ok(v)) => return Ok(v),
-                    Ok(Err(e)) => return Err(e),
-                    Err(_elapsed) => {
-                        return run_sub_impl(*on_timeout, ctx, undo, reg, access.reborrow(), depth)
-                            .await
-                    }
-=======
                 // ── 取消传播协议（RFC-08/09/12 残余统一修复）──
                 // 超时触发时不再直接丢弃 inner future（旧行为：已 spawn 的
                 // Fork 分支成为孤儿继续执行、持锁分支永不 Unlock、飞行中
@@ -1201,9 +1222,7 @@ async fn interpret_impl(
                 // 返回后借用即结束（无需显式 drop）。
                 let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx).await;
                 if !timed_out {
-                    // 超时前完成：inner 效果全部保留（原语义）。
                     return inner_result;
->>>>>>> iter1/it1-rfc0809
                 }
                 // 超时取消：先回滚 inner 已入栈 undo（异步，可含 IO），
                 // 再回滚 inner 新增的线性标记，最后执行 on_timeout。
