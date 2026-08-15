@@ -567,7 +567,7 @@ fn poison_failed_write_syscall_leaves_linear_mark() {
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
     assert!(rt.registry().lookup(0).is_none(), "失败不分配 fd");
 
-    // F2：同路径 Write 模式重开被残留标记拒绝。
+    // RFC-12 修复后：失败路径线性标记已回滚 → 同路径 Write 模式重开成功。
     let e2 = rt
         .run_blocking(syscall(
             DataOp::Open {
@@ -581,11 +581,10 @@ fn poison_failed_write_syscall_leaves_linear_mark() {
             vec![wr_path(p.clone())],
             Action::Pure,
         ))
-        .unwrap_err();
-    assert_eq!(
-        e2,
-        SysError::InvalidInput,
-        "F2 缺陷锁定：失败 Write syscall 的线性标记残留 → 同路径重开被拒"
+        .unwrap();
+    assert!(
+        matches!(e2, Value::Fd(_)),
+        "RFC-12 修复后行为：失败 Write 的线性标记已回滚，同路径重开成功，得到 {e2:?}"
     );
 
     // 对照：Read 模式不查 consumed → 同路径读打开不受影响（物理文件完好）。
