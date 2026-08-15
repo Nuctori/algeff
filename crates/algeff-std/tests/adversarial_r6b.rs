@@ -139,7 +139,11 @@ fn r6b_open_missing_not_found_no_poison() {
             Action::Pure,
         ))
         .unwrap_err();
-    assert_eq!(e, SysError::NotFound, "Open 缺失 → NotFound（ENOENT，跨平台）");
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "Open 缺失 → NotFound（ENOENT，跨平台）"
+    );
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
     assert!(rt.registry().lookup(0).is_none(), "失败不分配 fd");
 
@@ -204,7 +208,10 @@ fn r6b_truncate_missing_not_found() {
 
     let e = rt
         .run_blocking(syscall(
-            DataOp::Truncate { path: p.clone(), len: 3 },
+            DataOp::Truncate {
+                path: p.clone(),
+                len: 3,
+            },
             vec![wr_path(p.clone())],
             Action::Pure,
         ))
@@ -311,7 +318,11 @@ fn r6b_mkdir_parent_missing_and_file_collision() {
             Action::Pure,
         ))
         .unwrap_err();
-    assert_eq!(e, SysError::NotFound, "Mkdir 父目录缺失 → NotFound（跨平台）");
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "Mkdir 父目录缺失 → NotFound（跨平台）"
+    );
     assert!(!nested.exists(), "失败不创建目录");
 
     let e = rt
@@ -452,7 +463,10 @@ fn r6b_write_readonly_fd_error_no_poison_linearity() {
     // 无状态毒化①：文件内容未变、无 undo、失败未丢句柄。
     assert_eq!(std::fs::read(&p).unwrap(), b"0123456789", "失败不改动文件");
     assert!(rt.undo_stack().is_empty(), "失败的 Write 不产生 undo");
-    assert!(rt.registry().lookup(ro_fd).is_some(), "失败后只读 fd 仍可寻址");
+    assert!(
+        rt.registry().lookup(ro_fd).is_some(),
+        "失败后只读 fd 仍可寻址"
+    );
 
     // 线性标记：失败 Syscall 已消费 Write 标记（check_linear 先行，按设计），
     // 但 Own 终结集独立 → 错误后 Close(Own) 仍合法（r2/r4b 风格断言）。
@@ -606,7 +620,10 @@ fn r6b_pipe_write_no_reader_error() {
          NotFound 见 direct executor 测试）"
     );
     // 读端无轮换（Close 前无读操作）→ 注册表直查可观测。
-    assert!(rt.registry().lookup(rfd).is_none(), "Close 后读端从注册表释放");
+    assert!(
+        rt.registry().lookup(rfd).is_none(),
+        "Close 后读端从注册表释放"
+    );
 }
 
 /// 管道错误路径的 put_back 句柄恢复（blocker-3，direct executor 层）：
@@ -782,10 +799,7 @@ fn r6b_send_file_closed_pipe_error_and_self_copy_invalid() {
         ))
         .unwrap_err();
     assert_eq!(e3, SysError::InvalidInput, "SendFile 自拷贝 → InvalidInput");
-    assert!(
-        rt.registry().lookup(sfd).is_some(),
-        "自拷贝拒绝不丢句柄"
-    );
+    assert!(rt.registry().lookup(sfd).is_some(), "自拷贝拒绝不丢句柄");
 
     // 清理：全部 fd 可正常关闭。
     for (fd, usage) in [(sfd, ow(sfd)), (wfd, ow(wfd))] {
@@ -935,7 +949,11 @@ fn r6b_mmap_missing_not_found() {
             Action::Pure,
         ))
         .unwrap();
-    assert_eq!(v, Value::Bytes(b"0123".to_vec()), "恢复后 Mmap 正常（len 截断）");
+    assert_eq!(
+        v,
+        Value::Bytes(b"0123".to_vec()),
+        "恢复后 Mmap 正常（len 截断）"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -952,11 +970,7 @@ fn r6b_spawn_missing_command_not_found_then_success() {
     cmd.arg("--help");
 
     let e = rt
-        .run_blocking(syscall(
-            DataOp::Spawn { cmd },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::Spawn { cmd }, vec![], Action::Pure))
         .unwrap_err();
     assert_eq!(
         e,
@@ -979,22 +993,14 @@ fn r6b_spawn_missing_command_not_found_then_success() {
         c
     };
     let v = rt
-        .run_blocking(syscall(
-            DataOp::Spawn { cmd: real },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::Spawn { cmd: real }, vec![], Action::Pure))
         .unwrap();
     let pid = match v {
         Value::Pid(p) => p,
         other => panic!("期望 Pid，得到 {other:?}"),
     };
     let v = rt
-        .run_blocking(syscall(
-            DataOp::Wait { pid },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::Wait { pid }, vec![], Action::Pure))
         .unwrap();
     assert_eq!(v, Value::U64(3), "Wait 取回退出码 3");
 }
@@ -1027,11 +1033,7 @@ fn r6b_udp_bind_occupied_other_98_no_poison() {
     };
 
     let e = rt
-        .run_blocking(syscall(
-            DataOp::UdpBind { addr },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
         .unwrap_err();
     assert_eq!(
         e,
@@ -1058,18 +1060,10 @@ fn r6b_udp_bind_occupied_other_98_no_poison() {
     .unwrap();
 
     // Close 首 socket → 端口释放 → 同地址可再绑（无跨操作泄漏占用端口）。
-    rt.run_blocking(syscall(
-        DataOp::Close { fd },
-        vec![ow(fd)],
-        Action::Pure,
-    ))
-    .unwrap();
+    rt.run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
+        .unwrap();
     let v = rt
-        .run_blocking(syscall(
-            DataOp::UdpBind { addr },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
         .unwrap();
     let fd2 = fd_of(&v);
     assert!(
@@ -1101,7 +1095,9 @@ fn r6b_catch_error_then_new_ops_work() {
     let v = rt
         .run_blocking(Action::Catch {
             action: Box::new(syscall(
-                DataOp::Stat { path: missing.clone() },
+                DataOp::Stat {
+                    path: missing.clone(),
+                },
                 vec![rd_path(missing)],
                 Action::Pure,
             )),

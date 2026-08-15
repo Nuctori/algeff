@@ -356,7 +356,7 @@ impl ResourceRegistry {
     /// 终结——重复插入会返回 Err 且不进入执行阶段），故恰好移除一个标记是
     /// 安全的：不会误删早前成功 syscall 的消费记录。Read/Append 不插标记，
     /// 无操作。成功路径行为不变（公理 A4：Write/Own 恰好消费一次）。
-    pub fn rollback_linear(&mut self, resources: &ResourceSet) {
+    pub fn rollback_linear(&mut self, resources: &[ResourceUsage]) {
         for u in resources {
             match u.mode {
                 AccessMode::Write => {

@@ -157,7 +157,14 @@ async fn chain_missing_path_ops_map_not_found() {
         "Open 缺失路径 → NotFound"
     );
     assert_eq!(
-        exec_err(&mut ex, &mut reg, &DataOp::Stat { path: missing.clone() }).await,
+        exec_err(
+            &mut ex,
+            &mut reg,
+            &DataOp::Stat {
+                path: missing.clone()
+            }
+        )
+        .await,
         SysError::NotFound,
         "Stat 缺失路径 → NotFound"
     );
@@ -175,12 +182,26 @@ async fn chain_missing_path_ops_map_not_found() {
         "Truncate 缺失路径 → NotFound"
     );
     assert_eq!(
-        exec_err(&mut ex, &mut reg, &DataOp::Unlink { path: missing.clone() }).await,
+        exec_err(
+            &mut ex,
+            &mut reg,
+            &DataOp::Unlink {
+                path: missing.clone()
+            }
+        )
+        .await,
         SysError::NotFound,
         "Unlink 缺失路径 → NotFound"
     );
     assert_eq!(
-        exec_err(&mut ex, &mut reg, &DataOp::ReadDir { path: missing.clone() }).await,
+        exec_err(
+            &mut ex,
+            &mut reg,
+            &DataOp::ReadDir {
+                path: missing.clone()
+            }
+        )
+        .await,
         SysError::NotFound,
         "ReadDir 缺失路径 → NotFound"
     );
@@ -524,7 +545,11 @@ async fn xvol_rename_windows_maps_to_cross_device() {
         "Unix 跨卷 rename → EXDEV → CrossDevice"
     );
     // 失败原子性：源文件完好。
-    assert_eq!(std::fs::read(&from).unwrap(), b"payload", "失败不改动源文件");
+    assert_eq!(
+        std::fs::read(&from).unwrap(),
+        b"payload",
+        "失败不改动源文件"
+    );
     assert!(reg.lookup(0).is_none(), "失败不分配句柄");
     xvol_cleanup(&src_dir, &dst_dir);
 }
@@ -563,7 +588,11 @@ fn poison_failed_write_syscall_leaves_linear_mark() {
             Action::Pure,
         ))
         .unwrap_err();
-    assert_eq!(e, SysError::AlreadyExists, "exclusive 撞已存在（RFC-10 归一化）");
+    assert_eq!(
+        e,
+        SysError::AlreadyExists,
+        "exclusive 撞已存在（RFC-10 归一化）"
+    );
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
     assert!(rt.registry().lookup(0).is_none(), "失败不分配 fd");
 
@@ -600,7 +629,11 @@ fn poison_failed_write_syscall_leaves_linear_mark() {
         .unwrap();
     let fd = fd_of(&v);
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd, len: 4 }, vec![rd(fd)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd, len: 4 },
+            vec![rd(fd)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"data".to_vec()), "物理文件未被失败污染");
 }
@@ -733,7 +766,11 @@ fn catch_rfc10_io_error_is_caught_and_not_sticky() {
         .unwrap();
     let fd = fd_of(&v);
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd, len: 9 }, vec![rd(fd)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd, len: 9 },
+            vec![rd(fd)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"keep-data".to_vec()), "Catch 后同文件可读");
     rt.run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
@@ -753,11 +790,7 @@ fn catch_network_error_is_caught_and_not_sticky() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let v = rt
         .run_blocking(Action::Catch {
-            action: Box::new(syscall(
-                DataOp::TcpConnect { addr },
-                vec![],
-                Action::Pure,
-            )),
+            action: Box::new(syscall(DataOp::TcpConnect { addr }, vec![], Action::Pure)),
             handler: Box::new(|e| {
                 assert_eq!(
                     e,
@@ -775,7 +808,11 @@ fn catch_network_error_is_caught_and_not_sticky() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr2 = listener.local_addr().unwrap();
     let v = rt
-        .run_blocking(syscall(DataOp::TcpConnect { addr: addr2 }, vec![], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::TcpConnect { addr: addr2 },
+            vec![],
+            Action::Pure,
+        ))
         .unwrap();
     let fd = fd_of(&v);
     assert_eq!(fd, 0, "失败未消耗 fd 编号");

@@ -626,8 +626,14 @@ async fn interpret_impl(
                 resources,
                 next,
             } => {
-                for u in &resources {
-                    reg.check_linear(u)?;
+                // 批内部分失败原子性（审计 B2）：check_linear 逐资源插入 Write/Own
+                // 消费标记，若后续资源检查失败（`?` 提前返回），前缀已插入的标记
+                // 会残留——只回滚成功前缀（resources[..i]），不得动更早的合法消费记录。
+                for (i, u) in resources.iter().enumerate() {
+                    if let Err(e) = reg.check_linear(u) {
+                        reg.rollback_linear(&resources[..i]);
+                        return Err(e);
+                    }
                 }
                 // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
                 // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径

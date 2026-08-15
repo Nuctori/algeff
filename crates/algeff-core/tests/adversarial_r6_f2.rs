@@ -309,3 +309,72 @@ fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
         .unwrap();
     assert_eq!(v, Value::Unit, "Read 不受回滚影响（兜底值）");
 }
+
+/// 审计 B2：check_linear 批内部分失败的前缀回滚。
+/// 资源批 [W(path1), W(path2)] 中 path2 已消费（早前成功 Open(w)）→
+/// path1 的标记先插入、path2 检查失败 → 只回滚前缀 [W(path1)]：
+/// path1 不被毒化（可重试），path2 的**早前**消费记录不被误删（仍拒绝）。
+#[test]
+fn batch_partial_check_failure_rolls_back_prefix_only() {
+    let mut rt = Runtime::new(Box::new(ScriptedExecutor {
+        results: VecDeque::from([
+            Ok((Value::Fd(0), None)), // Open(w) path2 成功 → path2 Write 标记消费
+                                      // 双资源 Open：check_linear(path1) 插入 → check_linear(path2) 失败
+                                      // （已消费）→ 前缀 [W(path1)] 回滚，错误透传
+        ]),
+    }));
+    let p1 = PathBuf::from("/a.txt");
+    let p2 = PathBuf::from("/b.txt");
+
+    rt.run_blocking(syscall(
+        DataOp::Open {
+            path: p2.clone(),
+            flags: rw_flags(),
+        },
+        vec![wr_path(p2.clone())],
+        Action::Pure,
+    ))
+    .unwrap();
+
+    // 双资源批：path1 标记插入后 path2 检查失败（InvalidInput）
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: p1.clone(),
+                flags: rw_flags(),
+            },
+            vec![wr_path(p1.clone()), wr_path(p2.clone())],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(e, SysError::InvalidInput, "path2 已消费 → 批检查失败");
+    assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
+
+    // path1 前缀标记已回滚 → 同路径 Write 模式重开成功（B2 修复后）
+    rt.run_blocking(syscall(
+        DataOp::Open {
+            path: p1.clone(),
+            flags: rw_flags(),
+        },
+        vec![wr_path(p1.clone())],
+        Action::Pure,
+    ))
+    .unwrap();
+
+    // path2 的早前消费记录未被前缀回滚误删 → 仍被 A4 拒绝
+    let e2 = rt
+        .run_blocking(syscall(
+            DataOp::Open {
+                path: p2.clone(),
+                flags: rw_flags(),
+            },
+            vec![wr_path(p2.clone())],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e2,
+        SysError::InvalidInput,
+        "早前成功消费的 path2 标记不被前缀回滚误删（A4 恰好一次）"
+    );
+}
