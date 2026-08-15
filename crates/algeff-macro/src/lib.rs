@@ -39,11 +39,25 @@ impl Parse for PlanInput {
     }
 }
 
-/// `plan!{ ... }`：构造 `Action::Sequential` 链（pdr.md §13）。
-///
-/// 每个元素为返回 `Action` 的表达式；`current` 逐个装箱，
-/// `next` 忽略前一值继续链，最后一个 `next` 收敛为 `Pure(Unit)`。
-/// 空列表展开为 `Action::Pure(Value::Unit)`。
+#[doc = "构造 `Action::Sequential` 链（pdr.md §13「宏的使用（可选）」/ §八「代数原语（DSL 名称与语义）」）。"]
+#[doc = ""]
+#[doc = "语法：`plan!{ e1; e2; ... }`，每个元素为返回 `Action` 的表达式。"]
+#[doc = ""]
+#[doc = "展开说明：元素反向逐个装箱为 `Action::Sequential { current, next }`；"]
+#[doc = "`current` 为当前元素，`next` 为忽略前一值的 continuation，最后一个 `next`"]
+#[doc = "收敛为 `Action::Pure(Value::Unit)`。空列表直接展开为 `Action::Pure(Value::Unit)`。"]
+#[doc = "宏仅拼 AST，不做任何类型检查（pdr.md §八：核心不依赖宏，宏仅为语法糖）。"]
+#[doc = ""]
+#[doc = "用法示例："]
+#[doc = "```rust"]
+#[doc = "use algeff_macro::plan;"]
+#[doc = "use algeff_core::{Action, Value};"]
+#[doc = "let p: Action = plan! {"]
+#[doc = "    Action::Pure(Value::U64(1));"]
+#[doc = "    Action::Pure(Value::U64(2));"]
+#[doc = "};"]
+#[doc = "assert!(matches!(p, Action::Sequential { .. }));"]
+#[doc = "```"]
 #[proc_macro]
 pub fn plan(input: TokenStream) -> TokenStream {
     let PlanInput { exprs } = syn::parse_macro_input!(input as PlanInput);
@@ -72,7 +86,10 @@ impl Parse for ForkInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let label: Ident = input.parse()?;
         if label != "left" {
-            return Err(syn::Error::new(label.span(), "fork! 期望标签 `left:`"));
+            return Err(syn::Error::new(
+                label.span(),
+                "fork! 期望标签 `left:`（语法：fork!{ left: <expr>, right: <expr> }）",
+            ));
         }
         input.parse::<Token![:]>()?;
         let left: Expr = input.parse()?;
@@ -80,7 +97,10 @@ impl Parse for ForkInput {
 
         let label: Ident = input.parse()?;
         if label != "right" {
-            return Err(syn::Error::new(label.span(), "fork! 期望标签 `right:`"));
+            return Err(syn::Error::new(
+                label.span(),
+                "fork! 期望标签 `right:`（语法：fork!{ left: <expr>, right: <expr> }）",
+            ));
         }
         input.parse::<Token![:]>()?;
         let right: Expr = input.parse()?;
@@ -88,15 +108,30 @@ impl Parse for ForkInput {
         // 容忍尾随逗号，再拒绝任何多余 token
         let _ = input.parse::<Token![,]>();
         if !input.is_empty() {
-            return Err(input.error("fork! 存在多余 token"));
+            return Err(input.error("fork! 存在多余 token（语法：fork!{ left: <expr>, right: <expr> }）"));
         }
         Ok(Self { left, right })
     }
 }
 
-/// `fork!{ left: ..., right: ... }`：构造 `Action::Fork`（pdr.md §13）。
-///
-/// `combine` 固定为忽略两侧值的 `Pure(Unit)` 收敛闭包。
+#[doc = "构造 `Action::Fork`（pdr.md §13「宏的使用（可选）」/ §八「代数原语」）。"]
+#[doc = ""]
+#[doc = "语法：`fork!{ left: e1, right: e2 }`（容忍尾随逗号）。"]
+#[doc = ""]
+#[doc = "展开说明：`left`/`right` 分别装箱为 `Action::Fork` 的两个分支；"]
+#[doc = "`combine` 固定为忽略两侧值、收敛为 `Action::Pure(Value::Unit)` 的闭包"]
+#[doc = "（pdr.md §八：并发分叉，左/右资源集自动分裂）。"]
+#[doc = ""]
+#[doc = "用法示例："]
+#[doc = "```rust"]
+#[doc = "use algeff_macro::fork;"]
+#[doc = "use algeff_core::{Action, Value};"]
+#[doc = "let f: Action = fork! {"]
+#[doc = "    left: Action::Pure(Value::U64(1)),"]
+#[doc = "    right: Action::Pure(Value::U64(2)),"]
+#[doc = "};"]
+#[doc = "assert!(matches!(f, Action::Fork { .. }));"]
+#[doc = "```"]
 #[proc_macro]
 pub fn fork(input: TokenStream) -> TokenStream {
     let ForkInput { left, right } = syn::parse_macro_input!(input as ForkInput);
@@ -128,16 +163,28 @@ impl Parse for ScopeInput {
         // 容忍尾随逗号，再拒绝任何多余 token
         let _ = input.parse::<Token![,]>();
         if !input.is_empty() {
-            return Err(input.error("scope! 存在多余 token"));
+            return Err(input.error("scope! 存在多余 token（语法：scope!(base, || expr)）"));
         }
         Ok(Self { base, inner })
     }
 }
 
-/// `scope!(base, || expr)`：构造 `Action::Scope`（pdr.md §13）。
-///
-/// `base` 支持字符串字面量（转 `PathBuf::from`）或现成的 `PathBuf` 表达式；
-/// `inner` 为闭包调用结果（`Box::new(闭包())`），`next` 收敛为 `Pure(Unit)`。
+#[doc = "构造 `Action::Scope`（pdr.md §13「宏的使用（可选）」/ §八「代数原语」）。"]
+#[doc = ""]
+#[doc = "语法：`scope!(base, || expr)`：`base` 为路径（字符串字面量或现成的 `PathBuf` 表达式），"]
+#[doc = "`expr` 为返回 `Action` 的闭包体。"]
+#[doc = ""]
+#[doc = "展开说明：`base` 为字符串字面量时转换为 `PathBuf::from(base)`，否则原样使用；"]
+#[doc = "`inner` 为闭包调用结果（`Box::new(闭包())`），`next` 收敛为 `Action::Pure(Value::Unit)`"]
+#[doc = "（pdr.md §八：局部路径上下文，路径资源作用域化）。"]
+#[doc = ""]
+#[doc = "用法示例："]
+#[doc = "```rust"]
+#[doc = "use algeff_macro::scope;"]
+#[doc = "use algeff_core::{Action, Value};"]
+#[doc = "let s: Action = scope!(\"/var/log/myapp\", || Action::Pure(Value::Unit));"]
+#[doc = "assert!(matches!(s, Action::Scope { .. }));"]
+#[doc = "```"]
 #[proc_macro]
 pub fn scope(input: TokenStream) -> TokenStream {
     let ScopeInput { base, inner } = syn::parse_macro_input!(input as ScopeInput);
@@ -174,7 +221,10 @@ impl Parse for ChooseInput {
 
         let label: Ident = input.parse()?;
         if label != "then" {
-            return Err(syn::Error::new(label.span(), "choose! 期望标签 `then:`"));
+            return Err(syn::Error::new(
+                label.span(),
+                "choose! 期望标签 `then:`（语法：choose!(cond, then: <expr>, else: <expr>)）",
+            ));
         }
         input.parse::<Token![:]>()?;
         let then_branch: Expr = input.parse()?;
@@ -188,7 +238,7 @@ impl Parse for ChooseInput {
         // 容忍尾随逗号，再拒绝任何多余 token
         let _ = input.parse::<Token![,]>();
         if !input.is_empty() {
-            return Err(input.error("choose! 存在多余 token"));
+            return Err(input.error("choose! 存在多余 token（语法：choose!(cond, then: <expr>, else: <expr>)）"));
         }
         Ok(Self {
             cond,
@@ -198,10 +248,26 @@ impl Parse for ChooseInput {
     }
 }
 
-/// `choose!(cond, then: ..., else: ...)`：构造 `Action::Choose`（pdr.md §13）。
-///
-/// `cond` 为 bool 表达式，包进 `move |_| cond` 闭包（`CondFn`），
-/// 分支字段分别装箱。
+#[doc = "构造 `Action::Choose`（pdr.md §13「宏的使用（可选）」/ §八「代数原语」）。"]
+#[doc = ""]
+#[doc = "语法：`choose!(cond, then: e1, else: e2)`（容忍尾随逗号；`else` 为关键字，"]
+#[doc = "按 `Token![else]` 解析）。"]
+#[doc = ""]
+#[doc = "展开说明：`cond` 为 bool 表达式，包进 `move |_| cond` 闭包（`CondFn`）；"]
+#[doc = "`then_branch`/`else_branch` 分别装箱"]
+#[doc = "（pdr.md §八：条件分支，分支内资源隔离）。"]
+#[doc = ""]
+#[doc = "用法示例："]
+#[doc = "```rust"]
+#[doc = "use algeff_macro::choose;"]
+#[doc = "use algeff_core::{Action, Value};"]
+#[doc = "let c: Action = choose!("]
+#[doc = "    true,"]
+#[doc = "    then: Action::Pure(Value::U64(1)),"]
+#[doc = "    else: Action::Pure(Value::U64(2)),"]
+#[doc = ");"]
+#[doc = "assert!(matches!(c, Action::Choose { .. }));"]
+#[doc = "```"]
 #[proc_macro]
 pub fn choose(input: TokenStream) -> TokenStream {
     let ChooseInput {
