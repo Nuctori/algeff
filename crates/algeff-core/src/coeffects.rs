@@ -82,6 +82,33 @@ impl CoeffectStore {
             }
         })
     }
+
+    /// 可逆注册并同时产出两份等价逆操作（`Runtime::set_dependency` 场景）：
+    /// 一份压入撤销栈随 `recover()` 生效，一份返回调用方供即时撤销。
+    ///
+    /// 两份逆操作各自独立持有撤销所需信息（旧绑定/删除），语义等价；
+    /// 调用方应保证**只执行其中一份**（栈内那份由 `recover()` 消费），
+    /// 避免对同一绑定执行两次撤销。
+    pub async fn set_replicated(&self, k: DepKey, v: Value) -> (UndoOp, UndoOp) {
+        let mut table = self.inner.lock().await;
+        let old = table.entries.insert(k, v);
+        drop(table);
+        let make_undo = |store: CoeffectStore| -> UndoOp {
+            let old = old.clone();
+            Box::pin(async move {
+                let mut t = store.inner.lock().await;
+                match old {
+                    Some(old_v) => {
+                        t.entries.insert(k, old_v);
+                    }
+                    None => {
+                        t.entries.remove(&k);
+                    }
+                }
+            })
+        };
+        (make_undo(self.clone()), make_undo(self.clone()))
+    }
 }
 
 /// 组件：依赖规范 d ⊆ K + 生命周期回调（pdr.md §5.2.2）。
@@ -188,6 +215,63 @@ impl ComponentRegistry {
         let snapshot = store.snapshot().await;
         let mut events = Vec::new();
         for (idx, comp) in self.components.iter_mut().enumerate() {
+            let satisfied = comp.deps.iter().all(|k| snapshot.contains(k));
+            let prev = self.last_satisfied[idx];
+            let activation = match (prev, satisfied) {
+                (false, true) => Activation::Activating,
+                (true, false) => Activation::Deactivating,
+                _ => Activation::Neutral,
+            };
+            self.last_satisfied[idx] = satisfied;
+            match activation {
+                Activation::Activating => {
+                    if let Some(cb) = comp.on_activate.as_mut() {
+                        cb();
+                    }
+                    events.push((idx, activation));
+                }
+                Activation::Deactivating => {
+                    if let Some(cb) = comp.on_deactivate.as_mut() {
+                        cb();
+                    }
+                    events.push((idx, activation));
+                }
+                Activation::Neutral => {}
+            }
+        }
+        events
+    }
+}
+
+/// 组件满足状态机（pdr.md §5.2.2 notify 的折叠状态，工程载体）。
+///
+/// `Runtime::loaded_components` 由运行时持有（避免组件列表双份漂移），
+/// 本结构仅维护各索引「上次满足状态」；`sync` 基于 `store` 当前快照驱动
+/// 激活/停用翻转，语义与 `ComponentRegistry::sync` 一致（组件初始视为
+/// 未满足，首次满足即 Activating；依赖撤销后翻转 Deactivating），并触发
+/// 组件生命周期回调、返回 (索引, Activation) 事件列表。
+///
+/// 局限：状态按组件索引对齐，组件列表仅追加不删除时索引保持稳定。
+#[derive(Debug, Default)]
+pub struct ComponentState {
+    last_satisfied: Vec<bool>,
+}
+
+impl ComponentState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 同步外部组件列表（`Runtime::sync_components` 的底层载体）。
+    pub async fn sync(
+        &mut self,
+        components: &mut [Component],
+        store: &CoeffectStore,
+    ) -> Vec<(usize, Activation)> {
+        let snapshot = store.snapshot().await;
+        self.last_satisfied.resize(components.len(), false);
+        let mut events = Vec::new();
+        for (idx, comp) in components.iter_mut().enumerate() {
             let satisfied = comp.deps.iter().all(|k| snapshot.contains(k));
             let prev = self.last_satisfied[idx];
             let activation = match (prev, satisfied) {
