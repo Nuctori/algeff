@@ -146,9 +146,21 @@ impl Runtime {
         self.context.virtual_clock_mut()
     }
 
-    /// 执行蓝图（异步）。`interpret` 的 future 非 `Send`（冻结签名
-    /// `&mut dyn SyscallExecutor` 无 Send 超 trait），直接 `.await` 时
-    /// 需在非 Send 要求上下文中进行（如 `run_blocking`）。
+    /// 执行蓝图（异步），完整路径语义（contracts.md D10/D14）：
+    ///
+    /// - 主循环为 `interpret` trampoline：`cur` 贯穿节点，`Pure` 单位元直接收敛；
+    /// - `Fork`：阶段 1（D14）= 静态冲突检测（`fork_conflict`）+ **顺序执行**
+    ///   （left → right → combine）；分支状态以 registry Clone 隔离（D13）；
+    /// - `Replace`：**先 `recover()`**——LIFO 执行全部累积逆操作并清空撤销栈——
+    ///   再执行 target，以其结果结束（D10，安全默认：资源不泄漏）；
+    /// - `Scope`：cwd 词法规范化入栈，退出时（含 inner 出错）无条件恢复；
+    /// - `Timeout`：`tokio::time::timeout`，`Elapsed` 走 `on_timeout` 分支；
+    /// - `Catch`：仅处理错误值，不触碰撤销栈（recover 语义在 Replace/recover 路径）；
+    /// - `WatchSignal`/`Invoke`：委托执行器，默认 ENOSYS（`Other(38)`）原样透传。
+    ///
+    /// 注意：`interpret` 的 future 非 `Send`（冻结签名 `&mut dyn SyscallExecutor`
+    /// 无 Send 超 trait），直接 `.await` 时需在非 Send 要求上下文中进行
+    /// （如 `run_blocking`）。
     pub async fn run(&mut self, action: Action) -> Result<Value, SysError> {
         interpret(
             action,
@@ -264,7 +276,10 @@ pub fn fork_conflict(reg: &ResourceRegistry, left: &Action, right: &Action) -> b
 /// - `Replace`：先 `recover()`（清空撤销栈）再执行 target，以其结果结束（D10）；
 /// - `Sleep`：feature `virtual-clock` 时推进逻辑时钟（不真实等待），否则真实等待；
 /// - `Timeout`：`tokio::time::timeout`，`Elapsed` → 执行 on_timeout；
-/// - `Catch`：Err → handler(e)，Ok 原样返回。
+/// - `Catch`：Err → handler(e)，Ok 原样返回；不触碰撤销栈（recover 语义在
+///   Replace/recover 路径）；
+/// - `WatchSignal`/`Invoke`：委托执行器；默认执行器返回 ENOSYS
+///   （`SysError::Other(38)`），解释器原样透传错误；
 pub async fn interpret(
     action: Action,
     ctx: &mut Context,
@@ -317,14 +332,11 @@ pub async fn interpret(
             Action::Scope { base, inner, next } => {
                 let old = ctx.cwd.clone();
                 ctx.cwd = reg.canonicalize_path(&base, &old);
-                let v = match run_sub(*inner, ctx, undo, reg, ex).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        ctx.cwd = old;
-                        return Err(e);
-                    }
-                };
+                // finally 模式：inner 无论成功/失败，先恢复 cwd 再传播结果，
+                // 保证异常路径同样恢复（RAII 守卫因 ctx 双重可变借用不可行）。
+                let v = run_sub(*inner, ctx, undo, reg, ex).await;
                 ctx.cwd = old;
+                let v = v?;
                 let na = next(v);
                 (Value::Unit, na)
             }
