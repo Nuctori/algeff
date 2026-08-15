@@ -180,7 +180,8 @@ pub enum ResourceHandle {
 }
 
 /// 全局标识分配与冲突检测（pdr.md §2.3 / §12.3，公理 A3/A4/A7 的工程载体）。
-#[derive(Default)]
+/// 实现 Clone：Fork 并行时子任务隔离状态，完成后合并回主 registry（决策 D13）。
+#[derive(Default, Clone)]
 pub struct ResourceRegistry {
     next_fd: Fd,
     handles: HashMap<Fd, ResourceHandle>,

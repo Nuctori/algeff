@@ -36,3 +36,7 @@
 ## 🤖 助手: Fixing the std executor stub to the new trait signature: <!--run:run-59204-591vcl-->
 
 ## 🤖 助手: Workspace compiles. Writing contracts.md (the frozen contract all 8 agents build against), then committing 阶段0: <!--run:run-59204-591vcl-->
+
+## 🤖 助手: Base committed, 11 tests green. Adding `.pi/` to gitignore, then creating 8 worktrees: <!--run:run-59204-591vcl-->
+
+## 🤖 助手: 8 worktrees ready. One CTO-level unblock first: `ResourceRegistry` needs `Clone` for A2's Fork-parallel state isolation (implementation-level addition, no signature change). Checking current file state (clippy auto-fixed it earlier): <!--run:run-59204-591vcl-->
