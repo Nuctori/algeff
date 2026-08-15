@@ -110,10 +110,7 @@ fn append_task(path: PathBuf, chunk: Bytes, tail: Action) -> Action {
         Box::new(move |v| {
             let fd = fd_of(v);
             syscall(
-                DataOp::Write {
-                    fd,
-                    data: chunk,
-                },
+                DataOp::Write { fd, data: chunk },
                 vec![use_write_fd(fd)],
                 Box::new(move |_| {
                     syscall(

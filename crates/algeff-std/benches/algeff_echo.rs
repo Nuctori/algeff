@@ -180,10 +180,7 @@ fn read_until(fd: Fd, remaining: usize, done: Action) -> Action {
         return done;
     }
     syscall(
-        DataOp::TcpRead {
-            fd,
-            len: remaining,
-        },
+        DataOp::TcpRead { fd, len: remaining },
         vec![use_read_fd(fd)],
         Box::new(move |v| {
             let n = bytes_len(v); // n ≤ remaining（TcpRead 至多返回剩余长度）
@@ -206,10 +203,7 @@ fn conn_session(addr: SocketAddr, payload: Bytes, tail: Action) -> Action {
             );
             let read_loop = read_until(fd, PAYLOAD_LEN, after_read);
             syscall(
-                DataOp::TcpWrite {
-                    fd,
-                    data: payload,
-                },
+                DataOp::TcpWrite { fd, data: payload },
                 vec![use_write_fd(fd)],
                 Box::new(move |_| read_loop),
             )

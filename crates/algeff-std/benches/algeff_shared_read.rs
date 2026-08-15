@@ -219,7 +219,9 @@ fn bench_shared_read(c: &mut Criterion) {
         }
         b.iter(|| {
             let chain = shared_read_chain(file_path.clone());
-            let v = runtime.run_blocking(chain).expect("共享读链执行失败（测量中）");
+            let v = runtime
+                .run_blocking(chain)
+                .expect("共享读链执行失败（测量中）");
             assert_eq!(v, Value::U64(FILE_SIZE));
             criterion::black_box(v)
         });

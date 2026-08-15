@@ -189,7 +189,9 @@ fn bench_parallel_reads(c: &mut Criterion) {
         }
         b.iter(|| {
             let chain = fork_tree(&paths, 0, paths.len());
-            let v = runtime.run_blocking(chain).expect("fork 读链执行失败（测量中）");
+            let v = runtime
+                .run_blocking(chain)
+                .expect("fork 读链执行失败（测量中）");
             assert_eq!(v, Value::U64((FILE_COUNT * FILE_SIZE) as u64));
             criterion::black_box(v)
         });
