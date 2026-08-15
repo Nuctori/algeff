@@ -5,6 +5,7 @@
 > （注：任务单称 §19.5，实际 §19.5 为「关键风险与应对」，收敛定义在 §19.2 行 1175 —— 以实际位置为准）。
 > 前置文档：`spec/final-audit.md`（批 5 G4 放行终审，条件 C1–C5）、`spec/contract-final-audit.md`（批 4 预检）。
 > 审计基线：
+>
 > - worktree `.wt/a1` 分支 `s7/a1` @ `fac7b38` = **main @ `fac7b38`（零落后）**。批 6 基线 `c968ebd` 之后合入：
 >   A7 批 4 性能复测（`77a411b`/`88e70e0`）、A3 双序 commutation 测试（`4e2dc9e`，G4 条件-2）、
 >   A2 批 5 Fork 缺陷修复（`38bca67`：fd 区间预分割 / 顺序路径 merge / `Send` 超 trait）、D19 补录（`fac7b38`）。
@@ -66,7 +67,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 | **C1（偏差-1）** D13「完成后合并回父」 | 保持开放 | 并行路径：`resource.rs::merge`（:268，RFC-A3-2 语义：原 fd 直接插入 + consumed/owned_consumed 并集 + `next_fd=max` 归一化，doc 注明「偏差-1 落地」）接入 `runtime.rs::run_fork_parallel`（完成两子分支后 `reg.merge(l_reg); reg.merge(r_reg);`，undo 按 left→right append 保持 LIFO）；测试：`interpreter.rs::fork_parallel_true_path`（子句柄原 fd 并入父、父 next_fd=max 不冲突）、`fork_parallel_undo_merge`（recover 先 right 后 left，与顺序路径观察序一致）、`resource.rs::merge_preserves_fd_identity`、`merge_unions_consumed`、`merge_advances_next_fd`。**A2 批 5 复核（`38bca67`）**：① F1 修复——并行两分支同源自父 `next_fd` 克隆分配会撞 fd，spawn 前右分支按高位区间（`N + k·2^48`）**预分割 fd 区间**，两分支分配不相交、merge 不丢句柄（新增测试 `fork_parallel_both_branches_allocate_fds_disjoint`：并行双分支各自分配 fd 不相交）；② F2 修复——顺序路径（冲突 Fork）完成后同样 merge 回父，分支 fd 与线性标记不泄漏（新增测试 `fork_conflict_merge_keeps_linear_marks`：冲突型 Fork 后父级同资源 Write 被 A4 拒绝、`fork_sequential_both_branches_allocate_fds_disjoint`：顺序路径两分支 fd 不冲突） | ✅ **核销（A2 批 5 复核后）**（代码级 + 新增 3 测试） |
 | **C2（偏差-2）** Replace 调 `reg.clear()` | 保持开放 | `runtime.rs` Replace 分支：`undo.recover().await; reg.clear();`（先 recover 清撤销栈、再释放 handles/线性标记，next_fd 保留 D1 单调）；测试：`interpreter.rs::replace_clears_registry`（句柄清空 + 线性复位可重写 + fd 单调不复用）、`e2e.rs::e2e_file_write_read_undo`（Replace 清空 registry 句柄后仍可重新 Open/Seek/Read）；集成修复 `2f612f9` 使 `replay_property.rs` 排除 Replace、e2e 对齐 D10 清空语义 | ✅ **核销**（代码级，A2 批 4） |
 | **C3（契约补录）** D15 + ResourceArbiter 入表 | 部分核销 | `contracts.md` §3 决策表已含 **D15**（undo 闭包捕获边界，`d356368`）、**D16**（ResourceArbiter，`d356368` + 措辞修正「接入待 C4 裁决」`6cb3de9`）、**D17**（Fork 并行路径）、**D18**（闭包 +Send，`ed84a3c`）、**D19**（`SyscallExecutor: Send` 超 trait + `Runtime::new(Box<dyn SyscallExecutor + Send>)`，`fac7b38` 补录）；代码侧 `executor.rs` D15 注释（:7/:216）、`resource.rs:385 ResourceArbiter`、`runtime.rs` SharedExecutor/`run_fork_parallel`、`action.rs:41-44` 四闭包 `+ Send`、`syscall.rs:27` trait 声明 / `runtime.rs::new` 签名均已落地 | ✅ **核销**（文档级） |
-| **C4（观察项）** `op_mutex_lock` 阻塞 `lock_owned` vs try_lock | 新增观察 | `executor.rs::op_mutex_lock`（:855）仍 `m.lock_owned().await`（阻塞），未接 arbiter `try_claim`/try_lock；arbiter 本身已作为独立原语闭环（§1 A7）。D16 决策表明示「接入待 C4 裁决」 | ⚠️ **保持观察项**（裁决建议见 §4 残余-1） |
+| **C4（观察项）** `op_mutex_lock` 阻塞 `lock_owned` vs try_lock | 新增观察 → **已核销** | `executor.rs::op_mutex_lock` 已接入 arbiter（A5 批 7 254eaf3）：`try_claim` + 8×1ms 有限重试 + WouldBlock 快速失败；死锁可达窗口消除；D16 已更新为「已接入」（D-030） | ✅ **核销**（A5 批 7） |
 | **C5（基线核销）** 以 main 为基复核 | 部分核销 | 批 6：worktree `s6/a1` @ `c968ebd` = **main @ `c968ebd`，零落后**；批 5 时落后的 4 commits（Runtime 批3、Verification 批4）已全部合入。批 7 复核：worktree `s7/a1` @ `fac7b38` = **main @ `fac7b38`，零落后** | ✅ **核销**（流程级） |
 
 ### 3.2 D1–D19 与代码逐项终审（批 5 final-audit §2 结论 + 批 6/批 7 复核）
