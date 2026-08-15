@@ -154,3 +154,6 @@ Init/Next 与不变式检查（不动 `Spec` 本身）。活性 `Progress` 一�
 `ResourceArbiter` 互斥集合，断言任意时刻至多一个持有者、`tokio::join!` 全完成（无死锁 /
 无丢失唤醒）；`parallel_runs_isolated_state` / `replay_under_concurrency` 补充模型未建模的
 维度——D13 隔离-合并模式下并发任务的 registry 状态独立（fd 分配序列一致）与解释器可重放性。
+执行级可重放性最终属性见 `crates/algeff-core/tests/replay_property.rs`（A6 批 5）：随机蓝图×interpret 的
+执行-撤销-重放属性测试——确定性重放、A6 撤销往返（recover 后重放轨迹一致）与 A4 线性守恒（recover
+恢复「状态」而非「线性标记」），与本节调度器模型的「无环等待」不变式互补。
