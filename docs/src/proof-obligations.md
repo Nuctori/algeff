@@ -32,23 +32,23 @@ pdr.md §四 公理 A1–A7 与 §六 命题 P1–P5 的每一条形式化声明
 
 | 义务 | 形式化陈述 | 数学论证位置 | 测试证据（文件:测试） | 对抗 E2E 补充 | 审计结论 |
 | --- | --- | --- | --- | --- | --- |
-| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity | 轮 R1 | 待 R1 |
-| A2 单位元 | 1;a = a;1 = a | spec/proofs.md | execution_axioms.rs:exec_A2_identity | 轮 R1 | 待 R1 |
-| A3 交换律 | Δ(a)∩Δ(b)=∅ ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs:fork_commutation_disjoint | 轮 R1 | 待 R1 |
-| A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence | 轮 R1 | 待 R1 |
-| A5 分支隔离 | 左 Write 不影响右 Read | spec/proofs.md | concurrency_stress.rs:fork_same_fd_write | 轮 R1 | 待 R1 |
-| A6 撤销双态 | w;w̄=1 | spec/proofs.md | execution_axioms.rs:exec_A6_undo_roundtrip | 轮 R1 | 待 R1 |
-| A7 无死锁 | 无循环等待链 | spec/proofs.md + tla/ | arbiter.rs:finite_retry_eventually_succeeds | 轮 R1 | 待 R1 |
+| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity + adversarial_r1.rs:conc_repeat_blueprint_100_rounds_deterministic（100 轮确定性=结合律的序列稳定维度） | 轮 R1 ✅ | ✅ 有效（R1：演绎链严格，执行级+对抗双证据） |
+| A2 单位元 | 1;a = a;1 = a | spec/proofs.md | execution_axioms.rs:exec_A2_identity | 轮 R1 ✅ | ✅ 有效（R1：Pure 前缀/后缀/双侧 op 序列一致） |
+| A3 交换律 | Δ(a)∩Δ(b)=∅ ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs:fork_commutation_disjoint + adversarial_r1.rs:conc_fork_parallel_two_files_both_handles_readable（并行双分支句柄活性） | 轮 R1 ✅ | ⚠️ 有缺口（R1：combine 对称性未入 A3 形式化陈述——已记录待 R2 修） |
+| A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence + adversarial_r1.rs:lin_fork_conflict_double_write_then_parent_blocked（冲突 Fork 后父级拦截）+ lin_stale_fd_write_after_replace_succeeds（Replace 后线性标记清空但句柄残留反例） | 轮 R1 ✅ | ⚠️ 部分（R1：线性标记维度闭环；句柄活性反例→RFC-05 登记） |
+| A5 分支隔离 | 左 Write 不影响右 Read | spec/proofs.md | concurrency_stress.rs:fork_same_fd_write（registry 副本隔离）；branch_isolation.rs（读隔离，A6 批8 补足中） | 轮 R1 | ⚠️ 部分（R1：证据-义务不匹配已识别，读隔离测试补足中） |
+| A6 撤销双态 | w;w̄=1 | spec/proofs.md | execution_axioms.rs:exec_A6_undo_roundtrip + adversarial_r1.rs:rev_undo_restores_file_cursor（游标维度新证据） | 轮 R1 ✅ | ⚠️ 部分（R1：内容+游标维度闭环；句柄活性维度有反例——Replace 后旧 fd 仍可写，RFC-05） |
+| A7 无死锁 | 无循环等待链 | spec/proofs.md + tla/ | arbiter.rs:finite_retry_eventually_succeeds + arbiter_mutex.rs（R-1 强制） | 轮 R1 | ⚠️ 部分→已收敛（R1：模型/原语/执行器三层已交付，运行时载体为「冲突→顺序+分支不相交+单执行器锁」——axioms.md M4 修正后分层如实） |
 
 ### 命题层（pdr.md §六）
 
 | 义务 | 陈述 | 证明位置 | 测试证据 | 审计结论 |
 | --- | --- | --- | --- | --- |
-| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 | 待 R1 |
-| P2 交换律 | 资源不相交 ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs | 待 R1 |
-| P3 分支写隔离 | Choose/Fork 写隔离 | spec/proofs.md | fork_same_fd_write | 待 R1 |
-| P4 撤销双态 | w;w̄ 状态恢复 | spec/proofs.md | exec_A6 + e2e undo | 待 R1 |
-| P5 无死锁 | 调度器无环 | spec/proofs.md + tla/scheduler.tla | arbiter + concurrent_arbiter_claims | 待 R1 |
+| P1 幺半群 | (Action,;,1) | spec/proofs.md | exec_A1 + exec_A2 | ✅ 有效（R1：演绎链严格，隐含前提由执行级测试补足） |
+| P2 交换律 | 资源不相交 ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs | ⚠️ 有缺口（R1：combine 对称性未入 A3 形式化陈述——义务链不一致；Δ 覆盖未声明；已记录待 R2 修） |
+| P3 分支写隔离 | Choose/Fork 写隔离 | spec/proofs.md | fork_same_fd_write + branch_isolation.rs（补足中） | ⚠️ 有缺口（R1：Choose 读隔离无测试 + make_mut 未实现——A6 批8 补测试，make_mut 推迟阶段 3 已记录） |
+| P4 撤销双态 | w;w̄ 状态恢复 | spec/proofs.md | exec_A6 + e2e undo + adversarial_r1.rs | ⚠️ 部分（R1：证明有效、Full 边界正确；句柄活性维度反例未闭环——RFC-05 登记） |
+| P5 无死锁 | 调度器无环 | spec/proofs.md + tla/scheduler.tla | arbiter + concurrent_arbiter_claims + arbiter_mutex.rs | ⚠️ 部分→已收敛（R1：模型论证有效；工程映射失真已修正——axioms.md M4 分层如实描述，不再声称运行时动态占坑） |
 
 ## 更新规则（源文件为准）
 
