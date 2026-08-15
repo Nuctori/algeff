@@ -14,7 +14,7 @@ Fork 并行化后完成复测）。对比列的实现与现状见 §4。
 ## 1. 基准清单与场景说明
 
 | bench | 场景 | 输入规模 | 被测路径 | 中位时间（2026-08-15 基线） |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `echo` | 本地 TCP echo（127.0.0.1:0） | 100 连接 × 每连接 1000 次 1KB 往返 | `TcpListener` accept + `TcpStream` write_all/read_exact（tokio 网络栈 + loopback） | 6.3986 s / iter |
 | `parallel_reads` | 并行读 10 个不同文件（零冲突） | 10 × 1MB 文件，`tokio::join!` 10 路并发 | `tokio::fs::read` × 10（文件系统读路径，无锁） | 4.5676 ms |
 | `shared_read` | 8 任务并发读同一 8MB 文件（只读共享） | 8 任务 × 各 1MB 区间，`spawn_blocking` + 位置读 | `Arc<std::fs::File>` + `read_at`/`seek_read`（零锁、无偏移竞争） | 2.2445 ms |
@@ -28,7 +28,7 @@ Fork 并行化后完成复测）。对比列的实现与现状见 §4。
 - **parallel_reads**：10 个不同文件 → `tokio::join!` 并发读，读取路径无共享状态
   （对应 pdr.md §16「Algeff 静态路径 ~100%（零锁）」的对照）。
 - **shared_read**：`tokio::fs::File` 无位置读原语，故用跨平台基元 `Arc<std::fs::File>`
-  + 按偏移位置读（unix `read_at` / windows `seek_read`），在 `spawn_blocking` 中执行，
+  - 按偏移位置读（unix `read_at` / windows `seek_read`），在 `spawn_blocking` 中执行，
   零锁、零偏移竞争（对应「读-读可并行」场景）。
 - **append**：10 个任务各自以 append 模式打开同一文件并追加，顺序无关，单次写由内核
   保证原子（对应「并行追加同一文件（顺序无关）」场景）。
@@ -40,7 +40,7 @@ Fork 并行化后完成复测）。对比列的实现与现状见 §4。
 ## 2. 与 pdr.md §16 性能预期表的对应关系
 
 | pdr.md §16 场景 | 原生 tokio（100%） | 本目录基准 | Algeff 静态路径预期 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 网络 Echo（无共享资源） | 100% | `echo` | ~103% |
 | 并行读取 10 个不同文件 | 100% | `parallel_reads` | ~100%（零锁） |
 | 并行追加同一文件（顺序无关） | 100% | `append` | ~100% |
@@ -110,8 +110,11 @@ can_parallel=true）。批 4 实测 571%（vs 批 3 D14 顺序 308%，**回归**
 顺序无关的并行追加：A3 冲突矩阵 `Append∥Append` 默认串行（契约 D6），Algeff 臂走
 D6 默认串行路径（`Open{append} → Write → Close` × 10 任务顺序展开，CTO 批准）。
 批 4 复测 24.3%（批 3 为 29.4%，无回归）——小负载下串行追加显著快于原生 10 路
-并行追加（tokio::spawn + 同步开销主导）。opt-in 并行
 （`can_parallel_with append_order_insensitive`）留待后续基准驱动。
+
+> **R6 复测（2026-08-16）**：append 39.1%（2.3618 ms）——af27ce9（R1 写可见性修复，D-039
+> 「Write 返回 ⇔ OS 落盘」契约）后 Algeff 每写无条件 flush 的诚实成本；24.3%（1.4814 ms）为
+> 修复前旧数。详见 `perf/baseline-r6-2026-08-16.txt`。
 
 ### 4.5 接入注意事项
 

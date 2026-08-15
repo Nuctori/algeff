@@ -299,13 +299,15 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 - **shared_read 570.9%**：同 fd 游标读共用 `files[fd]` 文件互斥锁与游标（`op_read` 按序推进），
   即使锁边界收窄也不并行，需位置读原语（执行器层，A5 域待办）；实测 8.58ms 反超 D14 顺序基线
   （6.41ms）——D17 并行对同 fd 游标读是纯损失（诚实数据，不修饰）。
-- **append 24.3%**：走 D6 默认串行路径（顺序 Open{append}+Write+Close）；小负载下串行追加
-  （1.48ms）显著快于原生 10 路并行追加（6.09ms）。原生臂含每任务 flush()，Algeff 臂不 flush
-  （小量不对称，如实记录）。opt-in 并行留待后续基准驱动。
+- **append 39.1%（R6 复测）**：走 D6 默认串行路径（顺序 Open{append}+Write+Close）；小负载下
+  串行追加（2.36ms，R6 实测）快于原生 10 路并行追加（6.04ms）。**注意**：基线 24.3%/1.48ms 是
+  af27ce9（R1 写可见性修复，D-039「Write 返回 ⇔ OS 落盘」契约）**之前**的历史值——修复后 Algeff
+  每写无条件 flush，对比% 39.1% 是诚实现值（归因 af27ce9 正确性契约成本，非性能回归；R6 复测
+  数据见 `perf/baseline-r6-2026-08-16.txt`）。原生臂含每任务 flush()，Algeff 臂同样 flush（对称）。
 - **pdr §16 预期**：并行读目标 ~100%（对照列），未达成的原因全部指向 R-6 锁串行化与游标共享，
   属**已知工程局限**（pdr.md §17「动态资源仲裁的锁竞争」），非语义正确性缺口。
 
-→ 详见 `perf/baseline-2026-08-15.txt`（完整数据 + 命令清单 + 已知限制）、`crates/algeff-std/benches/README.md`
+→ 详见 `perf/baseline-2026-08-15.txt`（原始基线 + 命令清单 + 已知限制）、`perf/baseline-r6-2026-08-16.txt`（R6 复测：echo/append）、`crates/algeff-std/benches/README.md`
 
 ## 10 结论与后续工作
 

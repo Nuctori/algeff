@@ -12,9 +12,9 @@
   2. 对抗 E2E：164 个（R1-R5=122、R6=42；旧口径 120/125/157/162 均不得出现）
   3. RFC-10 状态：已修复
   4. RFC-11 状态：已修复（深度守卫阈值 96）
-  4. CI 三平台：ubuntu / windows / macos
-  5. 性能数字：103.1 / 366.2 / 570.9 / 24.3
-  6. 深度守卫：阈值 96 / 错误码 105 / 左结合 ≥97 步
+  5. CI 三平台：ubuntu / windows / macos
+  6. 性能数字：103.1 / 366.2 / 570.9 / 39.1（24.3 仅允许以「修复前旧数」语境出现）
+  7. 深度守卫：阈值 96 / 错误码 105 / 左结合 ≥97 步
 
 原则：某文件提及某事实时不得与 canonical 冲突（缺失 ≠ 冲突）；旧口径残留一律报。
 
@@ -72,6 +72,11 @@ def main():
             if "352 个测试函数" not in t and "352 测试全绿" not in t:
                 issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「352」")
 
+        # E2E 正向门禁：提及 E2E 计数即须含 canonical 164
+        if any(s in t for s in ("个 E2E", "E2E 测试", "对抗 E2E")):
+            if "164" not in t:
+                issues.append(f"[{p}] 提及对抗 E2E 但缺少 canonical 口径「164」")
+
     # ---- 2. RFC-10 状态：提及即须体现已修复 ----
     for p in FILES:
         t = texts[p]
@@ -105,11 +110,11 @@ def main():
                 if not ("ubuntu" in l and "windows" in l and "macos" in l):
                     issues.append(f"[{p}] CI 平台枚举不完整：{l.strip()[:60]}")
 
-    # ---- 5. 性能数字 ----
+    # ---- 5. 性能数字（canonical 含 R6 复测 39.1；24.3 仅历史语境）----
     for p in FILES:
         t = texts[p]
-        if any(x in t for x in ("103.1", "366.2", "570.9", "24.3")):
-            for num in ("103.1", "366.2", "570.9", "24.3"):
+        if any(x in t for x in ("103.1", "366.2", "570.9")):
+            for num in ("103.1", "366.2", "570.9", "39.1"):
                 if num not in t:
                     issues.append(f"[{p}] 提及性能数据但缺 canonical 数字「{num}」")
 
