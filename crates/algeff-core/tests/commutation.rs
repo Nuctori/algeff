@@ -19,11 +19,9 @@
 //!       `Fork{left: Pure(1), right: Pure(2)}` 交换序后 combine 结果一致，且
 //!       Pure 分支不触碰执行器（零 op）。
 //!
-//! A2 批 5 差异说明：A2 批 5（fd 区间分割修复）截至本批**未合并**（基线
-//! `a3b687b` = main，最新 A2 合入为批 4 Fork 并行化）。本测试全部使用
+//! A2 批 5 差异说明：A2 批 5（fd 区间分割修复）**已合并**（`38bca67`）。本测试全部使用
 //! `Fd(1)/Fd(2)` 静态声明的**纯资源隔离**场景，不依赖运行时 fd 分配区间语义
-//! （不新分配 fd、无子 registry 句柄并入父的区间交互），因此无论该修复是否
-//! 合入，本测试断言均不受影响。
+//! （不新分配 fd、无子 registry 句柄并入父的区间交互），因此修复前后断言均不受影响。
 //!
 //! 工程约束（同 execution_axioms.rs）：`interpret` 的 future 因冻结签名
 //! `&mut dyn SyscallExecutor`（trait 无 `Send` 超 trait）而**非 Send**，用普通
