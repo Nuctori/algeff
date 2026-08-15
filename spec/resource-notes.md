@@ -218,8 +218,7 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 **动态层（MutexLock 级，try_claim + 回滚 + 有限重试）**：
 `ResourceArbiter::try_claim(set)` 对 set 中每个资源原子占坑——先在副本上
 模拟全部占坑，全部可占才提交，任一失败**整体回滚**（自身状态完全不变，
-无部分占坑残留）。调用方在失败后执行已累积逆操作并**有限重试**（如指数退避
-
+无部分占坑残留）。调用方在失败后执行已累积逆操作并**有限重试**（如指数退避 + 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
 - 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
 `.lock().await` 不得在解释器任务内直接使用（会挂起等待，引入循环等待风险，
 见 §2）。
@@ -348,7 +347,7 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 不选择「放弃」：pdr.md §9.2 与命题 P3 明确将 make_mut 列为物理载体，阶段 3
 并行写需要它。不选择「立即实施」：冻结面内无测试暴露缺口，性价比不足。
 
-## 10. 审计已知缺陷登记（RFC-06 ~ RFC-09 / LOW）
+## 10. 审计已知缺陷登记（RFC-06 ~ RFC-11）
 
 > R2/R3c 对抗审计（`adversarial_r2.rs` / `adversarial_r3c.rs`）新确认的已知缺陷
 > （RFC-06/07/08/09，含 RFC-06 的 D1 边界影响小节与 R3c 风暴实测数据）。
@@ -433,4 +432,8 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 ### RFC-10：Windows 原生错误码未映射至 POSIX 语义（R4b 对抗发现）
 
-`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
+`create_new`（OpenFlags exclusive）撞已存在文件时，Windows 返回 `Other(80)` 而非 `AlreadyExists`（POSIX EEXIST=17）；UDP 端口占用同理返回 `Other(10048)`（WSAEADDRINUSE，**未测**——登记表引用的测试仅覆盖文件面，UDP 面待补断言）。根因：`SysError::from_errno` 只映射 POSIX errno（pdr.md §10.1 的 14 错误集），Windows 错误码（Win32/WSA 命名空间）未转换。影响：跨平台错误语义不一致——同一蓝图在 Windows 上返回 Other(n)，在 Unix 上返回具名变体（破坏 Catch 穷尽性匹配的跨平台可移植性）。修复方向（阶段 3+，error.rs 属冻结面需契约变更 D20 授权）：`From<io::Error>` 增加 Windows 错误码→POSIX errno 归一化映射（Win32 ERROR_FILE_EXISTS=80→EEXIST、WSAEADDRINUSE=10048→EADDRINUSE 等）；或执行器层归一化（executor.rs，A5 域）。测试：`adversarial_r4b.rs::open_exclusive_existing_fails_no_state_poison`（当前断言容忍 Other(80)，修复后应收紧为 AlreadyExists）。
+
+### RFC-11：解释器嵌套蓝图无递归深度上限 → 进程级栈溢出（R4c 对抗发现）
+
+`run_sub_impl`（runtime.rs:277）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下 **深度 ~110-120 即 STATUS_STACK_OVERFLOW 进程级 abort**（release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。修复方向（A2 批 7 实施中，runtime.rs 冻结面外）：解释器维护嵌套深度计数器，超阈值（如 128）返回可捕获错误（`SysError::Other` 或新变体）替代栈溢出；长期可堆上延续（explicit work stack）。测试：`adversarial_r4c.rs` 固定安全深度 64 回归（修复后应断言超深蓝图返回 Err 而非 abort）。
