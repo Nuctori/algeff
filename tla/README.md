@@ -145,3 +145,12 @@ Init/Next 与不变式检查（不动 `Spec` 本身）。活性 `Progress` 一�
 | `Claim` 顺序化（阶段 1，D14） | `exec_fork_conflict_static`：同资源 Write×Write → `can_parallel=false` → 顺序执行 + combine |
 | 撤销（recoverΓ） | `exec_A6_undo_roundtrip` / `exec_D10_replace_order`：LIFO 逆序 + 栈清空 |
 | 幺半群结构（P1） | `exec_A1_associativity` / `exec_A2_identity`：结合律与单位元的执行 trace 等价 |
+
+### 6.2 并发压力测试（Rust）与模型的关系
+
+`crates/algeff-core/tests/concurrency_stress.rs`（A6 批 4，pdr.md §19.4 loom 的
+替代策略——tokio 原生并发压力）以真实多线程调度佐证本模型：`concurrent_arbiter_claims`
+对应 `ExclusiveHold` / `Claim`（原子占坑 + 失败回滚 + 有限重试）——8 任务争用同一
+`ResourceArbiter` 互斥集合，断言任意时刻至多一个持有者、`tokio::join!` 全完成（无死锁 /
+无丢失唤醒）；`parallel_runs_isolated_state` / `replay_under_concurrency` 补充模型未建模的
+维度——D13 隔离-合并模式下并发任务的 registry 状态独立（fd 分配序列一致）与解释器可重放性。
