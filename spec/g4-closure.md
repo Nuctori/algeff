@@ -91,7 +91,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 
 | # | 残余项 | 现状 | 裁决建议 |
 | --- | --- | --- | --- |
-| **R-1（C4 延续）** | D16 arbiter ↔ `op_mutex_lock` 接入 | **已落地（A5 批 7 `254eaf3` + 批 8 `f897669`，D-034）**：`try_claim` + 8×1ms 有限重试 + WouldBlock；RAII claim guard（取消路径释放，批 8）；强制记录已入 resource-notes §2；语义变更（阻塞→快速失败）已入契约 D16 与决策链 | ✅ **核销**（D-034） |
+| **R-1（C4 延续）** | D16 arbiter ↔ `op_mutex_lock` 接入 | **已落地（A5 批 7 `254eaf3` + 批 8 `f897669`，D-034）**：`try_claim` + 8×1ms 有限重试 + WouldBlock；RAII claim guard（取消路径释放，批 8）；强制记录已入 resource-notes §2；语义变更（阻塞→快速失败）已入契约 D16 与决策链。**核销待审计 blocker-1 解除**（guard drop 的 blocking_lock panic 风险，A5 批 9 std Mutex 改造在飞——合并后复验翻绿） | ⚠️ **落地完成，核销待 blocker-1 解除**（D-034；A5 批 9 合并后复验） |
 | **R-2** | A3 执行级 left∥right 与 right∥left 双序 commutation 测试未单列 | 已补录：`tests/commutation.rs`（`4e2dc9e`，3 项）`fork_commutation_disjoint`（异资源双序 Fork 断言轨迹多集一致）+ `fork_commutation_same_value`（同值不同序 Pure，A1/A3 联合）；§1 A3 行残余标注已同步清除 | **已闭环**（G4 条件-2 交付） |
 | **R-3** | `Arc::make_mut` 物理 COW 未实现（A5/P3 物理层） | registry Clone 层隔离已闭环（consumed/owned_consumed 独立）；物理 Arc 共享句柄下子分支破坏性操作（Close）无拒绝路径测试 | **接受**（阶段 3 并行化载体，final-audit §6 判定维持；语义层闭环满足 G4 判据「公理被测试覆盖」的执行级） |
 | **R-4** | A7 批 4 性能复测数据未合并 | 已合入：`77a411b`/`88e70e0`，`perf/baseline-2026-08-15.txt` [5]–[8] 节刷新（echo 103.1% ✅ / parallel_reads 366.2% / shared_read 570.9% / append 24.3%，parallel_reads 双复跑 366.2%/383.6% 稳定） | **已交付**（G4 条件-1）；并行读偏离归因见 §4 残余-6（executor 锁串行化，接受，无需 CTO 新裁决） |
@@ -117,7 +117,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 4 复测，`
 | **条件-1** | ✅ **已交付**：A7 批 4 复测数据（并行 Fork 后）合入 `perf/`（`77a411b`）；echo 103.1% 达标；parallel_reads/shared_read 未回归 → 归因 executor 锁串行化（R-6，pdr §17 规范自认局限，接受，无需 CTO 新裁决） | A7 / CTO | 数据级 |
 | **条件-2** | ✅ **已交付**：A3 双序 commutation 等价测试补录（`4e2dc9e` `tests/commutation.rs`） | A6 | 测试级 |
 
-**观察项（不阻塞）**：R-1（arbiter–MutexLock 接入，接受 + 低优先待办）、R-3（make_mut 阶段 3）、R-6（executor 锁串行化，接受，阶段 3+ 工程缓解）；R-2/R-4 已交付、R-5 已修复（D19）。
+**观察项（不阻塞）**：R-3（make_mut 阶段 3）、R-6（executor 锁串行化，接受，阶段 3+ 工程缓解）；R-1 落地完成（核销待 blocker-1 解除）、R-2/R-4 已交付、R-5 已修复（D19）。
 
 **对冻结影响的总判定**：全部残余项均不构成冻结类型层面的阻塞（无签名破坏、无契约承诺被静默改写）；条件核销与观察项跟踪不影响 0.1.0 发布与 API 冻结面。
 
