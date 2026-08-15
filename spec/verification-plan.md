@@ -2,47 +2,47 @@
 
 > 拥有者：A1（Spec Guardian）。本文件是「开发 → 审计 → 验收 → 验证」闭环的跟踪载体：
 > 开发（A2–A7 交付）→ 审计（`spec/contracts-audit.md`）→ 验收（§1/§2 验证矩阵逐项判据）→ 验证（§3 G1–G4 门禁放行）。
-> 基准：`contracts.md`（D1–D14 决策表，含 `a16380f` 审计修正：D13 补录、DataOp 39→36、D5/D12 偏差记录；`f3494c0` 补录 D14）、
-> `spec/axioms.md`、`spec/proofs.md`、代码 `crates/`（main @ `121c806`；worktree `.wt/a1` = s3/a1 @ `926d423`，含 `91396c2`，落后 main 7 commits）。
+> 基准：`contracts.md`（D1–D18 决策表，含 `a16380f` 审计修正：D13 补录、DataOp 39→36、D5/D12 偏差记录；`f3494c0` 补录 D14；`d356368`/`6cb3de9`/`ed84a3c` 补录 D15–D18）、
+> `spec/axioms.md`、`spec/proofs.md`、代码 `crates/`（main @ `c968ebd`；worktree `.wt/a1` = s6/a1 @ `c968ebd`，与 main 零落后）。
 > 状态词：**已验证** = 测试/模型检测通过且有记录；**待合并** = 实现或测试已交付，但依赖 A2/A5 合并后才能运行；**未验证** = 无实现载体或测试未落地。
 > 修订流程：RFC → CTO 裁决（与 `spec/` 其余文件一致）。
 
-## 0. 基线事实（A1 复核，批 3 刷新：main @ 121c806 / worktree @ 926d423）
+## 0. 基线事实（A1 复核，批 6 刷新：main @ c968ebd / worktree @ c968ebd = s6/a1）
 
 | 载体 | 状态 |
 | --- | --- |
-| `runtime.rs::interpret`（Sequential/Pure/Fork/Choose/Scope/Replace/… 语义） | main 已合并（`003acd7`，15 节点 + 17 测试）；本 worktree 未含该 merge（落后 main 7 commits） |
-| `algeff-std` `TokioExecutor::execute`（Full 撤销策略物理实现） | `todo!()`，A5 **未合并** |
+| `runtime.rs::interpret`（Sequential/Pure/Fork/Choose/Scope/Replace/… 语义） | main 已合并（`003acd7` 解释器 + `430d64d`/`57b53d1` A2 批 4 Fork 并行化 + Replace clear）；本 worktree = main（`c968ebd`） |
+| `algeff-std` `TokioExecutor::execute`（Full 撤销策略物理实现） | A5 已合并（`0549bd5` + `ab662c7`/`f28236c` 批 4 错误路径修复）；全 DataOp 实现，0 处 `todo!()` |
 | `resource.rs`：冲突矩阵 / 线性检查 / `clear()` / 词法规范化（D12） | A3 已合并，13 个单测 |
 | `coeffects.rs`：Component 注册 + `sync` + `notify`（feature `coeffects`） | A3 已合并，5 个测试 |
-| `crates/algeff-core/tests/axioms.rs`（A6 属性测试） | A6 已合并，**22 项全绿**（批 2 issue-1 误报已更正，`91396c2` 修复，见 §5.1） |
+| `crates/algeff-core/tests/axioms.rs`（A6 属性测试） | A6 已合并，**22 项全绿**（批 2 issue-1 误报已更正，`91396c2` 修复，见 §5.1；批 6 复核 22/22，c968ebd） |
 | `tla/scheduler.tla` + `tla/README.md`（TLC 记录） | A6 已合并，模型检测**通过**（4 不变式 + 1 时序属性） |
 | `crates/algeff-macro` plan!/fork!/scope!/choose! | A4 已合并，8 个展开测试 |
-| `crates/algeff-std/benches/`（echo/parallel_reads/shared_read/append，criterion） | A7 已合并，**待实际运行** |
+| `crates/algeff-std/benches/`（echo/parallel_reads/shared_read/append，criterion） | A7 已合并；批 3 基线 `perf/baseline-2026-08-15.txt`（D14 顺序 Fork）；**批 4 复测（并行 Fork 后）进行中** |
 | `.github/workflows/ci.yml`、`docs/`、`scripts/` | A8/A7 已合并 |
-| `cargo clippy --workspace` | 0 error（core 1 warning：`reactor` never read，A2 合并后消除） |
+| `cargo clippy --workspace` | 0 error 0 warning（批 6 复核 c968ebd） |
 
 ## 1. 公理验证矩阵（A1–A7）
 
 | 公理 | 工程实现位置（文件 : 符号） | 验证手段 | 验收标准 | 责任人 | 当前状态 |
 | --- | --- | --- | --- | --- | --- |
-| **A1 结合律** | `runtime.rs::interpret`（Sequential 展开，A2）；`action.rs::Action::Sequential`（载体，已冻结） | 属性（proptest：trace/状态等价） | 对 proptest 生成的记录型 DataOp 序列，`(a;b);c` 与 `a;(b;c)` 在 trace executor 上产生相同操作序列与最终 Γ；CI 绿 | A2（解释语义）+ A6（属性测试） | **未验证**（唯一载体为 interpret，A2 未合并） |
-| **A2 单位元** | `action.rs::Action::Pure` / `unit()`（已冻结）；`runtime.rs::interpret` 的 Pure 分支（A2）；A6 静态部分已落地：`a2_empty_resource_set_parallel_always`、`a2_empty_set_is_parallel_identity`、`a2_empty_undo_stack_recover_noop` | 单元 + 属性（静态）；属性/集成（执行级） | 静态：空资源集 `can_parallel` 恒真、空 UndoStack `recover` 无副作用（**已满足**）；执行级：`run(Pure(());a)` 与 `run(a)` 值等价、`Pure` 不产生 UndoOp（待 A2） | A2 + A6 | **已验证**（静态层）；执行级**待合并** |
-| **A3 交换律** | `resource.rs::ResourceRegistry::can_parallel` / `can_parallel_with`（A3，已实现）；`runtime.rs::interpret` Fork 调度（A2）；`resource.rs::allocate`（D1 唯一句柄） | 单元（resource.rs 矩阵测试）+ 属性（axioms.rs `a3_can_parallel_symmetric`）+ 模型（TLA 间接覆盖静态层） | §9.1 矩阵穷举（同资源 4×4 × 异资源全组合）输出正确；Append∥Append 默认串行 + `can_parallel_with(...,true)` 才 opt-in 并行（D6）；执行级：不相交资源 Fork 并行结果与顺序执行一致（待 A2） | A3（矩阵）+ A2（Fork 调度）+ A6（属性测试） | **已验证**（矩阵/静态层）；动态调度**待合并** |
-| **A4 资源线性** | `resource.rs::ResourceRegistry::check_linear`（A3，已实现，consumed/owned_consumed 双集）；`runtime.rs::interpret` Syscall 节点接入 check_linear（A2）；`TypedResource<Owned>` 防降级 | 单元（resource.rs 5 项 linearity 测试）+ 属性（axioms.rs `a4_write_duplicate_rejected`/`a4_read_repeatable`/`a4_own_is_linear_too`/`a4_disjoint_writes_linear_sequence`/`a4_random_read_write_sequence`） | Write 重复 → `InvalidInput`；Own 后任何模式 → `InvalidInput`；Read/Append 可重复；**Write→Own 合法**（pdr §14 示例，`linearity_write_then_own_legal`）；执行级：解释器对每个 Syscall 调 check_linear（待 A2） | A3（registry）+ A2（接入）+ A6（属性测试） | **已验证**（registry 层，5 项单测 + 3 项属性）；执行级**待合并**；~~⚠️ A6 属性测试 1 项与冻结语义冲突（§5 issue-1）~~ → 已修复（`91396c2`，见 §5.1） |
-| **A5 分支隔离** | `action.rs::Action::Choose`（已冻结）；`resource.rs::ResourceRegistry: Clone`（D13，已实现）+ `ResourceHandle` 全 Arc（已实现）；`Arc::make_mut` 延迟复制（**未实现**，A2/A3）；`runtime.rs::interpret` Choose/Fork（A2） | 属性（`axiom_a5_choose_write_isolation` 等，未落地）+ 并发（loom，未交付） | Choose 左分支 Write 不影响右分支 Read；Fork 子任务 `make_mut` 写后兄弟分支数据不变；Own 独占转移（仅一个分支持有）；子任务 Close 共享句柄被拒绝 | A2（解释）+ A3（COW 载体）+ A6（测试） | **未验证**（make_mut 与 interpret 均未实现） |
-| **A6 撤销双态** | `syscall.rs::UndoOp` / `SyscallExecutor::execute -> Option<UndoOp>`（已冻结）；`runtime.rs::UndoStack::push/recover`、`Runtime::recover`（已实现）；A5 `TokioExecutor` Full 策略（**未合并**） | 单元/属性（axioms.rs `a6_undo_lifo_order`/`a6_undo_restores_observable_state`/`a6_undo_multiple_restores_full_state`）+ 集成（algeff-std 文件往返，待 A5） | UndoStack LIFO 逆序执行、recover 后栈清空、状态复原 w;w̄=1（**已满足**）；端到端：Write 文件 → recover → 内容还原、Open → recover → fd 关闭（Full 策略）；不可逆操作（UdpSendTo/Kill/SendSignal）返回 `None` 不压栈（待 A5/A2） | A2（trackΓ/recoverΓ 接入）+ A5（端到端）+ A6（属性测试） | **已验证**（UndoStack 层）；端到端**待合并** |
-| **A7 无死锁** | `tla/scheduler.tla`（A6，已交付，TLC 记录通过）；静态降级 `resource.rs::can_parallel_with`（A3，已实现）；动态原子占坑/回滚/有限重试 `runtime.rs::interpret`（A2，**未实现**）；`spec/resource-notes.md` §2（MutexLock try_lock 方案） | 模型（TLC/Apalache）+ 单元（静态矩阵，已覆盖）+ 压力（执行级，待 A2） | TLC 模型检测：NoCircularWait/ExactHold 等 4 不变式 + Progress 通过（**已满足**，tla/README §3）；执行级：N 任务争 M 资源（M<N）压力测试全部有限步完成或返回错误、重试次数 ≤ B、无永久挂起（待 A2） | A2（动态实现）+ A6（模型检测）+ A3（静态层） | **已验证**（模型层）；执行级**待合并** |
+| **A1 结合律** | `runtime.rs::interpret`（Sequential 展开，A2）；`action.rs::Action::Sequential`（载体，已冻结） | 属性（proptest：trace/状态等价） | 对 proptest 生成的记录型 DataOp 序列，`(a;b);c` 与 `a;(b;c)` 在 trace executor 上产生相同操作序列与最终 Γ；CI 绿 | A2（解释语义）+ A6（属性测试） | **已验证**（执行级：`execution_axioms.rs::exec_A1_associativity` + `replay_property.rs` 重放一致性，批 6 实跑） |
+| **A2 单位元** | `action.rs::Action::Pure` / `unit()`（已冻结）；`runtime.rs::interpret` 的 Pure 分支（A2）；A6 静态部分已落地：`a2_empty_resource_set_parallel_always`、`a2_empty_set_is_parallel_identity`、`a2_empty_undo_stack_recover_noop` | 单元 + 属性（静态）；属性/集成（执行级） | 静态：空资源集 `can_parallel` 恒真、空 UndoStack `recover` 无副作用（**已满足**）；执行级：`run(Pure(());a)` 与 `run(a)` 值等价、`Pure` 不产生 UndoOp（待 A2） | A2 + A6 | **已验证**（静态层 + 执行级：`exec_A2_identity` + `interpreter.rs::pure_unit`，批 6 实跑） |
+| **A3 交换律** | `resource.rs::ResourceRegistry::can_parallel` / `can_parallel_with`（A3，已实现）；`runtime.rs::interpret` Fork 调度（A2）；`resource.rs::allocate`（D1 唯一句柄） | 单元（resource.rs 矩阵测试）+ 属性（axioms.rs `a3_can_parallel_symmetric`）+ 模型（TLA 间接覆盖静态层） | §9.1 矩阵穷举（同资源 4×4 × 异资源全组合）输出正确；Append∥Append 默认串行 + `can_parallel_with(...,true)` 才 opt-in 并行（D6）；执行级：不相交资源 Fork 并行结果与顺序执行一致（待 A2） | A3（矩阵）+ A2（Fork 调度）+ A6（属性测试） | **已验证**（矩阵/静态层 + 执行级调度双路径：`fork_parallel_true_path` 并行、`fork_conflict_sequential_execution`/`exec_fork_conflict_static` 顺序降级，批 6 实跑）；双序 commutation 测试待补（批 6 g4-closure 残余-2，非阻塞） |
+| **A4 资源线性** | `resource.rs::ResourceRegistry::check_linear`（A3，已实现，consumed/owned_consumed 双集）；`runtime.rs::interpret` Syscall 节点接入 check_linear（A2）；`TypedResource<Owned>` 防降级 | 单元（resource.rs 5 项 linearity 测试）+ 属性（axioms.rs `a4_write_duplicate_rejected`/`a4_read_repeatable`/`a4_own_is_linear_too`/`a4_disjoint_writes_linear_sequence`/`a4_random_read_write_sequence`） | Write 重复 → `InvalidInput`；Own 后任何模式 → `InvalidInput`；Read/Append 可重复；**Write→Own 合法**（pdr §14 示例，`linearity_write_then_own_legal`）；执行级：解释器对每个 Syscall 调 check_linear（待 A2） | A3（registry）+ A2（接入）+ A6（属性测试） | **已验证**（registry 层 + 属性层 + 执行级 `exec_A4_linearity_runtime`，批 6 实跑）；issue-1 已修复（`91396c2`，见 §5.1） |
+| **A5 分支隔离** | `action.rs::Action::Choose`（已冻结）；`resource.rs::ResourceRegistry: Clone`（D13，已实现）+ `ResourceHandle` 全 Arc（已实现）；`Arc::make_mut` 延迟复制（**未实现**，A2/A3）；`runtime.rs::interpret` Choose/Fork（A2） | 属性（`axiom_a5_choose_write_isolation` 等，未落地）+ 并发（loom，未交付） | Choose 左分支 Write 不影响右分支 Read；Fork 子任务 `make_mut` 写后兄弟分支数据不变；Own 独占转移（仅一个分支持有）；子任务 Close 共享句柄被拒绝 | A2（解释）+ A3（COW 载体）+ A6（测试） | **已验证**（语义层：Choose 隔离 `choose_picks_then/else_branch` + Fork 状态隔离 `fork_same_fd_write`/`parallel_runs_isolated_state` + 并行路径隔离，批 6 实跑）；`make_mut` 物理 COW 归阶段 3（g4-closure 残余-3，不阻塞） |
+| **A6 撤销双态** | `syscall.rs::UndoOp` / `SyscallExecutor::execute -> Option<UndoOp>`（已冻结）；`runtime.rs::UndoStack::push/recover`、`Runtime::recover`（已实现）；A5 `TokioExecutor` Full 策略（**未合并**） | 单元/属性（axioms.rs `a6_undo_lifo_order`/`a6_undo_restores_observable_state`/`a6_undo_multiple_restores_full_state`）+ 集成（algeff-std 文件往返，待 A5） | UndoStack LIFO 逆序执行、recover 后栈清空、状态复原 w;w̄=1（**已满足**）；端到端：Write 文件 → recover → 内容还原、Open → recover → fd 关闭（Full 策略）；不可逆操作（UdpSendTo/Kill/SendSignal）返回 `None` 不压栈（待 A5/A2） | A2（trackΓ/recoverΓ 接入）+ A5（端到端）+ A6（属性测试） | **已验证**（UndoStack 层 + 执行级 `exec_A6_undo_roundtrip` + Full 策略端到端 `undo_restores_file_content`/`rename_undo`/`e2e_file_write_read_undo`，批 6 实跑） |
+| **A7 无死锁** | `tla/scheduler.tla`（A6，已交付，TLC 记录通过）；静态降级 `resource.rs::can_parallel_with`（A3，已实现）；动态原子占坑/回滚/有限重试 `ResourceArbiter`（D16，已实现）+ 并行 Fork 调度（A2 批 4，已实现）；`spec/resource-notes.md` §2（MutexLock try_lock 方案） | 模型（TLC/Apalache）+ 单元（静态矩阵，已覆盖）+ 压力（执行级，待 A2） | TLC 模型检测：NoCircularWait/ExactHold 等 4 不变式 + Progress 通过（**已满足**，tla/README §3）；执行级：N 任务争 M 资源（M<N）压力测试全部有限步完成或返回错误、重试次数 ≤ B、无永久挂起（待 A2） | A2（动态实现）+ A6（模型检测）+ A3（静态层） | **已验证**（模型层 TLC + 原语层 `tests/arbiter.rs` 8 项 + 并发层 `concurrent_arbiter_claims` + 并行 Fork 层 `fork_parallel_true_path`/`parallel_runs_isolated_state`，批 6 实跑）；C4 观察项：`op_mutex_lock` 阻塞 `lock_owned` 未接 arbiter（g4-closure 残余-1，非阻塞） |
 
 ## 2. 命题验证矩阵（P1–P5，同格式一行表）
 
 | 命题 | 工程实现位置（文件 : 符号） | 验证手段 | 验收标准 | 责任人 | 当前状态 |
 | --- | --- | --- | --- | --- | --- |
-| **P1 幺半群** | A1+A2 载体（interpret，A2）；宏 `plan!{a;b;c}` 展开（A4，已合并，`plan_three_elements_nested_sequential` 验 AST 形状） | 属性（结合律/单位元 trace 等价，待 A2）+ 单元（宏 AST 形状，已验） | `(a;b);c` ≡ `a;(b;c)`、`1;a`≡`a`≡`a;1` 执行 trace 相同（= A1/A2 执行级）；`plan!` 恒等变换（`Sequential(Pure,a)→a`）不改变语义 | A2 + A6（+A4 已交付） | **待合并**（宏 AST 形状**已验证**；执行级依赖 A2） |
-| **P2 并行交换律** | A3 载体：`can_parallel`（A3）+ Fork 调度（A2）；对称 combine 前提（`proofs.md` P2 记录） | 属性（静态对称性 `a3_can_parallel_symmetric`，已验）+ 属性（执行级 commutes，待 A2） | 不相交资源 `left∥right` 与 `right∥left` 结果值与最终状态一致（对称 combine）；非对称 combine 反例被记录 | A3 + A2 + A6 | **已验证**（静态对称性）；执行级**待合并** |
-| **P3 分支写隔离** | A5 载体：Choose 分支（interpret，A2）+ registry Clone（D13，已实现）+ `Arc::make_mut`（未实现） | 属性（未落地）+ 并发（loom，未交付） | = A5 三项验收标准（Choose 隔离 / Fork COW / Own 独占） | A2 + A3 + A6 | **未验证**（同 A5） |
-| **P4 撤销双态** | A6 载体：UndoStack（已实现）+ TokioExecutor Full 策略（A5，未合并）+ `Runtime::recover`（已实现） | 单元（UndoStack 级，已验）+ 集成（端到端，待 A5） | `w;w̄=1` 状态复原（UndoStack 级**已满足**）；Write 文件 → recover → 内容还原；recover 后 Context（cwd/env）复原 | A2 + A5 + A6 | **已验证**（UndoStack 层）；端到端**待合并** |
-| **P5 无死锁** | A7 载体：TLA 模型（A6，已交付）+ interpret 动态占坑/回滚/重试（A2，未实现）+ 静态串行降级（D6/§9.1，已实现） | 模型（TLC 已通过）+ 压力（执行级，待 A2）+ 单元（静态矩阵，已覆盖） | TLC 无「持有-等待」环（**已满足**）；占坑失败后 registry 无残留登记（回滚完整性）；静态冲突被顺序调度 | A2 + A6（+A3 静态） | **已验证**（模型层）；执行级**待合并** |
+| **P1 幺半群** | A1+A2 载体（interpret，A2）；宏 `plan!{a;b;c}` 展开（A4，已合并，`plan_three_elements_nested_sequential` 验 AST 形状） | 属性（结合律/单位元 trace 等价，待 A2）+ 单元（宏 AST 形状，已验） | `(a;b);c` ≡ `a;(b;c)`、`1;a`≡`a`≡`a;1` 执行 trace 相同（= A1/A2 执行级）；`plan!` 恒等变换（`Sequential(Pure,a)→a`）不改变语义 | A2 + A6（+A4 已交付） | **已验证**（宏 AST 形状 + 执行级：`exec_A1_associativity` + `exec_A2_identity`，批 6 实跑） |
+| **P2 并行交换律** | A3 载体：`can_parallel`（A3）+ Fork 调度（A2）；对称 combine 前提（`proofs.md` P2 记录） | 属性（静态对称性 `a3_can_parallel_symmetric`，已验）+ 属性（执行级 commutes，待 A2） | 不相交资源 `left∥right` 与 `right∥left` 结果值与最终状态一致（对称 combine）；非对称 combine 反例被记录 | A3 + A2 + A6 | **已验证**（静态对称性 + 执行级调度双路径，批 6 实跑）；双序 commutation 测试待补（g4-closure 残余-2，非阻塞） |
+| **P3 分支写隔离** | A5 载体：Choose 分支（interpret，A2）+ registry Clone（D13，已实现）+ `Arc::make_mut`（未实现） | 属性（未落地）+ 并发（loom，未交付） | = A5 三项验收标准（Choose 隔离 / Fork COW / Own 独占） | A2 + A3 + A6 | **已验证**（语义层：Choose 隔离 + Fork 状态隔离 + 并行路径隔离，批 6 实跑）；`make_mut` 物理 COW 归阶段 3（g4-closure 残余-3，非阻塞） |
+| **P4 撤销双态** | A6 载体：UndoStack（已实现）+ TokioExecutor Full 策略（A5，未合并）+ `Runtime::recover`（已实现） | 单元（UndoStack 级，已验）+ 集成（端到端，待 A5） | `w;w̄=1` 状态复原（UndoStack 级**已满足**）；Write 文件 → recover → 内容还原；recover 后 Context（cwd/env）复原 | A2 + A5 + A6 | **已验证**（UndoStack 层 + 执行级 + Full 策略端到端 `undo_restores_file_content`/`rename_undo`，批 6 实跑） |
+| **P5 无死锁** | A7 载体：TLA 模型（A6，已交付）+ `ResourceArbiter` 动态占坑/回滚/重试（D16，已实现）+ 静态串行降级（D6/§9.1，已实现） | 模型（TLC 已通过）+ 压力（执行级，待 A2）+ 单元（静态矩阵，已覆盖） | TLC 无「持有-等待」环（**已满足**）；占坑失败后 registry 无残留登记（回滚完整性）；静态冲突被顺序调度 | A2 + A6（+A3 静态） | **已验证**（模型层 + 原语层 `tests/arbiter.rs` + 并发层 `concurrent_arbiter_claims` + 并行 Fork 层，批 6 实跑） |
 
 依赖关系：P1←A1+A2；P2←A3；P3←A5；P4←A6；P5←A7+D6/§9.1（同 `proofs.md` 附图）。
 
@@ -53,7 +53,7 @@
 | **G1** 阶段 1 | 8 分支合并回 main + `cargo test --workspace` 绿 | 不依赖 interpret 的全部静态/registry 项：A3 矩阵层（单测+属性）、A4 registry 层、A6 UndoStack 层、A2 静态层（空集/空栈）、A7 静态层（矩阵）、A4 宏 AST 形状、错误映射/typestate/D1 单测 | ⚠️ ~~main 当前红：A6 `a4_random_read_write_sequence` 与冻结语义冲突（§5 issue-1）~~ → **已修复**：`91396c2` 对齐冻结语义后 main 22 测试全绿（§5.1）；G1 判据可满足 |
 | **G2** 阶段 2 | A1 审计报告闭环（contracts-audit.md）+ `cargo clippy --workspace` 无 error | G1 全部 + **执行级闭环**：A1 结合律、A2 执行级（Pure 跳过/单位元）、A3 动态调度（Fork 并行/串行降级）、A4 执行级（interpret 接入 check_linear）、A5（Choose 隔离 + Fork COW）、A6 端到端（algeff-std Full 策略往返）、A7 动态（占坑/回滚/重试压力测试）；P1–P5 对应执行级项；TLA 模型检测通过（已满足） | ~~**A2 interpret、A5 TokioExecutor 未合并——G2 硬前置**~~ → A2 interpret **已合并 main**（`003acd7`）；A5 TokioExecutor 仍未合并（剩余硬前置）；clippy 0 error 已满足（core 1 warning 随 A2 合并消除）；issue-1 已修复（`91396c2`，§5.1） |
 | **G3** 阶段 3 | bench 可运行 + CI yaml 通过校验 + 文档齐备 | G2 全部保持；criterion 4 项 bench（echo/parallel_reads/shared_read/append）实际运行成功且有基线记录（`scripts/perf.sh`）；ci.yml（ubuntu+windows）通过校验；mdBook `docs/` 构建成功 | bench 已交付（A7）但**未实际运行**；CI/docs 已交付待校验 |
-| **G4** 阶段 4 | 发布 0.1.0 + 契约冻结复审 | G3 全部保持；A1–A7、P1–P5 全项闭环（无「未验证/待合并」残留）；A1 复审 `spec/` 与 contracts.md 一致性并确认冻结 | 依赖 G2/G3 全部前置 |
+| **G4** 阶段 4 | 发布 0.1.0 + 契约冻结复审 | G3 全部保持；A1–A7、P1–P5 全项闭环（无「未验证/待合并」残留）；A1 复审 `spec/` 与 contracts.md 一致性并确认冻结 | C1/C2 已核销（A2 批 4：`merge` 接入 Fork 并行 + Replace `reg.clear()`）；D15–D18 已补录 contracts.md；worktree = main（`c968ebd`）→ C3/C5 核销；A7 批 4 性能复测进行中（条件-1）；A3 双序 commutation 测试待补（条件-2）；C4 观察项接受+待办（g4-closure §4，非阻塞） |
 
 ## 4. 风险标注：interpret 未合并前的验证空窗
 
@@ -82,22 +82,21 @@
 **main 22 测试全绿**（本 worktree 含 `91396c2`，`cargo test --workspace` 复核全绿）。
 本文件 §0/§1/§3/§4/附 中的 issue-1 记录已同步更正。
 
-### 5.2 状态标注（批 3）
+### 5.2 状态标注（批 6 刷新）
 
 | 项 | 状态 |
 | --- | --- |
 | A1 批 2（验证计划 G1–G4 门禁矩阵） | ✅ **已交付**（merge `926d423`，本文件） |
 | A4 批 2/3（宏编译测试 + README/发布准备） | ✅ **已完成**（`2129d4a` + `121c806`/`faebfd8`） |
 | A8 批 2（反馈循环 + CONTRIBUTING + getting-started） | ✅ **已完成**（`e11db29`/`ae93931`） |
-| main 基线测试 | ✅ **22 测试绿**（`91396c2` 修复后；本 worktree 复核 `cargo test --workspace` 全绿） |
-| A2 解释器（interpret，执行级载体） | ✅ main 已合并（`003acd7`，15 节点 + 17 测试）；本 worktree 未含该 merge |
-| A3 批 2（registry 生命周期集成预演） | ✅ main 已合并（`1031673`/`285085f`）；本 worktree 未含 |
-| D14（Fork 阶段 1 顺序执行） | ✅ contracts.md 已补录（`f3494c0`）；本 worktree 未含 |
-| A5 TokioExecutor（端到端载体） | ⏳ **未合并**（G2 剩余硬前置） |
+| main 基线测试 | ✅ **151 测试绿 / 24 二进制**（批 6 复核 `cargo test --workspace` 全绿，c968ebd；含 axioms 22 项） |
+| A2 解释器（interpret，执行级载体） | ✅ main 已合并（`003acd7` + 批 4 Fork 并行化 `430d64d`/`57b53d1`）；本 worktree = main |
+| A3 批 2（registry 生命周期集成预演） | ✅ main 已合并（`1031673`/`285085f`）；本 worktree = main |
+| D14（Fork 阶段 1 顺序执行） | ✅ contracts.md 已补录（`f3494c0`）；本 worktree = main |
+| A5 TokioExecutor（端到端载体） | ✅ **已合并**（`0549bd5` + 批 4 错误路径修复 `ab662c7`/`f28236c`）；G2 硬前置已解除 |
 
-> 说明：本 worktree（s3/a1 @ `926d423`）落后 main（@ `121c806`）7 commits，
-> 未含 A2/A3批2/D14/A4批3 的 merge；`cargo test --workspace` 在本 worktree 全绿
-> （含 axioms 22 项），与 main 的 22 测试绿一致（axioms.rs 两处同一版本）。
+> 说明：本 worktree（s6/a1 @ `c968ebd`）= main（@ `c968ebd`），零落后；
+> `cargo test --workspace` 全绿（151 fn / 24 二进制，含 axioms 22 项）。
 
 ### 5.3 G2 审计门禁最终检查项清单
 
