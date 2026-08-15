@@ -110,6 +110,13 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   `crates/algeff-std/tests/executor.rs` 新增 `mutex_lock_arbiter_contention` /
   `mutex_unlock_releases_arbiter`，`mutex_lock_exclusion` 断言同步更新为
   WouldBlock 快速失败；新增 §9「make_mut 物理 COW 评估」（R-3 预研，裁决：推迟）。
+- s10/a5：R3c 对抗发现修复（MEDIUM-1）——`op_send_file` 文件输出路径补
+  `flush().await`（与 op_write 的 D-039 对齐；管道/TCP 输出无需，异步投递
+  语义无落盘面）；`adversarial_r3c.rs::r2_sendfile_file_target_visibility`
+  升级为严格回归（64 轮 SendFile 后立即同步读必须可见新内容，fail-fast）；
+  §10 登记 RFC-09（Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover，可恢复；
+  R3c 风暴实测 240/240 轮超时、undo_len=1，修复方向=取消传播协议，阶段 3+）
+  与 LOW（arbiter 重试退避在 executor 锁内 → 争用风暴下全分支串行化放大）。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -340,10 +347,10 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 不选择「放弃」：pdr.md §9.2 与命题 P3 明确将 make_mut 列为物理载体，阶段 3
 并行写需要它。不选择「立即实施」：冻结面内无测试暴露缺口，性价比不足。
 
-## 10. R2 审计已知缺陷登记（RFC-06 / RFC-07 / RFC-08）
+## 10. 审计已知缺陷登记（RFC-06 ~ RFC-09 / LOW）
 
-> R2 对抗审计（`crates/algeff-std/tests/adversarial_r2.rs`）新确认的已知缺陷（RFC-06/07/08，
-> 含 RFC-06 的 D1 边界影响小节）。
+> R2/R3c 对抗审计（`adversarial_r2.rs` / `adversarial_r3c.rs`）新确认的已知缺陷
+> （RFC-06/07/08/09，含 RFC-06 的 D1 边界影响小节与 R3c 风暴实测数据）。
 > 均不在冻结面（runtime.rs / executor.rs / resource.rs）允许的最小修复范围内，
 > 以「断言偏差可复现」测试记录，阶段 3+ 修复。
 
@@ -396,3 +403,30 @@ panic）。数学核验：Σ_{k=1..n} k·2^48 ≥ 2^64 ⟺ n≈362 轮。模型�
 建议 D1 契约行加边界注（承诺范围为不溢出前缀）或提升修复优先级（阶段 3+ 中
 优先）。对 P2/P3 语义本体无直接证伪（交换律/隔离是 trace 语义命题，与 fd 值域
 无关）。
+
+### RFC-09：Timeout 取消持锁分支 → 锁 id 全局饥饿至 recover（可恢复，非永久毒化）
+
+`Action::Timeout` 包裹的 `MutexLock` 在**已获取锁之后**被取消（持锁分支：
+`Timeout{ MutexLock → Sleep → MutexUnlock }` 中 Sleep 阶段超时）：inner future
+被 `tokio::time::timeout` 丢弃，`MutexUnlock` 永不执行 → 锁 id 保持占用，
+**全局饥饿**（同一 id 的后续 Lock 全部 WouldBlock）直到 `Replace`/`recover`
+释放（undo 已入分支栈，recover 路径可释放）。与 RFC-08（Timeout 孤儿分支
+副作用不可撤销）同类——「Timeout 取消 ⇒ 孤儿副作用」；区别：本项**可恢复**
+（非永久毒化，recover 后同 id 可重入），RFC-08 的孤儿 Open 物理副作用不可
+撤销。
+
+R3c 风暴实测：`adversarial_r3c.rs::r2_arbiter_8x30_mixed_timeout_storm_no_poison`
+（8 分支 × 30 轮 = 240 轮随机 Timeout 争用风暴）最坏 240/240 轮全部超时、
+undo_len=1——单次取消持锁分支即令 id=42 饥饿至 recover；回归断言 = 风暴后
+recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取消传播协议
+（Timeout 取消前先执行已入栈 undo，或分支完成时合并 undo 与锁状态），阶段
+3+。
+
+### LOW：arbiter 重试退避发生在 executor 锁内 → 争用风暴下全分支串行化放大
+
+`ResourceArbiter` 有限重试（1ms × 8 次退避）在 executor 的仲裁锁
+（`self.arbiter.lock()`）持锁期间执行：争用风暴下所有分支的仲裁被串行化
+——一个分支退避 sleep 阻塞后续分支进入仲裁，整体吞吐被退避总和放大（R3c
+风暴 8 分支 × 30 轮下可观察）。记录（阶段 3+ 优化）：退避移出锁内（先释放
+仲裁锁再 sleep，或仲裁器内部异步退避队列）。对正确性无影响（退避有界、无
+死锁，A7 成立），纯性能放大。

@@ -1070,7 +1070,19 @@ impl TokioExecutor {
         // 输出侧：文件 / TCP 流 / 管道写端。
         let written = if let Some(m) = self.files.get(&out) {
             let mut g = m.lock().await;
-            g.write(&buf).await?
+            let n = g.write(&buf).await?;
+            // 写后必须 flush（D-039 对齐；R3c MEDIUM-1）：op_send_file 输出到
+            // 文件与 op_write 同属**异步落盘**面——tokio::fs::File 的 write
+            // 返回时 OS 写可能仍在飞（blocking 池后台完成），op 返回后立即
+            // 同步读会观察到旧内容（adversarial_r3c.rs
+            // r2_sendfile_file_target_visibility 修复前 64 轮实测
+            // stale_immediate>0，与 R1 flaky 同根因）。flush 使 SendFile
+            // 完成 ⇔ OS 已落盘（A4/A6 可观察性契约，同 D-039）。
+            // 管道/TCP 输出无需 flush：其 write 是对端缓冲/socket 缓冲的
+            // 投递语义，无“落盘”可观察面（同 op_write 管道路径不 flush
+            // 的约定）。
+            g.flush().await?;
+            n
         } else if self.stream_fds.contains_key(&out) {
             let mut arc = self.take_tcp_stream(out, reg)?;
             let n = {
