@@ -1,6 +1,7 @@
-//! RFC-10 回归：Windows 原生错误码（Win32/WSA）在 A5 执行器层归一化为 POSIX
-//! 语义，保证跨平台错误语义一致（修复：`executor.rs` 的 `to_sys_err` /
-//! `normalize_windows_errno`，冻结面 error.rs 未动）。
+//! RFC-10 回归：错误码在 A5 执行器层归一化为 POSIX 语义，保证跨平台错误语义
+//! 一致（修复：`executor.rs` 的 `to_sys_err` 统一 kind-first——std 在各平台用
+//! 平台自身 errno 常量解码 `ErrorKind` 后映射 POSIX errno；Windows 的 Win32/WSA
+//! 码与 macOS/BSD 的 Darwin 码均经此语义归一，冻结面 error.rs 未动）。
 //!
 //! 三个场景均为**跨平台**断言（Linux 上本就返回对应 POSIX errno，Windows
 //! 修复前分别退化为 Other(80)/Other(10048)/Other(10061)）：
