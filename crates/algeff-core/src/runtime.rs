@@ -483,7 +483,7 @@ fn run_virtual_timeout<'a>(
                         reg,
                         access.reborrow(),
                         depth,
-                        cancel.as_deref_mut(),
+                        cancel,
                     )
                     .await
                 } else {
@@ -525,6 +525,7 @@ fn run_sub_impl<'a>(
 /// 的轮询栈帧，压缩 RFC-11 深度守卫（阈值 64，Windows 2MB 栈）的余量
 /// （实测边界从 ~104 降至 ~92 的回归）。独立函数把 select! 轮询栈隔离到
 /// 自身 coroutine，解释器轮询帧保持精简。
+#[cfg(not(feature = "virtual-clock"))]
 async fn cancellable_sleep(duration: Duration, token: &mut CancelToken) {
     if token.is_cancelled() {
         return;
@@ -557,19 +558,17 @@ async fn wait_timeout<'a>(
 ) -> (bool, Result<Value, SysError>) {
     let sleep = tokio::time::sleep(duration);
     tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            r = &mut inner => return (false, r),
-            _ = &mut sleep => {
-                // 广播取消：并行 Fork 分支检查后快速返回（join 见下）。
-                let _ = cancel_tx.send(true);
-                // 有界宽限：等待并行分支把部分状态/undo 合并回父。
-                let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
-                tokio::pin!(grace);
-                tokio::select! {
-                    r = &mut inner => return (true, r),
-                    _ = &mut grace => return (true, Err(CANCELLED_ERR)),
-                }
+    tokio::select! {
+        r = &mut inner => return (false, r),
+        _ = &mut sleep => {
+            // 广播取消：并行 Fork 分支检查后快速返回（join 见下）。
+            let _ = cancel_tx.send(true);
+            // 有界宽限：等待并行分支把部分状态/undo 合并回父。
+            let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
+            tokio::pin!(grace);
+            tokio::select! {
+                r = &mut inner => return (true, r),
+                _ = &mut grace => return (true, Err(CANCELLED_ERR)),
             }
         }
     }
@@ -1274,6 +1273,9 @@ async fn interpret_impl(
                 // 墙钟 Timeout：取消传播协议在独立 async fn
                 // （`run_wall_timeout`）内实现——局部状态不撑大解释器状态机帧
                 // （RFC-11 守卫栈预算，见该函数注释）。
+                // VC 构建下上方恒 return（`#[allow]`：cfg 剥离后不可达性编译器
+                // 无法跨 feature 感知）。
+                #[allow(unreachable_code)]
                 return run_wall_timeout(
                     *inner,
                     *on_timeout,
