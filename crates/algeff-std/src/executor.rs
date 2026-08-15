@@ -49,6 +49,58 @@ const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 /// 持锁 guard 的停车位：undo（recover 路径）与显式 `MutexUnlock` 均可取走释放，幂等。
 type HeldLockSlot = Arc<tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
 
+/// MutexLock 仲裁占坑的 RAII 守卫（R-1 MEDIUM 批 8：claim 取消泄漏修复）。
+///
+/// 泄漏窗口：`try_claim` 成功（占坑已落入仲裁表）后、undo 建立前存在 await 点
+/// （`lock_owned`、slot 停车位锁）。若 future 在这些 await 点被丢弃（如
+/// `Action::Timeout` Elapsed 时 runtime.rs 经 `tokio::time::timeout` 直接丢弃
+/// 内层 future、不做任何清理），占坑会随 future 的局部状态一并消失但**不**
+/// release —— 该 MutexLock id 在本执行器内永久 WouldBlock（状态毒化，非死锁）。
+///
+/// 守卫在 `drop` 时自动 release 占坑（`release` 幂等：对未占坑资源是 no-op，
+/// 双保险安全）；undo/锁持有成功建立后由 `disarm()` 停用，释放职责移交 undo
+/// 路径（防双释放）。持有型守卫（clone Arc，非借用）：可跨 await 存活，且与
+/// undo 闭包（`'static` + Send，捕获同型 Arc 与 claim_set）并存。
+struct ArbiterClaimGuard {
+    arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
+    claim_set: Vec<ResourceUsage>,
+    armed: bool,
+}
+
+impl ArbiterClaimGuard {
+    fn new(
+        arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
+        claim_set: Vec<ResourceUsage>,
+    ) -> Self {
+        Self {
+            arbiter,
+            claim_set,
+            armed: true,
+        }
+    }
+
+    /// 释放职责移交给 undo 路径：此后 drop 不再 release（防双释放）。
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ArbiterClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop 内不可 await：先 `try_lock`；失败仅当另一任务正持有仲裁锁执行
+        // 同步短临界区（`try_claim`/`release` 无 await、微秒级），`blocking_lock`
+        // 兜底 —— 持锁者无需调度即可完成临界区，无死锁可达性。
+        let mut arb = match self.arbiter.try_lock() {
+            Ok(g) => g,
+            Err(_) => self.arbiter.blocking_lock(),
+        };
+        arb.release(&self.claim_set);
+    }
+}
+
 /// 默认物理执行器（pdr.md §12.2）。
 #[derive(Debug)]
 pub struct TokioExecutor {
@@ -911,9 +963,14 @@ impl TokioExecutor {
         if !claimed {
             return Err(SysError::WouldBlock);
         }
-        // 占坑成功 → 本仲裁域内无竞争者持有物理锁（不变量：占坑 ⟺ 持锁，见
-        // resource-notes §2），lock_owned 几乎立即获得；仍保留物理锁保证
-        // 跨仲裁域（如独立执行器实例）互斥。
+        // 占坑成功 → RAII 守卫接管释放职责（R-1 MEDIUM 批 8）：undo 建立前
+        // （`lock_owned`、slot 停车位锁两个 await 点）若 future 被丢弃
+        // （Timeout Elapsed 取消路径），守卫 drop 自动 release 占坑，杜绝
+        // 「claim 取消泄漏 → 永久 WouldBlock」状态毒化。
+        let mut claim_guard = ArbiterClaimGuard::new(arbiter.clone(), claim_set.clone());
+        // 本仲裁域内无竞争者持有物理锁（不变量：占坑 ⟺ 持锁，见 resource-notes
+        // §2），lock_owned 几乎立即获得；仍保留物理锁保证跨仲裁域（如独立
+        // 执行器实例）互斥。
         let guard = m.lock_owned().await;
         // 停车位：undo（recover 路径）与显式 MutexUnlock 均可取走释放（幂等）。
         let slot = self
@@ -922,6 +979,9 @@ impl TokioExecutor {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
             .clone();
         *slot.lock().await = Some(guard);
+        // 锁持有已落位（停车位，park 为最后一个 await 点）→ 释放职责移交 undo
+        // 路径（undo/显式 MutexUnlock 经 slot 取走释放）；disarm 防双释放。
+        claim_guard.disarm();
         let undo_slot = slot.clone();
         let undo: UndoOp = Box::pin(async move {
             // undo 顺序：先释放物理锁、再释放 arbiter 占坑。释放窗口内占坑仍持有，
@@ -1155,5 +1215,81 @@ impl SyscallExecutor for TokioExecutor {
                 DataOp::Dup2 { old_fd, new_fd } => self.op_dup2(*old_fd, *new_fd, registry).await,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R-1 MEDIUM 批 8 的确定性复现：`try_claim` 成功后、undo 建立前的 await 点
+    /// （`lock_owned`）future 被丢弃（等同 `Action::Timeout` Elapsed 丢弃内层
+    /// future）→ `ArbiterClaimGuard` drop 必须自动 release 占坑，否则该 id 永久
+    /// WouldBlock（状态毒化）。
+    ///
+    /// 构造：先占物理锁但不占仲裁坑（直接经内部 `mutexes` 表锁住，模拟极端
+    /// 取消时序下「try_claim 成功 → lock_owned 阻塞」的窗口），启动
+    /// `op_mutex_lock`，等占坑落入仲裁表后 abort 任务（未来在 `lock_owned`
+    /// await 处被丢弃）。修复前：占坑泄漏（仲裁表残留）；修复后：守卫 drop
+    /// 自动 release。
+    #[tokio::test]
+    async fn mutex_claim_guard_releases_on_cancel() {
+        let mut ex = TokioExecutor::new();
+        let id = 999u64;
+        // 物理锁被占用且仲裁表空闲：try_claim 成功（无占坑冲突）后 `lock_owned`
+        // 必然阻塞，形成 MEDIUM 描述的泄漏窗口。
+        let phys = ex
+            .mutexes
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _phys_held = phys.lock_owned().await;
+        // 观察句柄：`op_mutex_lock` 阻塞期间持有执行器锁，但仲裁锁在 try_claim
+        // 成功后即释放 —— 经独立 Arc 观察占坑状态，避免与执行器锁互斥死锁。
+        let arb_obs = ex.arbiter.clone();
+        let ex = Arc::new(tokio::sync::Mutex::new(ex));
+        let task_ex = ex.clone();
+        let handle = tokio::spawn(async move {
+            let mut g = task_ex.lock().await;
+            g.op_mutex_lock(id).await
+        });
+        // 等 try_claim 生效（占坑落入仲裁表）→ 此刻 future 必阻塞在 lock_owned。
+        let resource = Resource::Fd(id);
+        let wait_claim = async {
+            for _ in 0..10_000 {
+                match arb_obs.try_lock() {
+                    Ok(arb) if arb.held(&resource) => return,
+                    _ => {}
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("try_claim 未在超时内生效（占坑未出现在仲裁表）");
+        };
+        tokio::time::timeout(Duration::from_secs(2), wait_claim)
+            .await
+            .expect("等待占坑生效超时");
+        // 取消路径（等同 Timeout Elapsed 丢弃内层 future）：abort 在下一 await
+        // （lock_owned）丢弃 future → 守卫 drop → 自动 release 占坑。
+        handle.abort();
+        assert!(
+            handle.await.is_err(),
+            "op_mutex_lock 应在物理锁占用期间被取消，而非完成"
+        );
+        // 修复后：占坑已由守卫释放（release 幂等），仲裁表恢复干净。
+        let arb = arb_obs.try_lock().expect("仲裁锁可获取");
+        assert!(
+            !arb.held(&resource),
+            "取消后占坑必须已释放（guard drop → release）"
+        );
+        assert!(arb.is_clean(), "取消后仲裁表应干净");
+        drop(arb);
+        drop(_phys_held);
+        // 再次 MutexLock 同 id：占坑已释放 → 成功（非永久 WouldBlock）。
+        let mut ex2 = ex.lock().await;
+        let (_v, undo) = ex2
+            .op_mutex_lock(id)
+            .await
+            .expect("取消后应能重新获取锁（claim 未泄漏）");
+        assert!(undo.is_some(), "重新获取的锁应带 undo");
     }
 }
