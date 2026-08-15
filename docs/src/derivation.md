@@ -16,7 +16,7 @@ Algeff（Algebraic Effects）将 Unix 系统效应从「指令（动词）」代
 4. **实现**：三层 crate（core 解释器 / std tokio 执行器 / macro 语法糖），约 2000+1200+300 行；
 5. **验证**：352 个测试函数（约 344 个二进制测试 + 8 条 doc-test）+ 46 个测试二进制，叠加
    `tla/scheduler.tla` 模型检测；
-6. **审计**：5 轮「对抗审计（120 个 E2E 测试）× 形式逻辑审计」串行收官——P1/P2/P3/P5 终判
+6. **审计**：6 轮「对抗审计（164 个 E2E 测试）× 形式逻辑审计」——P1/P2/P3/P5 终判
    「有效（附声明前提）」，P4 部分收敛（差距 RFC-05，阶段 3+ 已裁决）。
 
 **结论**：语义正确性定案，可作研究/原型基线；并行性能（executor 锁串行化，R-6）为**已知开放面**，生产采用需先完成阶段 3+ 缺口清单（§10）；跨平台错误语义（RFC-10）已修复（executor 层归一化，fdd0cfe）。
@@ -203,7 +203,7 @@ AST 语法相等——Action 含 `NextFn` 闭包，语法不可比（A1 风险�
 | 属性（proptest） | `tests/axioms.rs`、`commutation.rs`、`arbiter.rs` | A3 对称 combine 交换、arbiter 三不变量（单调不减/原子快照/无泄漏） |
 | 执行级 | `tests/execution_axioms.rs` | `exec_A1_associativity`、`exec_A2_identity`、`exec_A6_undo_roundtrip` |
 | 端到端 | `algeff-std/tests/` | 文件往返、TCP echo、撤销往返、深度守卫 |
-| 对抗 E2E | `tests/adversarial_r{1..6}.rs` | 162 个测试（R1=17、R2=19、R3=28、R4=32、R5=24、R6=42） |
+| 对抗 E2E | `tests/adversarial_r{1..6}.rs` | 164 个测试（R1=18、R2=19、R3=28、R4=33、R5=24、R6=42，逐二进制 `--list` 实测） |
 | 模型检测 | `tla/scheduler.tla` | TLC 通过 `TypeOK`/`ExclusiveHold`/`ExactHold`/`NoCircularWait` 4 不变式 + `Progress` 时序属性 |
 
 总量：`cargo test --workspace` **352 个测试函数**（约 344 个 `#[test]`/`#[tokio::test]` +
