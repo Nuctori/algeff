@@ -158,7 +158,7 @@ Fork  ：子任务通过 COW 隔离（ReadOnly 共享、Mutable 延迟复制、O
 | 层 | 文件 : 符号 | 说明 |
 | --- | --- | --- |
 | Choose | `action.rs::Action::Choose { cond, then_branch, else_branch }` + `runtime.rs::interpret` | 只执行被选分支；未选分支不执行，天然无相互影响 |
-| Fork COW | `resource.rs::ResourceRegistry` 实现 `Clone`（决策 D13）+ `ResourceHandle` 全 `Arc` | `registry.clone()` 隔离子任务状态；`Arc::make_mut` 实现延迟复制（pdr.md §9.2，A2/A3 交付） |
+| Fork COW | `resource.rs::ResourceRegistry` 实现 `Clone`（决策 D13）+ `ResourceHandle` 全 `Arc` | `registry.clone()` 隔离子任务状态；`Arc::make_mut` 延迟复制为**阶段 3 设计**（当前未实现——静态串行化+执行器互斥保证隔离，见风险备注） |
 | 契约 | `contracts.md` D13（见 audit：未入决策表，建议补录）/ pdr.md §四 A5、§9.2 | — |
 
 **验证方式（A6 建议）**

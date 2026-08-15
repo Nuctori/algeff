@@ -79,7 +79,7 @@
 ## 5. 阶段 1 任务定义（各 Agent 的交付物）
 
 - **A1 Spec Guardian**：`spec/axioms.md`（A1–A7 形式化+工程映射表）、`spec/proofs.md`（P1–P5 证明，附 Rust 测试映射）、`spec/contracts-audit.md`（审计 contracts.md 与 pdr.md 一致性，列出偏差与建议；**只读 contracts.md**）。
-- **A2 Core Runtime**：实现 `runtime.rs::interpret`（trampoline 解释器，全部 15 个 Action 节点）、`Runtime::run`/`recover`、virtual clock 接入 Sleep；测试 `crates/algeff-core/tests/interpreter.rs`（Pure 单位元、Sequential、Choose、Fork 冲突调度、Scope、Timeout、Catch、Replace、Sleep）。
+- **A2 Core Runtime**：实现 `runtime.rs::interpret`（trampoline 解释器，全部 13 个 Action 节点）、`Runtime::run`/`recover`、virtual clock 接入 Sleep；测试 `crates/algeff-core/tests/interpreter.rs`（Pure 单位元、Sequential、Choose、Fork 冲突调度、Scope、Timeout、Catch、Replace、Sleep）。
 - **A3 Resource & Coeffects**：完成 `coeffects.rs`（Component 回调语义、store 集成测试）；`resource.rs` 边界打磨 + 冲突矩阵穷举测试；registry 并发安全说明文档（`crates/algeff-core/src/resource.rs` 内注释或 `spec/resource-notes.md`）。
 - **A4 DSL & Macro**：实现 `plan!`/`fork!`/`scope!`/`choose!`（syn/quote，纯 AST 构造，不参与类型系统）；测试 `crates/algeff-macro/tests/macros.rs`（展开后动作可达、资源自动收集）。
 - **A5 Std Adapters**：实现 `TokioExecutor`（全部 DataOp，Full 撤销策略：写前读 + 恢复逆操作；Open→undo Close；Dup 共享 Arc；不可逆操作返回 None）；`adapters.rs` 预包装函数；集成测试 `crates/algeff-std/tests/`（文件往返、TCP echo、撤销往返）。

@@ -17,8 +17,7 @@
 克隆 registry 作为私有状态（`Arc` 句柄浅拷贝，零拷贝共享底层资源），子任务内的
 分配 / 消费 / 终结只写入克隆体，与主 registry 完全隔离。父分支与兄弟分支互不可见
 对方的线性消费记录——这正是公理 A5「Fork 子任务通过 COW 隔离」的工程映射
-（物理层 COW 由 `Arc::make_mut` 延迟复制实现，见 pdr.md §9.2；线性状态的 COW 由
-Clone 实现）。任务完成后，由调度方决定将子状态合并回主 registry 或直接丢弃。
+（物理层 COW 的 `Arc::make_mut` 延迟复制为**阶段 3 设计，当前未实现**（§9 评估）；当前阶段 1 隔离由 registry Clone + 静态串行化 + 执行器互斥保证，见 pdr.md §9.2；线性状态的 COW 由 Clone 实现）。任务完成后，由调度方决定将子状态合并回主 registry 或直接丢弃。
 
 **并发约束**：`sync` 之外，registry 的线性检查是同步单线程 API（`&mut self`），
 不跨线程共享；跨任务共享的只有 `CoeffectStore`（内部 `Arc<tokio::sync::Mutex>`）。
@@ -191,10 +190,7 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 | clone → 子分配+消费 → 合并回父 | D13 | A3/A5 | `fork_clone_merge_pattern` |
 | 随机 usage 序列的状态机不变量 | — | A4 | `linearity_sequence_random` |
 
-> 备注：任务文本提及「与 D10/D14 的对应关系」，但当前 contracts.md 决策表只有
-> D1–D13，**D14 未定义**（全仓库检索无 D14 条目）。本节按现存决策 D1/D10/D13
-> 撰写对应关系；D14 的存在性需 CTO 澄清（见 RFC-A3-3）。
-
+> 备注（已核销）：RFC-A3-3 所指的 D14 缺口已于 `f3494c0` 补录（契约决策表 D1-D19，D14=Fork 阶段 1 语义）——本备注为历史记录，保留以供追溯。
 ## 8. ResourceArbiter 与公理 A7 的映射（批 3 落地）
 
 > **接入状态（批 7/8/9 更新）**：arbiter ↔ `MutexLock`（`DataOp::MutexLock { id }`）
@@ -435,4 +431,4 @@ recover → 同 id 重入成功（无永久 WouldBlock）。修复方向 = 取�
 
 ### RFC-11：解释器嵌套蓝图无递归深度上限 → 进程级栈溢出（R4c 对抗发现）
 
-`run_sub_impl`（runtime.rs:277）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下 **深度 ~110-120 即 STATUS_STACK_OVERFLOW 进程级 abort**（release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。修复方向（A2 批 7 实施中，runtime.rs 冻结面外）：解释器维护嵌套深度计数器，超阈值（如 128）返回可捕获错误（`SysError::Other` 或新变体）替代栈溢出；长期可堆上延续（explicit work stack）。测试：`adversarial_r4c.rs` 固定安全深度 64 回归（修复后应断言超深蓝图返回 Err 而非 abort）。
+`run_sub_impl`（runtime.rs:277）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下 **深度 ~110-120 即 STATUS_STACK_OVERFLOW 进程级 abort**（release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。修复方向（A2 批 7 实施中，runtime.rs 冻结面外）：解释器维护嵌套深度计数器，超阈值（**96**——实测 Windows 2MB 栈崩溃边界 ~104-108，留 ~8% 余量；128 会晚于崩溃触发）返回可捕获错误（`SysError::Other(105)`）替代栈溢出；长期可堆上延续（explicit work stack）。测试：`adversarial_r4c.rs` 固定安全深度 64 回归；修复后补「深度 200 蓝图返回 Err(Other(105)) 而非 abort」断言。
