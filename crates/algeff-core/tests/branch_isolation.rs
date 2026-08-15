@@ -1,11 +1,12 @@
 //! 分支隔离测试（A6 Verification 批 8，数学审计 R1 发现的 P3 证据缺口补足）。
 //!
-//! 义务引用：spec/proof-obligations.md ——「A5 分支隔离 | 左 Write 不影响右 Read |
-//! 测试证据：concurrency_stress.rs:fork_same_fd_write | 审计结论：待 R1」与
-//! 「P3 分支写隔离 | Choose/Fork 写隔离 | fork_same_fd_write」。R1 形式逻辑审计
-//! 指出：既有证据只验证**两分支 Write 互不拦截**（registry 副本隔离、A4 线性
+//! 义务引用：spec/proof-obligations.md ——「A5 分支隔离 | 左 Write 不影响右 Read」。
+//! R1 形式逻辑审计指出：既有证据只验证**两分支 Write 互不拦截**（registry 副本隔离、A4 线性
 //! 检查不互相拒绝），**无任何「读侧隔离」测试**——右分支 Read 应看到写前内容；
 //! Choose 的未选分支隔离也仅有 op 记录断言、无 registry 状态侧断言。本文件补足：
+//! 注（审查 LOW-5）：A2 批 6 已合并（fd 区间全局分配）；本文件覆盖顺序路径（Write×Read 冲突
+//! 恒顺序）与 Runtime Shared 路径；纯并行路径（读-读无冲突）的多重集合断言由
+//! adversarial_r2.rs / commutation.rs 覆盖。
 //!
 //! 1. **exec_P3_fork_left_write_right_read_isolated**（P3 核心，顺序路径）：
 //!    `Fork{left: Write(fd) → 写入标记, right: Read(fd) → 写前内容}`——左 Write
