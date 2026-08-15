@@ -61,17 +61,15 @@ type HeldLockSlot = Arc<tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<(
 /// 双保险安全）；undo/锁持有成功建立后由 `disarm()` 停用，释放职责移交 undo
 /// 路径（防双释放）。持有型守卫（clone Arc，非借用）：可跨 await 存活，且与
 /// undo 闭包（`'static` + Send，捕获同型 Arc 与 claim_set）并存。
+/// A5 批 9：arbiter 改 std Mutex 后，drop 内同步 `lock()` 安全（见 `Drop` 注释）。
 struct ArbiterClaimGuard {
-    arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
+    arbiter: Arc<std::sync::Mutex<ResourceArbiter>>,
     claim_set: Vec<ResourceUsage>,
     armed: bool,
 }
 
 impl ArbiterClaimGuard {
-    fn new(
-        arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
-        claim_set: Vec<ResourceUsage>,
-    ) -> Self {
+    fn new(arbiter: Arc<std::sync::Mutex<ResourceArbiter>>, claim_set: Vec<ResourceUsage>) -> Self {
         Self {
             arbiter,
             claim_set,
@@ -90,14 +88,18 @@ impl Drop for ArbiterClaimGuard {
         if !self.armed {
             return;
         }
-        // Drop 内不可 await：先 `try_lock`；失败仅当另一任务正持有仲裁锁执行
-        // 同步短临界区（`try_claim`/`release` 无 await、微秒级），`blocking_lock`
-        // 兜底 —— 持锁者无需调度即可完成临界区，无死锁可达性。
-        let mut arb = match self.arbiter.try_lock() {
-            Ok(g) => g,
-            Err(_) => self.arbiter.blocking_lock(),
-        };
-        arb.release(&self.claim_set);
+        // A5 批 9（Drop 内 async panic 修复）：arbiter 已改 std Mutex，临界区
+        // （`try_claim`/`release`）无 await、微秒级 —— `lock()` 只会短暂阻塞等待
+        // 持锁者完成临界区。修复前 tokio Mutex 的 `blocking_lock` 兜底在异步
+        // worker 线程 poll 帧内调用会 panic（tokio 明确禁止），而取消路径
+        // （Timeout 丢弃内层 future）的 drop 恰在该上下文执行 → Drop 内 panic
+        // 有 double-panic abort 风险；std Mutex 无此问题。`expect`：临界区内
+        // 无 panic 源（纯表操作），锁中毒不可达。
+        // release 幂等：对未占坑资源是 no-op（已 disarm / 已显式释放时双保险）。
+        self.arbiter
+            .lock()
+            .expect("arbiter 锁中毒不可达：临界区无 panic 源")
+            .release(&self.claim_set);
     }
 }
 
@@ -112,9 +114,9 @@ pub struct TokioExecutor {
     held_locks: HashMap<u64, HeldLockSlot>,
     /// 动态资源仲裁（D16 / R-1 落地）：MutexLock id → `Resource::Fd(id)` 占坑表。
     /// Arc 共享：undo 闭包（'static + Send）与显式 MutexUnlock 都需释放占坑；
-    /// tokio Mutex 保护跨任务访问（try_claim/release 为同步短临界区，无嵌套锁、
-    /// 无循环等待）。
-    arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
+    /// std Mutex 保护跨任务访问（A5 批 9：try_claim/release 为同步短临界区，
+    /// 无 await、无嵌套锁、无循环等待；Drop 内同步 lock 安全）。
+    arbiter: Arc<std::sync::Mutex<ResourceArbiter>>,
     /// 文件工作对象（registry 侧为 `try_clone` 簿记 token，共享同一 OS 描述）。
     files: HashMap<u64, Arc<tokio::sync::Mutex<tokio::fs::File>>>,
     /// TCP 流逻辑 fd → 当前注册表 fd。
@@ -131,7 +133,7 @@ impl Default for TokioExecutor {
             children: HashMap::new(),
             mutexes: HashMap::new(),
             held_locks: HashMap::new(),
-            arbiter: Arc::new(tokio::sync::Mutex::new(ResourceArbiter::new())),
+            arbiter: Arc::new(std::sync::Mutex::new(ResourceArbiter::new())),
             files: HashMap::new(),
             stream_fds: HashMap::new(),
             pipe_reader_fds: HashMap::new(),
@@ -952,7 +954,9 @@ impl TokioExecutor {
         let arbiter = self.arbiter.clone();
         let mut claimed = false;
         for attempt in 0..ARBITER_RETRY_LIMIT {
-            if arbiter.lock().await.try_claim(&claim_set) {
+            // std Mutex 同步 lock（A5 批 9）：临界区（try_claim）无 await、微秒级，
+            // 短持有不会长时间阻塞其他任务；`unwrap`：临界区无 panic 源，中毒不可达。
+            if arbiter.lock().unwrap().try_claim(&claim_set) {
                 claimed = true;
                 break;
             }
@@ -991,7 +995,8 @@ impl TokioExecutor {
                 drop(g);
             }
             // 幂等：release 对未占坑资源是 no-op（显式 MutexUnlock 已释放时安全）。
-            arbiter.lock().await.release(&claim_set);
+            // std Mutex 同步 lock（临界区无 await，A5 批 9）。
+            arbiter.lock().unwrap().release(&claim_set);
         });
         Ok((Value::Unit, Some(undo)))
     }
@@ -1010,7 +1015,7 @@ impl TokioExecutor {
             resource: Resource::Fd(id),
             mode: AccessMode::Write,
         }];
-        self.arbiter.lock().await.release(&claim_set);
+        self.arbiter.lock().unwrap().release(&claim_set);
         Ok((Value::Unit, None))
     }
 
@@ -1257,7 +1262,7 @@ mod tests {
         let resource = Resource::Fd(id);
         let wait_claim = async {
             for _ in 0..10_000 {
-                match arb_obs.try_lock() {
+                match arb_obs.lock() {
                     Ok(arb) if arb.held(&resource) => return,
                     _ => {}
                 }
@@ -1276,13 +1281,14 @@ mod tests {
             "op_mutex_lock 应在物理锁占用期间被取消，而非完成"
         );
         // 修复后：占坑已由守卫释放（release 幂等），仲裁表恢复干净。
-        let arb = arb_obs.try_lock().expect("仲裁锁可获取");
-        assert!(
-            !arb.held(&resource),
-            "取消后占坑必须已释放（guard drop → release）"
-        );
-        assert!(arb.is_clean(), "取消后仲裁表应干净");
-        drop(arb);
+        {
+            let arb = arb_obs.lock().unwrap();
+            assert!(
+                !arb.held(&resource),
+                "取消后占坑必须已释放（guard drop → release）"
+            );
+            assert!(arb.is_clean(), "取消后仲裁表应干净");
+        }
         drop(_phys_held);
         // 再次 MutexLock 同 id：占坑已释放 → 成功（非永久 WouldBlock）。
         let mut ex2 = ex.lock().await;
@@ -1291,5 +1297,121 @@ mod tests {
             .await
             .expect("取消后应能重新获取锁（claim 未泄漏）");
         assert!(undo.is_some(), "重新获取的锁应带 undo");
+    }
+
+    /// A5 批 9 审计 blocker 的确定性复现：取消路径的守卫 drop 与「另一任务正
+    /// 处于仲裁临界区」（arbiter 锁被持有）重叠。
+    ///
+    /// 修复前（tokio Mutex + `blocking_lock` 兜底）：Drop 恰在 worker 线程 poll
+    /// 帧内执行，`try_lock` 失败 → `blocking_lock` → tokio 明确 panic（"Cannot
+    /// block the current thread from within a runtime"）→ Drop 内 panic 有
+    /// double-panic abort 风险。修复后（std Mutex）：Drop 内 `lock()` 同步阻塞
+    /// 等待持锁者完成微秒级临界区，无 panic、无 abort。
+    ///
+    /// 构造：物理锁被占用 → `op_mutex_lock` 在 try_claim 成功后必然阻塞在
+    /// `lock_owned`；此时外部 std 线程持 arbiter 锁（模拟另一任务正处于临界区），
+    /// abort 取消任务 → 守卫 drop 的 `lock()` 与外部持锁者重叠（阻塞至其释放）。
+    #[tokio::test]
+    async fn mutex_claim_guard_drop_contends_with_arbiter_lock() {
+        let mut ex = TokioExecutor::new();
+        let id = 4242u64;
+        // 物理锁被占用且仲裁表空闲：try_claim 成功（无占坑冲突）后 `lock_owned`
+        // 必然阻塞，形成守卫 drop 的确定性窗口。
+        let phys = ex
+            .mutexes
+            .entry(id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _phys_held = phys.lock_owned().await;
+        let arb_obs = ex.arbiter.clone();
+        let ex = Arc::new(tokio::sync::Mutex::new(ex));
+        let task_ex = ex.clone();
+        let handle = tokio::spawn(async move {
+            let mut g = task_ex.lock().await;
+            g.op_mutex_lock(id).await
+        });
+        // 等 try_claim 生效（占坑落表）→ 此刻 future 必阻塞在 lock_owned。
+        let resource = Resource::Fd(id);
+        let wait_claim = async {
+            for _ in 0..10_000 {
+                match arb_obs.lock() {
+                    Ok(arb) if arb.held(&resource) => return,
+                    _ => {}
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("try_claim 未在超时内生效（占坑未出现在仲裁表）");
+        };
+        tokio::time::timeout(Duration::from_secs(2), wait_claim)
+            .await
+            .expect("等待占坑生效超时");
+        // 外部 std 线程持 arbiter 锁（模拟另一任务正处于仲裁临界区的瞬间）：
+        // 经 channel 确认已持锁后再触发取消，保证 drop 与临界区确定性重叠。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = {
+            let arb = arb_obs.clone();
+            std::thread::spawn(move || {
+                let _g = arb.lock().expect("外部持锁者取锁");
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            })
+        };
+        rx.recv().expect("外部持锁者未就绪");
+        // 取消路径（等同 Timeout Elapsed 丢弃内层 future）：abort 在 lock_owned
+        // 处丢弃 future → 守卫 drop → lock() 与外部持锁者重叠（安全阻塞等待）。
+        handle.abort();
+        let join_err = match handle.await {
+            Err(e) => e,
+            Ok(_) => panic!("op_mutex_lock 应在物理锁占用期间被取消，而非完成"),
+        };
+        assert!(
+            join_err.is_cancelled(),
+            "任务应因 abort 取消而非 panic（Drop 内 lock 不得 panic）"
+        );
+        holder.join().expect("外部持锁线程正常退出");
+        // 修复后（std Mutex）：无 panic、无 abort；仲裁表最终干净。
+        {
+            let arb = arb_obs.lock().unwrap();
+            assert!(
+                !arb.held(&resource),
+                "取消后占坑必须已释放（guard drop → release）"
+            );
+            assert!(arb.is_clean(), "取消后仲裁表应干净");
+        }
+        drop(_phys_held);
+        // 再次 MutexLock 同 id：占坑已释放 → 成功（非永久 WouldBlock）。
+        let mut ex2 = ex.lock().await;
+        let (_v, undo) = ex2
+            .op_mutex_lock(id)
+            .await
+            .expect("取消后应能重新获取锁（claim 未泄漏）");
+        assert!(undo.is_some(), "重新获取的锁应带 undo");
+    }
+
+    /// A5 批 9 确定性单测：`disarm` 后 drop 不触碰 arbiter 锁 —— 手动
+    /// `arbiter.lock().unwrap()` 持锁期间 drop 一个已 disarm 的 guard，无 panic、
+    /// 无死锁（std Mutex 非重入：armed 守卫在持锁线程内 drop 会自死锁，因此
+    /// 释放职责必须经 `disarm` 移交 undo 路径——本测试验证该语义成立）。
+    #[test]
+    fn claim_guard_disarmed_drop_under_held_arbiter_lock_no_panic() {
+        let arbiter = Arc::new(std::sync::Mutex::new(ResourceArbiter::new()));
+        let claim_set = vec![ResourceUsage {
+            resource: Resource::Fd(7),
+            mode: AccessMode::Write,
+        }];
+        // 模拟 op_mutex_lock 的占坑成功路径：try_claim 已提交（守卫持有占坑职责）。
+        assert!(arbiter.lock().unwrap().try_claim(&claim_set));
+        // 手动持锁（模拟另一路径正处于 arbiter 临界区，与 drop 重叠）。
+        let _outer = arbiter.lock().unwrap();
+        let mut guard = ArbiterClaimGuard::new(arbiter.clone(), claim_set.clone());
+        guard.disarm(); // 释放职责已移交 undo 路径 → drop 不触碰锁。
+        drop(guard); // 持锁期间 drop 已 disarm guard：无 panic、无死锁。
+        drop(_outer);
+        // disarm 后占坑保留（职责在 undo 路径，防双释放）。
+        let arb = arbiter.lock().unwrap();
+        assert!(
+            arb.held(&Resource::Fd(7)),
+            "disarm 后占坑应保留（防双释放）"
+        );
     }
 }
