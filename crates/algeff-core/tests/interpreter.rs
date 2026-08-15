@@ -1373,14 +1373,21 @@ fn fork_sequential_left_error_right_still_executes_and_merges() {
         vec!["write:1", "write:3", "write:2"],
         "右分支在左分支 Err 后仍执行（left→right 顺序）"
     );
-    // merge 发生：两分支的 Write 线性标记并入父。
-    for fd in [1u64, 2, 3] {
+    // merge 发生：两分支的线性标记并入父 —— 成功的 Write 消费并入
+    // （fd 1/2）；左分支**失败**的 Write（fd 3，NotFound）标记已回滚
+    // （RFC-12：失败 syscall 预插入的消费标记不残留），不并入父。
+    for fd in [1u64, 2] {
         assert_eq!(
             reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write)),
             Err(SysError::InvalidInput),
-            "分支 fd {fd} 的 Write 消费经 merge 并入父"
+            "分支 fd {fd} 的成功 Write 消费经 merge 并入父"
         );
     }
+    assert_eq!(
+        reg.check_linear(&usage(Resource::Fd(3), AccessMode::Write)),
+        Ok(()),
+        "左分支失败的 Write（fd 3）标记已回滚，经 merge 后父侧未消费"
+    );
     // recover 按 right→left 撤销（LIFO：右分支效果后发生、先撤销）。
     drive(undo.recover());
     assert_eq!(

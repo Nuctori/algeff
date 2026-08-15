@@ -575,7 +575,9 @@ async fn run_fork_parallel(
 ///   每个节点产出 `(下一 cur, 下一 Action)`；
 /// - `Pure`：单位元（公理 A2），直接产生值；
 /// - `Syscall`：逐资源 `check_linear`（公理 A4，失败立即返回）→ 执行器执行
-///   （经 `access` 通道）→ `Option<UndoOp>` 压入撤销栈 → `next(v)`；
+///   （经 `access` 通道）→ `Option<UndoOp>` 压入撤销栈 → `next(v)`；物理执行
+///   失败时回滚本次预插入的 Write/Own 线性标记（RFC-12，恢复同路径可重试
+///   语义），错误原样透传且不压 undo（现有契约）；
 /// - `Choose`：`cond(&cur)` 选分支，分支结果继续主循环（A5 分支隔离）；
 /// - `Fork`：D14 阶段 3 —— 静态冲突检测（`fork_conflict`）；`can_parallel=true`
 ///   且为 `Shared` 通道时真并行（`run_fork_parallel`：registry/ctx 隔离 + 独立
@@ -627,12 +629,24 @@ async fn interpret_impl(
                 for u in &resources {
                     reg.check_linear(u)?;
                 }
-                let (v, maybe_undo) = exec_via(&mut access, &op, reg).await?;
-                if let Some(u) = maybe_undo {
-                    undo.push(u);
+                // RFC-12（R6-F2）：物理执行失败时回滚本次预插入的线性消费
+                // 标记（Write/Own），恢复同路径可重试语义——否则失败后同路径
+                // 再以 Write 模式打开会被 A4 误拒（InvalidInput，标记残留
+                // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
+                // （现有契约）。
+                match exec_via(&mut access, &op, reg).await {
+                    Ok((v, maybe_undo)) => {
+                        if let Some(u) = maybe_undo {
+                            undo.push(u);
+                        }
+                        let na = next(v);
+                        (Value::Unit, na)
+                    }
+                    Err(e) => {
+                        reg.rollback_linear(&resources);
+                        return Err(e);
+                    }
                 }
-                let na = next(v);
-                (Value::Unit, na)
             }
 
             Action::Choose {

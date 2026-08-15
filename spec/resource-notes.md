@@ -481,3 +481,37 @@ op_spawn/op_wait/op_kill/op_mmap/op_send_file）已接入。修复后：create_n
 `run_sub_impl`（runtime.rs:277）对嵌套子 Action（Sequential/Fork 顺序/Scope/Catch/Timeout/Replace 同路径）递归，每层 `Box::pin(async)` 栈帧线性增长（~13-20KB/层，debug）；Windows 默认 2MB 测试线程栈下实测崩溃边界深度 ~104-108（100/104 通过、108 即 STATUS_STACK_OVERFLOW 进程级 abort；R4c 审计记录 ~110-120 同量级；release 1000 层同样溢出；Linux 8MB 栈约 3-4 倍余量）。影响：不受信任蓝图嵌套 ~百层可致宿主进程崩溃（拒绝服务面）。
 
 **已修复（A2 批 7，runtime.rs，冻结面外）**：`interpret_impl` 递归入口维护嵌套深度计数器（`depth` 为 interpret_impl 私有参数，冻结签名 `interpret`/`run_blocking` 从 0 起调），超阈值返回 `SysError::Other(105)`（ENOBUFS=105「嵌套资源耗尽」语义近似；`SysError` 冻结为 14+Other，无专用哨兵；注意与 Linux 真实 ENOBUFS 语义重叠——Catch 无法区分深度耗尽与系统 ENOBUFS，D-052 明确接受）替代栈溢出——错误可被外层 Catch 捕获（拒绝服务面转为可恢复错误）。阈值 96（CTO 裁决 D-052）：比实测边界 ~104 留 ~8% 余量（帧大小随嵌套构造/编译器版本波动），统一保守取值保证最弱平台（Windows 2MB 栈）安全。**受影响面提示**：左结合型链（含 `adapters::seq()` 左折叠）≥97 步返回 Err(Other(105))——用户需改右结合（and_then CPS）或 Catch Other(105)。**保证范围（文档化限制）**：守卫保证限于 ≥2MB 栈（Rust 测试线程/tokio worker/`std::thread::spawn` 默认 2MB）——96 帧 × ~13-20KB ≈ 1.2-1.9MB；若宿主在更小栈上执行深嵌套蓝图（如 Windows 主线程默认 1MB，实测崩溃边界 ~50-54 帧，55~95 层会在守卫触发前 abort），**正确缓解**：a. 链接器 /STACK 提升主线程栈；b. 将解释器运行在 spawn 线程（受 `RUST_MIN_STACK` 控制，默认 2MB）；c. 或 Catch Other(105)。注意 `RUST_MIN_STACK` 只影响 `std::thread::spawn` 新线程、**不影响主线程**（审查修正）。否则属用户责任（阈值不随栈尺寸动态调整）；Fork 并行分支在独立阻塞线程（全新栈）上驱动，深度从 0 独立起算。测试（`tests/interpreter.rs`）：`deep_nesting_under_limit_ok`（深度 64 成功，与 R4c 安全深度一致）、`deep_nesting_over_limit_returns_error`（深度 200 → `Err(Other(105))` 且不 abort，守卫先于栈溢出触发）、`deep_nesting_catchable`（超深蓝图经 Catch → handler 收到 Other(105)）。回归对照：`adversarial_r4c.rs::nested_sequential_64_deep_recursive_frames_values_flow`（安全深度 64）不受影响。
+
+### RFC-12：失败路径线性标记未回滚 → 同路径 Write 重试被 A4 误拒（R6-F2 发现，已修复）
+
+`check_linear`（resource.rs）在 syscall **执行前**预插入 Write/Own 消费标记（Write 记入
+`consumed`、Own 记入 `owned_consumed`，公理 A4）；interpret Syscall 臂物理执行失败时直接
+`?` 上抛（runtime.rs），**不回滚本次预插入的标记**。后果：失败后同路径再以 Write 模式打开
+被 A4 误拒（`InvalidInput`，线性标记残留 = 状态毒化）；r4b 的
+`open_exclusive_existing_fails_no_state_poison` 只验证了异路径重开（p2），同路径是盲区
+（R6-A1 对抗审计证实，audit/r6 分支 `adversarial_r6.rs` §3 锁定当前错误行为）。与 A7 仲裁
+「失败回滚」原则相悖：未发生的操作不应留下线性消费痕迹。
+
+**已修复（R6-F2，resource.rs/runtime.rs，冻结面外）**：新增
+`ResourceRegistry::rollback_linear(&ResourceSet)`——对一批 `check_linear` **全部返回 Ok**
+的资源，移除本批新插入的 Write（`consumed`）与 Own（`owned_consumed`）标记（Read/Append
+不插标记、无操作；Write 至多一次、Own 终结，重复插入会 Err 且不进入执行阶段，故移除恰好
+一个标记是安全的，不会误删早前成功 syscall 的消费记录）；interpret Syscall 臂改为
+`match exec_via(...).await`，`Err` 路径先 `rollback_linear(&resources)` 再原样透传错误。
+保证不变：A4 成功路径语义不变（Write/Own 恰好消费一次）；Fork 并行分支线性语义不变（顺序/
+并行路径均经 `run_sub_impl`，分支失败后的标记不再经 merge 毒化父）；undo 栈行为不变
+（错误不压栈——现有契约，r4b 错误透传测试不回归）。
+
+**测试证据**：
+- `crates/algeff-core/tests/adversarial_r6_f2.rs`（假执行器，D9 契约独立性）：
+  `failed_open_write_rolls_back_path_marker_same_path_retry_ok`（失败 Open(w) → 同路径
+  Write 重试成功）、`failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept`
+  （失败 Write(fd) → 重试成功 → 再写仍被 A4 拦截，计数不重复消费）、
+  `failed_close_rolls_back_own_terminal_marker_fd_still_usable`（失败 Own(Close) → fd
+  仍可用）、`rollback_only_touches_this_syscall_markers_success_path_axiom_kept`
+  （回滚不误删早前成功 syscall 的标记；Read/Append 无操作）；
+- `crates/algeff-std/tests/adversarial_r4b.rs::failed_exclusive_open_same_path_write_reopen_ok`
+  （真实 TokioExecutor 全链路，audit/r6 §3 场景修复后断言）：exclusive 撞已存在失败 →
+  同路径 Write 模式重开成功 → 重开后可写（物理生效）→ 二写仍被 A4 拦截；
+- 回归：r4b 异路径毒化测试 `open_exclusive_existing_fails_no_state_poison` 不变，
+  `cargo test --workspace` 全绿。
