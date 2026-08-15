@@ -53,7 +53,7 @@
 
 **依赖的前提**：A3；以及 combine 对称性（`axioms.md` A3 风险备注中记录的本审计新增前提）。
 
-**工程含义**：运行时可根据冲突矩阵（`ResourceRegistry::can_parallel`）**零锁并行调度**；Append∥Append 需显式声明顺序无关（决策 D6）后才允许并行。
+**工程含义**：运行时可根据冲突矩阵（`ResourceRegistry::can_parallel`）**资源级零锁并行调度**（注：D17 下执行器调用经 `Arc<Mutex<Box<dyn SyscallExecutor + Send>>>` 逐 op 互斥，零锁仅资源级成立，非全链路——数学审计 M6 修正）；Append∥Append 需显式声明顺序无关（决策 D6）后才允许并行。
 
 **Rust 测试映射（A6 建议）**
 
@@ -96,7 +96,7 @@
 | `prop_p3_fork_cow_isolation` | 同上（loom 并发） | 左分支 `make_mut` 写后，右分支 `Arc` 内容不变（= `axiom_a5_fork_cow_isolation`） |
 | `prop_p3_fork_own_exclusive` | 同上 | Own 资源仅一个分支持有，另一分支报错（= `axiom_a5_fork_own_exclusive`） |
 
-**边界与风险**：当前冻结代码只有 registry `Clone`，`make_mut` 的**副本触发时机**尚未实现（`interpret` 为 `todo!`）；P3 的 Fork 部分在 A2/A3 落地前无法端到端验证。另注意：子任务若通过 Arc 对共享句柄做破坏性操作（如 Close），会绕过 COW——Own 语义必须走 `take` + 独占转移（见 `axioms.md` A5 风险备注）。
+**边界与风险**：当前冻结代码只有 registry `Clone`，`make_mut` 的**副本触发时机**尚未实现（A5 批 7 预研：resource-notes §9 建议推迟至阶段 3）；P3 的 Fork COW 物理层在 make_mut 落地前无法端到端验证，语义层（registry 副本隔离 + 分支读隔离测试）已闭环。另注意：子任务若通过 Arc 对共享句柄做破坏性操作（如 Close），会绕过 COW——Own 语义必须走 `take` + 独占转移（见 `axioms.md` A5 风险备注）。
 
 ---
 
@@ -130,7 +130,7 @@ recover ∘ track(w, w̄)(γ₀, id) = (w̄(w(γ₀)), id)  （recoverΓ 定义�
 recover ∘ track(wₙ) ∘ ⋯ ∘ track(w₁)(γ₀, id) = (γ₀, id)
 ```
 
-（逆序应用 `w̄₁ ∘ ⋯ ∘ w̄ₙ` 与正序 `wₙ ∘ ⋯ ∘ w₁` 抵消；结合律 A1 保证分组无关。）
+（逆序应用 `w̄₁ ∘ ⋯ ∘ w̄ₙ` 与正序 `wₙ ∘ ⋯ ∘ w₁` 抵消；依赖函数复合的结合性——数学事实，非公理 A1，数学审计 M2 修正。）
 
 **适用范围边界**：只有撤销策略 **Full**（pdr.md §11.2）的操作返回逆操作（`SyscallExecutor::execute -> Option<UndoOp>` 为 `Some` 时才可撤销）；BestEffort/Skip 不满足 A6，不在此命题范围内。不可逆操作（UDP 发送、进程信号）仅提供补偿挂钩。
 
