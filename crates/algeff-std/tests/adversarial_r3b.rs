@@ -88,9 +88,16 @@ fn rw_flags() -> OpenFlags {
 /// 轨迹观察执行器：真实 TokioExecutor + 逐 op 记录（op 描述 + 执行线程 id）。
 /// 非 mock——全部行为委托真实执行器，仅追加只读观察。线程 id 用于 Fork
 /// 并行路径的证据（并行分支经 `spawn_blocking` 在不同线程执行）。
+///
+/// `op_delay`（默认 0）：每个 op 执行前的固定延迟。并行证据的确定性保障
+/// （审计 R1 r3b-flaky 修复）：virtual-clock 下 GetTime 短路使分支任务极短，
+/// spawn_blocking 任务 1 可能在任务 2 提交前完成 → 阻塞池线程复用 → 两个
+/// 分支 op 记录同线程（线程断言误报）。注入 ≥50ms 延迟后两分支必然同时
+/// 在飞（任务 2 提交时任务 1 仍在 sleep）→ 分到不同池线程，断言确定。
 struct TracedExecutor {
     inner: TokioExecutor,
     log: Arc<Mutex<Vec<(String, std::thread::ThreadId)>>>,
+    op_delay: Duration,
 }
 
 impl SyscallExecutor for TracedExecutor {
@@ -104,6 +111,9 @@ impl SyscallExecutor for TracedExecutor {
                 .lock()
                 .unwrap()
                 .push((format!("{op:?}"), std::thread::current().id()));
+            if !self.op_delay.is_zero() {
+                tokio::time::sleep(self.op_delay).await;
+            }
             self.inner.execute(op, registry).await
         })
     }
@@ -200,6 +210,7 @@ fn det_complex_blueprint_100_rounds_trajectory_identical() {
         let ex = TracedExecutor {
             inner: TokioExecutor::new(),
             log: Arc::clone(&log),
+            op_delay: Duration::ZERO,
         };
         let mut rt = Runtime::new(Box::new(ex));
         let v = rt.run_blocking(blueprint(pa.clone())).unwrap();
@@ -356,6 +367,7 @@ fn ub_fork_conflict_blindspot_hidden_closure_lock() {
     let ex = TracedExecutor {
         inner: TokioExecutor::new(),
         log: Arc::clone(&log),
+        op_delay: Duration::from_millis(50),
     };
     let mut rt = Runtime::new(Box::new(ex));
 
@@ -453,6 +465,8 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
         let ex = TracedExecutor {
             inner: TokioExecutor::new(),
             log: Arc::clone(&log),
+            // 真实延迟保证并行窗口（r3b-flaky 修复，见 TracedExecutor 注释）。
+            op_delay: Duration::from_millis(50),
         };
         let mut rt = Runtime::new(Box::new(ex));
         let fd = {
