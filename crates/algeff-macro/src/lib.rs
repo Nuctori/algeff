@@ -4,11 +4,12 @@
 //! `Action` 链等价表达；宏仅做 AST 构造（syn/quote 拼接），**不参与类型系统**，
 //! 不增加编译负担（pdr.md §八）。
 //!
-//! 提供四个宏：
+//! 提供五个宏：
 //! - `plan!{ stmt; stmt; ... }` → `Action::Sequential` 链
 //! - `fork!{ left: ..., right: ... }` → `Action::Fork`
 //! - `scope!("/tmp", || { ... })` → `Action::Scope`
 //! - `choose!(cond, then: ..., else: ...)` → `Action::Choose`
+//! - `do_!{ stmt; ...; 尾表达式 }` → 命令式 CPS 链（配合 `algeff_std::dx`）
 //!
 //! 展开产物一律引用 `algeff_core::action::` 路径构造节点，宏本身不做任何类型
 //! 检查。使用宏的代码需依赖 algeff-core，推荐配合其 prelude 使用：
@@ -19,7 +20,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{Expr, Ident, Lit, Token};
+use syn::spanned::Spanned;
+use syn::{Block, Expr, ExprMacro, Ident, Lit, Pat, Stmt, Token};
 
 /// 终止 continuation：`|_| Action::Pure(Value::Unit)`。
 fn pure_unit() -> TokenStream2 {
@@ -383,4 +385,147 @@ pub fn choose(input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// do_!{ stmt; stmt; ... ; 尾表达式 }（命令式语法糖，配合 algeff_std::dx）
+// ---------------------------------------------------------------------------
+
+/// 命令式顺序链宏（DX 迭代 1，配套 `algeff_std::dx` 模块）。
+///
+/// 把一段「正常操作」风格的语句序列编译成 `Action` CPS 链（`and_then` 嵌套），
+/// 语句间值传递经闭包参数完成（`let` 绑定的是原始 `Value`，使用处用
+/// `dx::expect_*`/dx 操作提取）。**不引入任何新 Action 节点**——展开产物
+/// 与手写 `Action::Sequential`/`and_then` 链完全等价，蓝图仍是纯数据。
+/// 名称 `do_`（下划线）是因为 `do` 是 Rust 保留关键字。
+///
+/// 语法（`{}` 块）：
+/// - `let <标识符> = <Action 表达式>;` —— 执行并把**结果值**绑定到标识符；
+/// - `let _ = <Action 表达式>;` / `<Action 表达式>;` —— 执行并丢弃结果；
+/// - 尾表达式（不带分号）—— 链的**最终值**，展开为 `Action::Pure(尾表达式)`；
+///   省略时收敛为 `Action::Pure(Value::Unit)`。
+///
+/// 语句内**任何返回 `Action` 的表达式**都可用（`dx::open`/`plan!`/`scope!`/
+/// `choose!`/嵌套 `do_!`）。分支/循环体需要多条语句时，用嵌套 `do_!` 块。
+///
+/// 展开说明：`let x = e;` → `algeff_std::dx::and_then(e, move |x| { 后续 })`；
+/// 表达式语句 → `and_then(e, move |_| { 后续 })`；尾表达式 → 最内层
+/// `Action::Pure(尾表达式)`。使用本宏的代码需依赖 `algeff-std`（提供
+/// `dx::and_then`）与 `algeff-core`。
+///
+/// 用法示例（配合 `algeff_std::dx`，资源声明自动推导）：
+/// ```rust
+/// use algeff_core::{Action, DataOp, Value};
+/// use algeff_macro::do_;
+/// use algeff_std::dx;
+///
+/// // 非 Pure 语句展开为 and_then 链；`let` 绑定 = 语句的结果值（Value）
+/// let p: Action = do_! {
+///     let t = dx::get_time();
+///     t // 尾表达式 = 链的最终值
+/// };
+/// assert!(matches!(p, Action::Sequential { .. }));
+/// let Action::Sequential { current, next } = p else {
+///     panic!("do_! 应展开为 Sequential 链");
+/// };
+/// assert!(matches!(*current, Action::Syscall { op: DataOp::GetTime, .. }));
+/// assert!(matches!(next(Value::U64(123)), Action::Pure(Value::U64(123))));
+/// ```
+///
+/// 真实文件 IO 示例见 README §3 与 `algeff_std::dx` 模块文档。
+#[proc_macro]
+pub fn do_(input: TokenStream) -> TokenStream {
+    // 调用点 `do_! { stmts }` 的定界符 `{}` 不进入输入流，补包一层再按 Block 解析
+    // （否则 syn 的 `Block` parse 会报 "expected curly braces"）。
+    let input2: TokenStream2 = input.into();
+    let block: Block = match syn::parse2(quote!({ #input2 })) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // 分离语句与尾表达式（最后一个无分号元素）。
+    let mut stmts: Vec<Stmt> = block.stmts;
+    let tail: Option<Expr> = match stmts.pop() {
+        Some(Stmt::Expr(e, None)) => Some(e),
+        Some(Stmt::Macro(sm)) if sm.semi_token.is_none() => Some(Expr::Macro(ExprMacro {
+            attrs: sm.attrs,
+            mac: sm.mac,
+        })),
+        Some(other) => {
+            stmts.push(other);
+            None
+        }
+        None => None,
+    };
+
+    // 从尾向前折叠成 and_then 链。
+    let mut out: TokenStream2 = match tail {
+        Some(e) => quote! {
+            algeff_core::action::Action::Pure(#e)
+        },
+        None => pure_unit(),
+    };
+
+    for stmt in stmts.into_iter().rev() {
+        match stmt {
+            Stmt::Local(local) => {
+                let init = match local.init {
+                    Some(init) => *init.expr,
+                    None => {
+                        return syn::Error::new(
+                            local.let_token.span,
+                            "do_! 的 let 必须有初始值（语法：let <标识符> = <Action 表达式>;）",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                };
+                match &local.pat {
+                    Pat::Ident(pi) => {
+                        let name = &pi.ident;
+                        let mut_ = &pi.mutability;
+                        out = quote! {
+                            algeff_std::dx::and_then(#init, move |#mut_ #name| { #out })
+                        };
+                    }
+                    Pat::Wild(_) => {
+                        out = quote! {
+                            algeff_std::dx::and_then(#init, move |_| { #out })
+                        };
+                    }
+                    _ => {
+                        return syn::Error::new(
+                            local.pat.span(),
+                            "do_! 仅支持 `let <标识符> = <表达式>;` 或 `let _ = <表达式>;`",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                }
+            }
+            Stmt::Expr(e, _) => {
+                out = quote! {
+                    algeff_std::dx::and_then(#e, move |_| { #out })
+                };
+            }
+            Stmt::Macro(sm) => {
+                let mac = Expr::Macro(ExprMacro {
+                    attrs: sm.attrs,
+                    mac: sm.mac,
+                });
+                out = quote! {
+                    algeff_std::dx::and_then(#mac, move |_| { #out })
+                };
+            }
+            Stmt::Item(_) => {
+                return syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "do_! 不支持块内 item 声明（fn/struct/use 等请放在宏外）",
+                )
+                .to_compile_error()
+                .into();
+            }
+        }
+    }
+    out.into()
 }
