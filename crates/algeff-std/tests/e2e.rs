@@ -109,7 +109,10 @@ fn e2e_file_write_read_undo() {
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(rt.undo_stack().is_empty());
     // D10（A2 批 4 对齐）：Replace = recover + reg.clear() —— 句柄与线性标记全部放弃。
-    assert!(rt.registry().lookup(fd).is_none(), "Replace 清空 registry 句柄");
+    assert!(
+        rt.registry().lookup(fd).is_none(),
+        "Replace 清空 registry 句柄"
+    );
     let v = rt
         .run_blocking(syscall(
             DataOp::Open {
@@ -128,7 +131,10 @@ fn e2e_file_write_read_undo() {
                     vec![rd(fd2)],
                     move |_| {
                         syscall(
-                            DataOp::Read { fd: fd2, len: orig_len },
+                            DataOp::Read {
+                                fd: fd2,
+                                len: orig_len,
+                            },
                             vec![rd(fd2)],
                             Action::Pure,
                         )
