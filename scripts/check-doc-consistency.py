@@ -50,9 +50,12 @@ def main():
     for p in FILES:
         t = texts[p]
         for stale in (
-            "305 个测试函数", "305 测试全绿",
-            "297 二进制", "297 个二进制",
-            "44 个测试二进制", "41 个测试二进制",
+            "305 个测试函数",
+            "305 测试全绿",
+            "297 二进制",
+            "297 个二进制",
+            "44 个测试二进制",
+            "41 个测试二进制",
         ):
             check_absent(p, t, "测试计数", stale)
         # 新口径应存在（至少一处）
@@ -64,13 +67,17 @@ def main():
     for p in FILES:
         t = texts[p]
         if "RFC-10" in t and "已修复" not in t:
-            issues.append(f"[{p}] RFC-10 被提及但无「已修复」标记（历史轮次行除外，人工核对）")
+            issues.append(
+                f"[{p}] RFC-10 被提及但无「已修复」标记（历史轮次行除外，人工核对）"
+            )
 
     # ---- 3. RFC-11 状态：提及即须体现已修复 ----
     for p in FILES:
         t = texts[p]
         if "RFC-11" in t and "已修复" not in t and "已修" not in t:
-            issues.append(f"[{p}] RFC-11 被提及但无「已修复」标记（历史轮次行除外，人工核对）")
+            issues.append(
+                f"[{p}] RFC-11 被提及但无「已修复」标记（历史轮次行除外，人工核对）"
+            )
 
     # ---- 4. CI 三平台：提及 CI/三平台时不得出现少于三平台的表述 ----
     for p in FILES:
@@ -80,8 +87,10 @@ def main():
                 issues.append(f"[{p}] CI 平台表述出现「双平台/两平台」")
             # 若在 CI/三平台语境下枚举平台，必须含三平台（RFC 语境提及 windows 不算）
             ci_lines = [
-                l for l in t.splitlines()
-                if ("CI" in l or "三平台" in l) and ("ubuntu" in l or "windows" in l or "macos" in l)
+                l
+                for l in t.splitlines()
+                if ("CI" in l or "三平台" in l)
+                and ("ubuntu" in l or "windows" in l or "macos" in l)
             ]
             for l in ci_lines:
                 if not ("ubuntu" in l and "windows" in l and "macos" in l):
