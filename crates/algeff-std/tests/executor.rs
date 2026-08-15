@@ -301,10 +301,13 @@ async fn pipe_duplex() {
     assert_eq!(v, Value::Bytes(b"ping".to_vec()));
 }
 
-// ── g. 互斥锁互斥（并发 MutexLock 同一 id 串行化）─────────────────────
+// ── g. 互斥锁互斥（并发 MutexLock 同一 id：仲裁占坑 + 有限重试）─────────────
 
 #[tokio::test]
 async fn mutex_lock_exclusion() {
+    // 并发 MutexLock 同一 id：D16 接入后竞争失败方在有限重试（8×1ms）后返回
+    // WouldBlock，不再阻塞等待（A7：失败回滚 + 有限重试，绝不挂起）。
+    // 旧断言「第二把锁被阻塞」同步更新为「快速失败不挂死」。
     let ex = std::sync::Arc::new(tokio::sync::Mutex::new(TokioExecutor::new()));
     let mut reg = ResourceRegistry::new();
     let op = DataOp::MutexLock { id: 7 };
@@ -315,21 +318,104 @@ async fn mutex_lock_exclusion() {
     let mut reg2 = ResourceRegistry::new();
     let t = tokio::spawn(async move {
         let mut g = ex2.lock().await;
-        g.execute(&op, &mut reg2).await.unwrap()
+        g.execute(&DataOp::MutexLock { id: 7 }, &mut reg2).await
     });
 
-    // 给第二个任务到达阻塞点的机会；此时它必须仍被第一把锁阻塞。
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!t.is_finished(), "并发 MutexLock 应被第一把锁阻塞");
+    // 第一把锁仍持有 → 第二把必须在有限重试内返回 WouldBlock（不挂死）。
+    let res = tokio::time::timeout(Duration::from_secs(2), t)
+        .await
+        .expect("第二把锁挂死")
+        .unwrap();
+    match res {
+        Err(SysError::WouldBlock) => {} // 预期：竞争失败 → 有限重试后快速失败
+        Ok(_) => panic!("持锁期间竞争应 WouldBlock，却成功获取锁"),
+        Err(e) => panic!("持锁期间竞争应 WouldBlock，得到 {e:?}"),
+    }
 
-    // 释放第一把锁：执行 undo（等价解释器 recover 路径）→ 第二个任务获得锁并完成。
+    // 释放第一把锁：执行 undo（等价解释器 recover 路径）→ 重新获取成功。
     if let Some(u) = undo1 {
         u.await;
     }
-    let (_v2, _undo2) = tokio::time::timeout(Duration::from_secs(2), t)
+    let (_v2, _undo2) = ex.lock().await.execute(&op, &mut reg).await.unwrap();
+}
+
+// ── g2. 并发双任务：至多一个持有，不挂死（D16 接入验证）──────────────────
+
+#[tokio::test]
+async fn mutex_lock_arbiter_contention() {
+    // 两个并发 execute 同一 id（共享同一执行器 → 同一仲裁器与物理锁）：
+    // 仲裁器独占占坑 → 至多一个同时持有；竞争失败方有限重试后 WouldBlock，
+    // 两个任务都在超时内返回（不挂死）。释放成功方后失败方可重新获取。
+    let ex = std::sync::Arc::new(tokio::sync::Mutex::new(TokioExecutor::new()));
+    let ex_a = ex.clone();
+    let ex_b = ex.clone();
+    let (ra, rb) = tokio::join!(
+        async move {
+            let mut reg = ResourceRegistry::new();
+            let mut g = ex_a.lock().await;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                g.execute(&DataOp::MutexLock { id: 42 }, &mut reg),
+            )
+            .await
+            .expect("任务 A 挂死")
+        },
+        async move {
+            let mut reg = ResourceRegistry::new();
+            let mut g = ex_b.lock().await;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                g.execute(&DataOp::MutexLock { id: 42 }, &mut reg),
+            )
+            .await
+            .expect("任务 B 挂死")
+        },
+    );
+    let (undo_opt, a_ok, b_ok) = match (ra, rb) {
+        (Ok((_, u)), Err(SysError::WouldBlock)) => (u, true, false),
+        (Err(SysError::WouldBlock), Ok((_, u))) => (u, false, true),
+        (Ok(_), Ok(_)) => panic!("两个并发 MutexLock 都成功：独占占坑被破坏"),
+        _ => panic!("竞争失败方应返回 WouldBlock，而非其他错误/挂死"),
+    };
+    // 独占不变量：至多一个同时持有（恰好一个 Ok）。
+    assert!(a_ok ^ b_ok, "至多一个同时持有（A={a_ok} B={b_ok}）");
+    // 释放成功方的锁（undo 已同时释放 arbiter 占坑）→ 重新获取成功。
+    undo_opt.expect("MutexLock 应返回 undo").await;
+    let mut reg = ResourceRegistry::new();
+    let mut g = ex.lock().await;
+    let (_v, _u) = g
+        .execute(&DataOp::MutexLock { id: 42 }, &mut reg)
         .await
-        .expect("第二把锁等待超时")
+        .expect("释放后应能重新获取锁");
+}
+
+// ── g3. MutexUnlock 显式路径释放 arbiter 占坑（幂等）────────────────────
+
+#[tokio::test]
+async fn mutex_unlock_releases_arbiter() {
+    // lock → unlock → 再次 lock：MutexUnlock 同步释放 arbiter 占坑（幂等：
+    // 第二次 unlock / undo 已释放时是 no-op），claim 不泄漏 → 重新可锁。
+    let mut ex = TokioExecutor::new();
+    let mut reg = ResourceRegistry::new();
+    let op = DataOp::MutexLock { id: 3 };
+
+    let (_v1, undo1) = ex.execute(&op, &mut reg).await.unwrap();
+    // 显式 unlock（返回 None undo，但必须同步释放 arbiter 占坑）。
+    ex.execute(&DataOp::MutexUnlock { id: 3 }, &mut reg)
+        .await
         .unwrap();
+    // 再次 lock：若 unlock 未释放占坑 → try_claim 失败 → WouldBlock。
+    let (_v2, undo2) = ex.execute(&op, &mut reg).await.unwrap();
+    // 二次 unlock 幂等（释放 lock#2 重新建立的占坑）。
+    ex.execute(&DataOp::MutexUnlock { id: 3 }, &mut reg)
+        .await
+        .unwrap();
+    // undo1（recover 路径）此时全部 no-op：slot 已空 + release 幂等，
+    // 不得破坏 lock#2 已释放的状态。
+    undo1.expect("MutexLock 应返回 undo").await;
+    if let Some(u2) = undo2 {
+        u2.await;
+    }
 }
 
 // ── h. 子进程退出码 ────────────────────────────────────────────────────

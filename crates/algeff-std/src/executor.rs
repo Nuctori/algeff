@@ -25,10 +25,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use algeff_core::{
-    BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, ResourceHandle, ResourceRegistry, SysError,
-    SyscallExecutor, UndoOp, Value,
+    AccessMode, BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceArbiter,
+    ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoOp, Value,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -40,12 +41,16 @@ const FULL_UNDO_MAX_BYTES: u64 = 1024 * 1024;
 const PIPE_BUF_SIZE: usize = 64 * 1024;
 /// SIGKILL（tokio `Child::start_kill` 仅支持该信号，跨平台常量）。
 const SIGKILL: i32 = 9;
+/// 动态仲裁占坑有限重试上限（A7：失败回滚 + 有限重试，绝不阻塞等待）。
+const ARBITER_RETRY_LIMIT: usize = 8;
+/// 动态仲裁占坑重试退避间隔（固定 1ms，竞争窗口合计约 7ms）。
+const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 
 /// 持锁 guard 的停车位：undo（recover 路径）与显式 `MutexUnlock` 均可取走释放，幂等。
 type HeldLockSlot = Arc<tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>;
 
 /// 默认物理执行器（pdr.md §12.2）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TokioExecutor {
     /// 子进程 pid → 注册表 fd（Wait/Kill 经此定位；注册表 fd 随 take/allocate 轮换）。
     children: HashMap<u32, u64>,
@@ -53,6 +58,11 @@ pub struct TokioExecutor {
     mutexes: HashMap<u64, Arc<tokio::sync::Mutex<()>>>,
     /// 持锁 guard 停车位（undo 与显式 MutexUnlock 均可取走释放，幂等）。
     held_locks: HashMap<u64, HeldLockSlot>,
+    /// 动态资源仲裁（D16 / R-1 落地）：MutexLock id → `Resource::Fd(id)` 占坑表。
+    /// Arc 共享：undo 闭包（'static + Send）与显式 MutexUnlock 都需释放占坑；
+    /// tokio Mutex 保护跨任务访问（try_claim/release 为同步短临界区，无嵌套锁、
+    /// 无循环等待）。
+    arbiter: Arc<tokio::sync::Mutex<ResourceArbiter>>,
     /// 文件工作对象（registry 侧为 `try_clone` 簿记 token，共享同一 OS 描述）。
     files: HashMap<u64, Arc<tokio::sync::Mutex<tokio::fs::File>>>,
     /// TCP 流逻辑 fd → 当前注册表 fd。
@@ -61,6 +71,21 @@ pub struct TokioExecutor {
     pipe_reader_fds: HashMap<u64, u64>,
     /// 管道写端逻辑 fd → 当前注册表 fd。
     pipe_writer_fds: HashMap<u64, u64>,
+}
+
+impl Default for TokioExecutor {
+    fn default() -> Self {
+        Self {
+            children: HashMap::new(),
+            mutexes: HashMap::new(),
+            held_locks: HashMap::new(),
+            arbiter: Arc::new(tokio::sync::Mutex::new(ResourceArbiter::new())),
+            files: HashMap::new(),
+            stream_fds: HashMap::new(),
+            pipe_reader_fds: HashMap::new(),
+            pipe_writer_fds: HashMap::new(),
+        }
+    }
 }
 
 impl TokioExecutor {
@@ -858,6 +883,32 @@ impl TokioExecutor {
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
+        // 动态仲裁（D16 / R-1 落地）：MutexLock id 映射为 `Resource::Fd(id)` 独占占坑。
+        // 模式选 Write（互斥语义；Write 与 Own 在仲裁器同为独占，Write 表达
+        // 「共享互斥锁」而非「终结所有权」，见 spec/resource-notes.md §8）。
+        // 失败 → 有限重试（A7：失败回滚 + 有限重试，绝不阻塞等待，无循环等待链）
+        // → 超限返回 WouldBlock（调用方整体回滚）。
+        let claim_set = vec![ResourceUsage {
+            resource: Resource::Fd(id),
+            mode: AccessMode::Write,
+        }];
+        let arbiter = self.arbiter.clone();
+        let mut claimed = false;
+        for attempt in 0..ARBITER_RETRY_LIMIT {
+            if arbiter.lock().await.try_claim(&claim_set) {
+                claimed = true;
+                break;
+            }
+            if attempt + 1 < ARBITER_RETRY_LIMIT {
+                tokio::time::sleep(ARBITER_RETRY_BACKOFF).await;
+            }
+        }
+        if !claimed {
+            return Err(SysError::WouldBlock);
+        }
+        // 占坑成功 → 本仲裁域内无竞争者持有物理锁（不变量：占坑 ⟺ 持锁，见
+        // resource-notes §2），lock_owned 几乎立即获得；仍保留物理锁保证
+        // 跨仲裁域（如独立执行器实例）互斥。
         let guard = m.lock_owned().await;
         // 停车位：undo（recover 路径）与显式 MutexUnlock 均可取走释放（幂等）。
         let slot = self
@@ -868,9 +919,14 @@ impl TokioExecutor {
         *slot.lock().await = Some(guard);
         let undo_slot = slot.clone();
         let undo: UndoOp = Box::pin(async move {
+            // undo 顺序：先释放物理锁、再释放 arbiter 占坑。释放窗口内占坑仍持有，
+            // 新占坑者会失败重试，不会出现「新锁已持有期间被旧 undo 释放占坑」的窗口
+            // （保持 占坑 ⟺ 持锁 不变量）。
             if let Some(g) = undo_slot.lock().await.take() {
                 drop(g);
             }
+            // 幂等：release 对未占坑资源是 no-op（显式 MutexUnlock 已释放时安全）。
+            arbiter.lock().await.release(&claim_set);
         });
         Ok((Value::Unit, Some(undo)))
     }
@@ -882,6 +938,14 @@ impl TokioExecutor {
                 drop(g);
             }
         }
+        // 同步释放 arbiter 占坑（顺序与 undo 一致：先物理锁、后占坑）。
+        // 幂等：`release` 对未占坑资源是 no-op——第二次 unlock（或 undo 已释放）
+        // 不会重复释放，无需额外标志位（注释：核心契约 `release` 幂等性保证）。
+        let claim_set = vec![ResourceUsage {
+            resource: Resource::Fd(id),
+            mode: AccessMode::Write,
+        }];
+        self.arbiter.lock().await.release(&claim_set);
         Ok((Value::Unit, None))
     }
 
