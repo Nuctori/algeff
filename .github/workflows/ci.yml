@@ -54,8 +54,8 @@ jobs:
       # obligations）的 7 组事实（测试计数 352/46+3、对抗 E2E 164、RFC-10/11
       # 状态、CI 三平台、性能 canonical 103.1/366.2/570.9/39.1、深度守卫 96/
       # 105/97）不得漂移；GitHub runner 预装 Python，直接调用。
-      - name: python scripts/check-doc-consistency.py
-        run: python scripts/check-doc-consistency.py
+      - name: python3 scripts/check-doc-consistency.py
+        run: python3 scripts/check-doc-consistency.py
 
       # mdBook 构建：仅当 docs/book.toml 存在时执行。
       # 选 cargo install --locked 而非下载 release 二进制：
