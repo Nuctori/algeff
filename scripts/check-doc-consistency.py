@@ -61,7 +61,7 @@ def main():
         # 新口径应存在（至少一处）
         if any(s in t for s in ("测试函数", "测试全绿", "测试二进制")):
             if "352 个测试函数" not in t and "352 测试全绿" not in t:
-                issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「309」")
+                issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「352」")
 
     # ---- 2. RFC-10 状态：提及即须体现已修复 ----
     for p in FILES:
