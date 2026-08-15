@@ -351,11 +351,12 @@ impl ResourceRegistry {
     /// （与 A7 仲裁「失败回滚」同原则）——否则失败后同路径再以 Write 模式
     /// 重试会被 A4 误拒（`InvalidInput`，线性标记残留毒化）。
     ///
-    /// 前置条件：仅当 `check_linear` 对同一批 `resources` **全部返回 Ok** 之后
-    /// 调用。此时每个 Write/Own 标记都是本批新插入的（Write 至多一次、Own
-    /// 终结——重复插入会返回 Err 且不进入执行阶段），故恰好移除一个标记是
-    /// 安全的：不会误删早前成功 syscall 的消费记录。Read/Append 不插标记，
-    /// 无操作。成功路径行为不变（公理 A4：Write/Own 恰好消费一次）。
+    /// 前置条件：对传入切片内的**每个** usage，`check_linear` 均已返回 Ok
+    /// （即：全部成功——或批内部分失败时对成功前缀调用）。此时每个 Write/Own
+    /// 标记都是本批新插入的（Write 至多一次、Own 终结——重复插入会返回 Err 且
+    /// 不进入执行阶段），故恰好移除一个标记是安全的：不会误删早前成功 syscall
+    /// 的消费记录。Read/Append 不插标记，无操作。成功路径行为不变（公理 A4：
+    /// Write/Own 恰好消费一次）。
     pub fn rollback_linear(&mut self, resources: &[ResourceUsage]) {
         for u in resources {
             match u.mode {

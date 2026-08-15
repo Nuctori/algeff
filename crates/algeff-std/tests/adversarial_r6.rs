@@ -564,8 +564,9 @@ async fn xvol_rename_windows_maps_to_cross_device() {
 /// InvalidInput（线性标记残留 = 状态毒化）。r4b 的
 /// open_exclusive_existing_fails_no_state_poison 只验证了异路径重开（p2），
 /// 同路径盲区由本测试补齐。
-/// 修复方向：exec 失败回滚已插入的 Write/Own 标记（与 A7 仲裁「失败回滚」
-/// 同原则），修复后本断言应改为成功。
+/// 修复状态（RFC-12，6ded2db）：exec 失败路径已回滚本批预插入的 Write/Own
+/// 标记（与 A7 仲裁「失败回滚」同原则）——本测试现断言**修复后行为**（同路径
+/// 重开成功）。
 #[test]
 fn poison_failed_write_syscall_leaves_linear_mark() {
     let dir = tempfile::tempdir().unwrap();
