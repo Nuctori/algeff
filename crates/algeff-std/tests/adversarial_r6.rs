@@ -465,15 +465,27 @@ async fn chain_tcp_connect_refused_maps_connection_refused_not_sticky() {
     let mut reg = ResourceRegistry::new();
 
     // 绑临时端口后立即关闭 → 无监听 → RST → ECONNREFUSED（两平台一致）。
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let e = exec_err(&mut ex, &mut reg, &DataOp::TcpConnect { addr }).await;
-    assert_eq!(
-        e,
-        SysError::ConnectionRefused,
-        "连接被拒 → ConnectionRefused（跨平台一致）"
-    );
+    // 加固（R2 审计）：全量并行负载下刚释放的端口可能被其他测试进程
+    // 立即重用（Windows 快速重用），connect 偶发成功——重试至多 5 个端口。
+    let mut refused = false;
+    for _ in 0..5 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        match ex.execute(&DataOp::TcpConnect { addr }, &mut reg).await {
+            Err(SysError::ConnectionRefused) => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("意外错误：{e:?}"),
+            Ok((Value::Fd(fd), _)) => {
+                // 端口被重用（并行负载竞态）→ 关闭该 fd 后换端口重试
+                ex.execute(&DataOp::Close { fd }, &mut reg).await.unwrap();
+            }
+            Ok(_) => panic!("TcpConnect 意外返回值"),
+        }
+    }
+    assert!(refused, "5 个临时端口均未得到 ConnectionRefused（端口重用竞态持续）");
     assert!(reg.lookup(0).is_none(), "失败不分配句柄");
 
     // 不粘滞：连真实 listener 成功，fd 从 0 起（无流表残留）。

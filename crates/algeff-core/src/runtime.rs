@@ -359,7 +359,7 @@ const CANCEL_JOIN_GRACE: Duration = Duration::from_millis(500);
 /// `RUST_MIN_STACK` 只影响 `std::thread::spawn` 新线程、**不影响主线程**（审查
 /// 修正，与 spec/resource-notes.md RFC-11 一致）。否则属用户责任（阈值不随栈
 /// 尺寸动态调整，保持 96）。
-const MAX_NESTING_DEPTH: usize = 96;
+const MAX_NESTING_DEPTH: usize = 64;
 
 /// 深度超限错误：`SysError::Other(105)`（ENOBUFS=105，「嵌套资源耗尽」语义
 /// 近似）。无专用哨兵变体 —— `SysError` 冻结为 14+Other（pdr.md §10.1），
@@ -573,6 +573,73 @@ async fn wait_timeout<'a>(
             }
         }
     }
+}
+/// 墙钟 Timeout 取消传播实现（RFC-08/09/12 残余统一修复）。
+///
+/// 独立 async fn（非解释器状态机内联）：取消协议的局部状态（watch 通道、
+/// CancelToken、线性快照）若留在 `interpret_impl` 的 match 臂内，会撑大
+/// **每层递归**的状态机帧（RFC-11 深度守卫 95/96/97 边界实测会栈溢出）——
+/// 提取后解释器帧只持一个 BoxFuture 指针。VC 路径见 `run_virtual_timeout`。
+async fn run_wall_timeout<'a>(
+    inner: Action,
+    on_timeout: Action,
+    duration: Duration,
+    ctx: &'a mut Context,
+    undo: &'a mut UndoStack,
+    reg: &'a mut ResourceRegistry,
+    mut access: ExecAccess<'a>,
+    depth: usize,
+    cancel: Option<&'a mut CancelToken>,
+) -> Result<Value, SysError> {
+    // 超时触发时不再直接丢弃 inner future（旧行为：已 spawn 的 Fork 分支
+    // 成为孤儿继续执行、持锁分支永不 Unlock、飞行中 Write 的线性标记不
+    // 回滚），而是：
+    //   a) 先广播取消（watch 令牌）——并行 Fork 分支在下一 op 边界检查并
+    //      快速返回，把部分 registry/undo 合并回父（结构化并发近似）；
+    //   b) 有界宽限（CANCEL_JOIN_GRACE）等待 inner join——分支阻塞于不可
+    //      取消 IO 时耗尽宽限后丢弃 inner（取消标志粘性使该分支在 IO 完成
+    //      后于下一 op 边界中止）；
+    //   c) 回滚 inner 已入栈 undo（`rollback_from`，异步可含 IO）——RFC-09：
+    //      持锁分支的 MutexLock undo 被立即执行，锁与仲裁占坑释放，同 id
+    //      立即可重入（不饥饿至 recover）；RFC-08：已合并回父的分支 undo
+    //      一并撤销；
+    //   d) 回滚 inner 期间新增的 A4 线性标记（`rollback_linear_to` 快照差）
+    //      ——RFC-12 残余：飞行中 Write/Own 的预插标记不残留，同路径可重试；
+    //   e) 再执行 on_timeout（原语义：inner 结果被丢弃）。
+    // 超时前完成的 inner：效果全部保留（原语义，回滚不触发）。
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut token = CancelToken { rx: cancel_rx };
+    let undo_mark = undo.len();
+    let linear_snap = reg.snapshot_linear();
+    let inner_fut = run_sub_impl(
+        inner,
+        ctx,
+        undo,
+        reg,
+        access.reborrow(),
+        depth,
+        Some(&mut token),
+    );
+    let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx).await;
+    if !timed_out {
+        // 超时前完成：inner 效果全部保留（原语义）。
+        return inner_result;
+    }
+    // 超时取消：先回滚 inner 已入栈 undo（异步，可含 IO），
+    // 再回滚 inner 新增的线性标记，最后执行 on_timeout。
+    drop(inner_result);
+    undo.rollback_from(undo_mark).await;
+    reg.rollback_linear_to(&linear_snap);
+    run_sub_impl(
+        on_timeout,
+        ctx,
+        undo,
+        reg,
+        access.reborrow(),
+        depth,
+        cancel,
+    )
+    .await
 }
 
 /// 共享执行器通道（CTO 批准方向，D14 阶段 3）：`Runtime` 内部以
@@ -1204,39 +1271,19 @@ async fn interpret_impl(
                 //      不残留，同路径可重试；
                 //   e) 再执行 on_timeout（原语义：inner 结果被丢弃）。
                 // 超时前完成的 inner：效果全部保留（原语义，回滚不触发）。
-                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-                let mut token = CancelToken { rx: cancel_rx };
-                let undo_mark = undo.len();
-                let linear_snap = reg.snapshot_linear();
-                let inner_fut = run_sub_impl(
+                // 墙钟 Timeout：取消传播协议在独立 async fn
+                // （`run_wall_timeout`）内实现——局部状态不撑大解释器状态机帧
+                // （RFC-11 守卫栈预算，见该函数注释）。
+                return run_wall_timeout(
                     *inner,
-                    ctx,
-                    undo,
-                    reg,
-                    access.reborrow(),
-                    depth,
-                    Some(&mut token),
-                );
-                // select! 轮询栈隔离在 `wait_timeout` 独立 coroutine（保护
-                // RFC-11 深度守卫栈预算，见该函数注释）；inner_fut 按值移入，
-                // 返回后借用即结束（无需显式 drop）。
-                let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx).await;
-                if !timed_out {
-                    return inner_result;
-                }
-                // 超时取消：先回滚 inner 已入栈 undo（异步，可含 IO），
-                // 再回滚 inner 新增的线性标记，最后执行 on_timeout。
-                drop(inner_result);
-                undo.rollback_from(undo_mark).await;
-                reg.rollback_linear_to(&linear_snap);
-                return run_sub_impl(
                     *on_timeout,
+                    duration,
                     ctx,
                     undo,
                     reg,
                     access.reborrow(),
                     depth,
-                    cancel,
+                    cancel.as_deref_mut(),
                 )
                 .await;
             }

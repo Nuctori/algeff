@@ -124,6 +124,11 @@ async fn dup2_degrades_to_close_then_dup() {
     );
     assert!(got > old_fd, "新 fd 单调递增");
 
+    // 降级后的 dup 语义仍成立：新 fd 与 old_fd 共享同一工作对象（读回同内容）。
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: got, len: 12 }, &mut reg)
+        .await
+        .unwrap();
     assert_eq!(v, Value::Bytes(b"dup2-payload".to_vec()));
 }
 
@@ -517,11 +522,16 @@ async fn mutex_unlock_releases_arbiter() {
 
 // ── g4. Timeout 取消不毒化 MutexLock id（R-1 MEDIUM 批 8：claim 取消泄漏修复）──
 // 蓝图：Timeout{ Sequential{ MutexLock(id) → Sleep(200ms) 慢操作 }, 20ms, on_timeout }。
-// Sleep 使内层 future 在到期时仍 pending → Elapsed → runtime 丢弃内层 future
-// （runtime.rs Timeout 语义）→ 走 on_timeout。取消后撤销栈仍保留 MutexLock 的
-// undo（占坑是「待 recover 释放」而非「泄漏」）；recover（Replace 触发，D10）
-// 后同一 executor 再次 MutexLock 同 id 必须成功（非永久 WouldBlock）。
+//
+// 语义分叉（审计 R2 适配）：
+// - 墙钟（无 virtual-clock）：Sleep 真实 200ms → 20ms 超时触发 → rfc0809 取消传播
+//   回滚 MutexLock undo → 锁立即释放，同 id 可重入（RFC-09 目标）；
+// - virtual-clock：Sleep 瞬时完成（虚拟推进 10s…本蓝图 200ms → 虚拟 200ms ≥ 20ms
+//   → 虚拟通道判定超时），但 run_virtual_timeout 为 post-check 语义（inner 完整执行、
+//   效果保留、无取消）→ 锁保留，probe WouldBlock，recover 后释放。
 
+/// 墙钟语义：取消传播回滚 undo → 锁立即释放。
+#[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn mutex_claim_released_on_timeout_cancel() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
@@ -547,20 +557,20 @@ fn mutex_claim_released_on_timeout_cancel() {
         duration: Duration::from_millis(20),
         on_timeout: Box::new(Action::Pure(Value::Unit)),
     };
-    // 执行蓝图：20ms 后 Elapsed，内层 future（已完成的 MutexLock + pending 的
-    // Sleep）被丢弃，on_timeout 生效并返回。
+    // 执行蓝图：20ms 后 Elapsed → 取消传播（rfc0809）：回滚 inner 已入栈 undo
+    // （MutexLock 的释放 undo 被立即执行）→ 锁与仲裁占坑释放，on_timeout 生效。
     assert_eq!(rt.run_blocking(blueprint).unwrap(), Value::Unit);
-    // 取消语义：内层完成的 undo 保留在撤销栈（占坑待 recover 释放，而非泄漏）。
-    // 此刻再次 MutexLock 同 id → 占坑仍在 → 有限重试后 WouldBlock（不挂死）。
+    // 新语义（rfc0809 取消传播）：取消即回滚——占坑已释放，同 id 立即可重入
+    // （旧语义「占坑待 recover 释放」已被取消协议取代）。
     let probe = Action::Syscall {
         op: DataOp::MutexLock { id },
         resources: Vec::new(),
         next: Box::new(|_| Action::Pure(Value::Unit)),
     };
     assert_eq!(
-        rt.run_blocking(probe).unwrap_err(),
-        SysError::WouldBlock,
-        "取消后、recover 前占坑应仍持有（undo 栈保留释放职责）"
+        rt.run_blocking(probe).unwrap(),
+        Value::Unit,
+        "取消传播：超时回滚 undo → 锁立即释放，同 id 可重入（RFC-09 目标）"
     );
     // recover（Replace：先 recover 后执行 target，D10）→ undo 释放占坑与物理锁。
     assert_eq!(
@@ -571,6 +581,62 @@ fn mutex_claim_released_on_timeout_cancel() {
         Value::Unit
     );
     // 同一 executor 再次 MutexLock 同 id：占坑已释放 → 成功（非永久 WouldBlock）。
+    let again = Action::Syscall {
+        op: DataOp::MutexLock { id },
+        resources: claim,
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    assert_eq!(rt.run_blocking(again).unwrap(), Value::Unit);
+}
+
+/// virtual-clock 语义：post-check 无取消——inner 效果保留（锁保留），probe
+/// WouldBlock；recover（Replace）后释放 → 同 id 可重入（非永久毒化）。
+#[cfg(feature = "virtual-clock")]
+#[test]
+fn mutex_claim_kept_on_virtual_timeout_cancel() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let id = 77u64;
+    let claim = vec![ResourceUsage {
+        resource: Resource::Fd(id),
+        mode: AccessMode::Write,
+    }];
+    let inner = Action::Sequential {
+        current: Box::new(Action::Syscall {
+            op: DataOp::MutexLock { id },
+            resources: claim.clone(),
+            next: Box::new(move |_| Action::Sleep {
+                duration: Duration::from_millis(200),
+                next: Box::new(|_| Action::Pure(Value::Unit)),
+            }),
+        }),
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    let blueprint = Action::Timeout {
+        action: Box::new(inner),
+        duration: Duration::from_millis(20),
+        on_timeout: Box::new(Action::Pure(Value::Unit)),
+    };
+    // VC：Sleep 瞬时（虚拟 200ms ≥ 20ms → 虚拟通道判定超时，post-check 语义）。
+    assert_eq!(rt.run_blocking(blueprint).unwrap(), Value::Unit);
+    // inner 效果保留（无取消）：锁仍持有 → 同 id Lock WouldBlock。
+    let probe = Action::Syscall {
+        op: DataOp::MutexLock { id },
+        resources: Vec::new(),
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    };
+    assert_eq!(
+        rt.run_blocking(probe).unwrap_err(),
+        SysError::WouldBlock,
+        "VC post-check：inner 效果保留，锁未释放（与墙钟取消传播语义分叉）"
+    );
+    // recover 释放锁 → 同 id 可重入（非永久毒化）。
+    assert_eq!(
+        rt.run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap(),
+        Value::Unit
+    );
     let again = Action::Syscall {
         op: DataOp::MutexLock { id },
         resources: claim,

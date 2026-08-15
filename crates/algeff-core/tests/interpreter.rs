@@ -1690,16 +1690,16 @@ fn nested_seq_chain(depth: u64) -> Action {
     }
 }
 
-/// RFC-11 a：安全深度 64 正常执行（与 R4c 固定安全深度一致，远低于守卫阈值
-/// 96 与实测崩溃边界 ~104）——守卫不误伤合法嵌套。
+/// RFC-11 a：安全深度 62 正常执行（迭代 1 复测裁决：取消传播帧膨胀后实测
+/// 80 OK / 88 崩，阈值由 96 降为 64——64 层本身触发守卫）——守卫不误伤合法嵌套。
 #[test]
 fn deep_nesting_under_limit_ok() {
     let mut rt = Runtime::new(Box::new(MockExecutor::new()));
-    let v = rt.run_blocking(nested_seq_chain(64));
+    let v = rt.run_blocking(nested_seq_chain(62));
     assert_eq!(
         v,
         Ok(Value::U64(300)),
-        "64 层嵌套应在守卫阈值（96）之下正常执行，收到 {v:?}"
+        "62 层嵌套应在守卫阈值（64）之下正常执行，收到 {v:?}"
     );
     assert!(rt.undo_stack().is_empty());
 }

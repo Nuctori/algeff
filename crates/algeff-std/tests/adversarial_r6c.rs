@@ -226,28 +226,28 @@ fn fork_same_file_conflict_serializes_deterministic() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn depth_guard_seq_96_ok_97_err() {
+fn depth_guard_seq_64_ok_65_err() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
     // 左结合链 = adapters::seq 折叠（README「深度守卫」指定的构造）：
     // N 个元素 → N-1 层 Sequential 嵌套 → 首个元素（叶子）进入解释器
-    // 深度 N-1。守卫在递归入口检查 depth ≥ 96 → Err(SysError::Other(105))
-    // （ENOBUFS=105 语义）。故 96 元素 = 叶子深度 95 → OK；97 元素 = 叶子
-    // 深度 96 → Err。注意：边界数值依赖构造方式（"步"= seq 元素数），
-    // 手工左嵌套 96 层 Sequential 会在叶子深度 96 处触发（计数口径不同）。
-    let steps_96: Vec<Action> = (0..96).map(|_| gettime_step()).collect();
+    // 深度 N-1。守卫在递归入口检查 depth ≥ 64（迭代 1 复测裁决：取消传播
+    // 帧膨胀后阈值由 96 降为 64）→ Err(SysError::Other(105))
+    // （ENOBUFS=105 语义）。故 64 元素 = 叶子深度 63 → OK；65 元素 = 叶子
+    // 深度 64 → Err。注意：边界数值依赖构造方式（"步"= seq 元素数）。
+    let steps_64: Vec<Action> = (0..64).map(|_| gettime_step()).collect();
     assert_eq!(
-        rt.run_blocking(adapters::seq(steps_96)).unwrap(),
+        rt.run_blocking(adapters::seq(steps_64)).unwrap(),
         Value::Unit,
-        "96 步左结合链应正常完成（叶子深度 95 < 96）"
+        "64 步左结合链应正常完成（叶子深度 63 < 64）"
     );
 
-    let steps_97: Vec<Action> = (0..97).map(|_| gettime_step()).collect();
-    let e = rt.run_blocking(adapters::seq(steps_97)).unwrap_err();
+    let steps_65: Vec<Action> = (0..65).map(|_| gettime_step()).collect();
+    let e = rt.run_blocking(adapters::seq(steps_65)).unwrap_err();
     assert_eq!(
         e,
         SysError::Other(105),
-        "97 步左结合链应触发深度守卫 Other(105)"
+        "65 步左结合链应触发深度守卫 Other(105)"
     );
 
     // 守卫在副作用发生前触发：任何一步 GetTime 都未执行 → 撤销栈为空。

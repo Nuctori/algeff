@@ -1450,13 +1450,10 @@ fn time_timeout_inner_parallel_fork_completes() {
     }
 }
 
-/// 【已知缺陷记录 RFC-05 先例式】Timeout 内并行 Fork 超时后：spawn_blocking
-/// 分支成为孤儿任务继续执行（tokio::time::timeout 只 drop fork future，不取消
-/// 已 spawn 的分支），其副作用（Open 创建文件）不可撤销（undo 栈空、
-/// Replace 无法恢复）、句柄泄漏。记录行为，不修复（语义上 Timeout 对
-/// 并行分支无取消保证，pdr §2.1 未声明；修复需分支取消机制，超范围）。
-/// 注：R2 修正了构造错误——孤儿 Open 此前用 read-only flags（文件不存在 →
-/// NotFound，副作用不发生）；现改为 create 能力使缺陷场景真实复现。
+/// 【RFC-08 修复后断言翻转（迭代 1 取消传播协议）】Timeout 内并行 Fork
+/// 超时后：取消广播（watch 令牌）→ 孤儿分支在下一 op 边界中止 → Open
+/// 副作用不再发生（修复前：spawn_blocking 分支成为孤儿继续执行、副作用
+/// 不可撤销、句柄泄漏）。
 #[test]
 fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
@@ -1464,7 +1461,7 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
     let pb = dir.path().join("orphan-b.txt");
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 左分支 Sleep(400ms) 后 Open —— 超时（100ms）后分支继续在后台执行。
+    // 左分支 Sleep(400ms) 后 Open —— 超时（100ms）后分支应响应取消中止。
     let pa_in = pa.clone();
     let v = rt
         .run_blocking(Action::Timeout {
@@ -1496,15 +1493,18 @@ fn time_timeout_parallel_fork_orphan_effects_unrecoverable() {
         .unwrap();
     assert_eq!(v, Value::U64(42), "Timeout 触发");
 
-    // 等待孤儿分支完成：其 Open 真实执行（文件被创建）—— 效果不可撤销。
+    // 等待原孤儿窗口：取消传播后分支在 Sleep 后下一 op 边界中止，
+    // Open 不执行 → 文件不被创建（修复前被创建）。
     std::thread::sleep(Duration::from_millis(900));
-    assert!(pa.exists(), "孤儿分支的 Open 副作用发生（文件被创建）");
-    assert!(rt.undo_stack().is_empty(), "孤儿效果未入撤销栈");
+    assert!(
+        !pa.exists(),
+        "RFC-08 修复后：孤儿分支响应取消，Open 副作用不发生（文件未被创建）"
+    );
+    assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo");
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert!(pa.exists(), "Replace 无法撤销孤儿分支的副作用（记录）");
 
     // 父级继续执行不受影响（孤儿 fd 未并入父 registry，父 next_fd 未抬高）。
     std::fs::write(&pb, b"BBB").unwrap();

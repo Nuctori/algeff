@@ -144,9 +144,11 @@ fn nested_seq(depth: u64) -> Action {
 }
 
 #[test]
-fn nested_sequential_64_deep_recursive_frames_values_flow() {
+fn nested_sequential_62_deep_recursive_frames_values_flow() {
     let mut rt = Runtime::new(Box::new(NoopExecutor));
-    let v = rt.run_blocking(nested_seq(64)).unwrap();
+    // 62 层 = 阈值 64 的下沿余量（迭代 1 复测裁决：取消传播帧膨胀后
+    // 实测 80 OK / 88 崩，阈值由 96 降为 64——64 层本身触发守卫）。
+    let v = rt.run_blocking(nested_seq(62)).unwrap();
     assert_eq!(
         v,
         Value::U64(300),

@@ -423,33 +423,33 @@ fn fix_five_point_regression_single_blueprint() {
 // 攻击面 2：守卫边界 × 组合（纯 95/96/97 边界在 core 侧）
 // ══════════════════════════════════════════════════════════════════════
 
-/// 守卫 × Catch/Timeout 组合：
-/// - 深度 96 内嵌 Catch → 守卫错误（Other(105)）被捕获（拒绝服务面转可恢复）；
-/// - 深度 90 + Timeout → 在超时窗口内正常完成（守卫不误伤、Timeout 不误触发）；
+/// 守卫 × Catch/Timeout 组合（迭代 1 阈值 64 复测裁决后数值更新）：
+/// - 深度 64 内嵌 Catch → 守卫错误（Other(105)）被捕获（拒绝服务面转可恢复）；
+/// - 深度 58 + Timeout → 在超时窗口内正常完成（守卫不误伤、Timeout 不误触发）；
 /// - 超深蓝图外包 Timeout+Catch → 守卫错误经 Timeout 原样透传（Timeout 只拦截
 ///   Elapsed，不吞错误）并可被外层 Catch 捕获。
 #[test]
-fn guard_depth96_catch_catchable_depth90_timeout_ok() {
+fn guard_depth64_catch_catchable_depth58_timeout_ok() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
-    // 深度 96 内嵌 Catch → 可捕获。
+    // 深度 64 内嵌 Catch → 可捕获。
     let v = rt
         .run_blocking(Action::Catch {
-            action: Box::new(nested_seq(96)),
+            action: Box::new(nested_seq(64)),
             handler: Box::new(|e| Action::Pure(Value::Str(format!("caught:{e}")))),
         })
         .unwrap();
     assert_eq!(
         v,
         Value::Str("caught:Other(105)".to_string()),
-        "深度 96 的守卫错误应被 Catch 捕获并执行 handler"
+        "深度 64 的守卫错误应被 Catch 捕获并执行 handler"
     );
     assert!(rt.undo_stack().is_empty(), "守卫错误不残留 undo");
 
-    // 深度 90 + Timeout 组合：正常完成（5s 窗口远大于执行时间）。
+    // 深度 58 + Timeout 组合：正常完成（5s 窗口远大于执行时间）。
     let v = rt
         .run_blocking(Action::Timeout {
-            action: Box::new(nested_seq(90)),
+            action: Box::new(nested_seq(58)),
             duration: Duration::from_secs(5),
             on_timeout: Box::new(Action::Pure(Value::U64(999))),
         })
@@ -457,14 +457,14 @@ fn guard_depth96_catch_catchable_depth90_timeout_ok() {
     assert_eq!(
         v,
         Value::U64(300),
-        "深度 90 在 Timeout 内正常完成（未误触守卫/超时）"
+        "深度 58 在 Timeout 内正常完成（未误触守卫/超时）"
     );
 
     // 守卫错误经 Timeout 原样透传（Timeout 对 Err 不转换），外层 Catch 可捕获。
     let v = rt
         .run_blocking(Action::Catch {
             action: Box::new(Action::Timeout {
-                action: Box::new(nested_seq(96)),
+                action: Box::new(nested_seq(64)),
                 duration: Duration::from_secs(5),
                 on_timeout: Box::new(Action::Pure(Value::U64(999))),
             }),
