@@ -433,7 +433,8 @@ impl ResourceRegistry {
     /// 丢弃/中断后不再有逐批上下文）。
     pub fn rollback_linear_to(&mut self, snap: &LinearSnapshot) {
         self.consumed.retain(|r| snap.consumed.contains(r));
-        self.owned_consumed.retain(|r| snap.owned_consumed.contains(r));
+        self.owned_consumed
+            .retain(|r| snap.owned_consumed.contains(r));
     }
 
     /// 公理 A3 / 冲突矩阵（pdr.md §9.1）。保守默认：Append∥Append 视为不可并行

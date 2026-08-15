@@ -659,11 +659,7 @@ fn lin_stale_fd_read_close_fail_after_replace() {
     );
     // 旧 fd Close → NotFound（修复前经 executor 内部映射 remove 会成功）
     let e = rt
-        .run_blocking(syscall(
-            DataOp::Close { fd },
-            vec![ow(fd)],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
         .unwrap_err();
     assert_eq!(
         e,

@@ -345,7 +345,11 @@ fn fix_five_point_regression_single_blueprint() {
             Action::Pure,
         ))
         .unwrap_err();
-    assert_eq!(e, SysError::NotFound, "阶段1：Replace 后旧 fd 失效（NotFound）");
+    assert_eq!(
+        e,
+        SysError::NotFound,
+        "阶段1：Replace 后旧 fd 失效（NotFound）"
+    );
     let v = rt
         .run_blocking(syscall(
             DataOp::Open {

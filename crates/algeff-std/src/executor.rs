@@ -35,11 +35,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use algeff_core::runtime::MAX_IO_LEN;
 use algeff_core::{
     AccessMode, BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceArbiter,
     ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoOp, Value,
 };
-use algeff_core::runtime::MAX_IO_LEN;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Child;
@@ -189,40 +189,49 @@ impl Drop for ArbiterClaimGuard {
 }
 
 /// 默认物理执行器（pdr.md §12.2）。
+///
+/// ## R-6 锁边界重构（阶段 3 并行兑现）
+/// 全部内部状态表改为 `Arc<std::sync::Mutex<HashMap>>`（短临界区，无 await 内
+/// 持锁）：`fork_snapshot`（syscall.rs 新增默认方法）克隆这些 Arc 得到**状态共享
+/// 的独立执行器实例**，Fork 并行分支各自独占驱动（&mut 无竞争）→ 物理 IO 移出
+/// 共享锁外、跨分支真并行；同一 fd 的物理 IO 仍在共享 per-fd `Arc<Mutex<File>>`
+/// 上串行（游标语义不变），互斥锁/仲裁器/句柄映射跨分支一致（与 D17 共享执行器
+/// 等价）。映射锁全部为同步短临界区（clone Arc / 查表 / 插入），绝不在持锁期间
+/// await（与 arbiter 的 A5 批 9 同理由）；`expect`：临界区无 panic 源，中毒不可达。
 #[derive(Debug)]
 pub struct TokioExecutor {
     /// 子进程 pid → 注册表 fd（Wait/Kill 经此定位；注册表 fd 随 take/allocate 轮换）。
-    children: HashMap<u32, u64>,
+    children: Arc<std::sync::Mutex<HashMap<u32, u64>>>,
     /// 互斥锁 id → 原语（MutexLock/MutexUnlock，executor 内部映射）。
-    mutexes: HashMap<u64, Arc<tokio::sync::Mutex<()>>>,
+    mutexes: Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
     /// 持锁 guard 停车位（undo 与显式 MutexUnlock 均可取走释放，幂等）。
-    held_locks: HashMap<u64, HeldLockSlot>,
+    held_locks: Arc<std::sync::Mutex<HashMap<u64, HeldLockSlot>>>,
     /// 动态资源仲裁（D16 / R-1 落地）：MutexLock id → `Resource::Fd(id)` 占坑表。
     /// Arc 共享：undo 闭包（'static + Send）与显式 MutexUnlock 都需释放占坑；
     /// std Mutex 保护跨任务访问（A5 批 9：try_claim/release 为同步短临界区，
     /// 无 await、无嵌套锁、无循环等待；Drop 内同步 lock 安全）。
     arbiter: Arc<std::sync::Mutex<ResourceArbiter>>,
     /// 文件工作对象（registry 侧为 `try_clone` 簿记 token，共享同一 OS 描述）。
-    files: HashMap<u64, Arc<tokio::sync::Mutex<tokio::fs::File>>>,
+    files: Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<tokio::fs::File>>>>>,
     /// TCP 流逻辑 fd → 当前注册表 fd。
-    stream_fds: HashMap<u64, u64>,
+    stream_fds: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
     /// 管道读端逻辑 fd → 当前注册表 fd。
-    pipe_reader_fds: HashMap<u64, u64>,
+    pipe_reader_fds: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
     /// 管道写端逻辑 fd → 当前注册表 fd。
-    pipe_writer_fds: HashMap<u64, u64>,
+    pipe_writer_fds: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
 }
 
 impl Default for TokioExecutor {
     fn default() -> Self {
         Self {
-            children: HashMap::new(),
-            mutexes: HashMap::new(),
-            held_locks: HashMap::new(),
+            children: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mutexes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            held_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             arbiter: Arc::new(std::sync::Mutex::new(ResourceArbiter::new())),
-            files: HashMap::new(),
-            stream_fds: HashMap::new(),
-            pipe_reader_fds: HashMap::new(),
-            pipe_writer_fds: HashMap::new(),
+            files: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stream_fds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pipe_reader_fds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pipe_writer_fds: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -233,12 +242,31 @@ impl TokioExecutor {
     }
 
     /// 逻辑 fd → 当前注册表 fd（仅对 take/get_mut 轮换型句柄）。
+    /// 三个映射逐一持锁（每个临界区单映射、无嵌套，防锁序死锁）。
     fn translated_fd(&self, fd: u64) -> Option<u64> {
-        self.stream_fds
+        if let Some(v) = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .get(&fd)
             .copied()
-            .or_else(|| self.pipe_reader_fds.get(&fd).copied())
-            .or_else(|| self.pipe_writer_fds.get(&fd).copied())
+        {
+            return Some(v);
+        }
+        if let Some(v) = self
+            .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .copied()
+        {
+            return Some(v);
+        }
+        self.pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .copied()
     }
 
     /// RFC-05 修复（fd 活性）：文件工作对象缓存（`self.files`）是否已失效。
@@ -250,17 +278,36 @@ impl TokioExecutor {
     /// 克隆（D13），分支级 Replace 后另一分支的同 fd 仍须可用——按本分支 registry
     /// 删共享条目会破坏隔离。
     fn file_fd_stale(&self, fd: u64, reg: &ResourceRegistry) -> bool {
-        self.files.contains_key(&fd) && reg.lookup(fd).is_none()
+        self.files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd)
+            && reg.lookup(fd).is_none()
     }
 
     /// 轮换型句柄操作后放回：注册表分配新 fd（D1 单调），更新逻辑映射。
     fn put_back(&mut self, fd: u64, handle: ResourceHandle, reg: &mut ResourceRegistry) {
         let new_fd = reg.allocate(handle);
-        if let Some(v) = self.stream_fds.get_mut(&fd) {
+        if let Some(v) = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get_mut(&fd)
+        {
             *v = new_fd;
-        } else if let Some(v) = self.pipe_reader_fds.get_mut(&fd) {
+        } else if let Some(v) = self
+            .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get_mut(&fd)
+        {
             *v = new_fd;
-        } else if let Some(v) = self.pipe_writer_fds.get_mut(&fd) {
+        } else if let Some(v) = self
+            .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get_mut(&fd)
+        {
             *v = new_fd;
         }
     }
@@ -268,7 +315,10 @@ impl TokioExecutor {
     /// 把 Child 句柄放回注册表（轮换后更新 pid 映射）。
     fn put_child_back(&mut self, pid: u32, arc: Arc<Child>, reg: &mut ResourceRegistry) {
         let fd = reg.allocate(ResourceHandle::Child(arc));
-        self.children.insert(pid, fd);
+        self.children
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(pid, fd);
     }
 
     /// 取走管道读端句柄并做类型转换；类型不符时恢复注册表条目与内部映射
@@ -280,6 +330,8 @@ impl TokioExecutor {
     ) -> Result<Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>, SysError> {
         let cur = self
             .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .get(&fd)
             .copied()
             .ok_or(SysError::NotFound)?;
@@ -300,6 +352,8 @@ impl TokioExecutor {
     ) -> Result<Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>, SysError> {
         let cur = self
             .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .get(&fd)
             .copied()
             .ok_or(SysError::NotFound)?;
@@ -320,6 +374,8 @@ impl TokioExecutor {
     ) -> Result<Arc<TcpStream>, SysError> {
         let cur = self
             .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .get(&fd)
             .copied()
             .ok_or(SysError::NotFound)?;
@@ -352,6 +408,8 @@ impl TokioExecutor {
         let token = file.try_clone().await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::File(Arc::new(token)));
         self.files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
         // undo=None：物理关闭由 Arc Drop 保证；旧 fd 失效由 RFC-05 修复兜底
         // （registry 活性校验，见 file_fd_stale）。
@@ -368,7 +426,14 @@ impl TokioExecutor {
         if self.file_fd_stale(fd, reg) {
             return Err(SysError::NotFound);
         }
-        if let Some(m) = self.files.get(&fd) {
+        // 锁内查表（短临界区）：克隆 Arc 后锁即释放，物理 IO 在 per-fd 锁上进行。
+        let file = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .cloned();
+        if let Some(m) = file {
             let mut g = m.lock().await;
             if len > MAX_IO_LEN {
                 return Err(SysError::InvalidInput);
@@ -378,7 +443,12 @@ impl TokioExecutor {
             buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
         }
-        if self.pipe_reader_fds.contains_key(&fd) {
+        let is_pipe_reader = self
+            .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if is_pipe_reader {
             // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
             // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
             if len > MAX_IO_LEN {
@@ -418,7 +488,13 @@ impl TokioExecutor {
             return Err(SysError::NotFound);
         }
         // 文件：Full 撤销（<1MB 写前读原内容）或 BestEffort（大文件，undo=None）。
-        if let Some(m) = self.files.get(&fd) {
+        let file = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .cloned();
+        if let Some(m) = file {
             let mut g = m.lock().await;
             let file = &mut *g;
             let pos = file
@@ -494,7 +570,12 @@ impl TokioExecutor {
             return Ok((Value::Unit, undo));
         }
         // 管道写端（轮换型；错误路径恢复句柄，blocker-3）。
-        if self.pipe_writer_fds.contains_key(&fd) {
+        let is_pipe_writer = self
+            .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if is_pipe_writer {
             let mut arc = self.take_pipe_writer(fd, reg)?;
             let r = {
                 let wh = match Arc::get_mut(&mut arc) {
@@ -511,7 +592,12 @@ impl TokioExecutor {
             return Ok((Value::Unit, None));
         }
         // TCP 流（Write 对流的复用，轮换型；错误路径恢复句柄，blocker-3）。
-        if self.stream_fds.contains_key(&fd) {
+        let is_stream = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if is_stream {
             let mut arc = self.take_tcp_stream(fd, reg)?;
             let r = {
                 let s = match Arc::get_mut(&mut arc) {
@@ -541,7 +627,13 @@ impl TokioExecutor {
         if self.file_fd_stale(fd, reg) {
             return Err(SysError::NotFound);
         }
-        let m = self.files.get(&fd).ok_or(SysError::NotFound)?;
+        let m = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .cloned()
+            .ok_or(SysError::NotFound)?;
         let mut g = m.lock().await;
         // DataOp 冗余双字段：whence 决定基准，offset 为位移（以 offset 为准）。
         let sf = match whence {
@@ -741,7 +833,10 @@ impl TokioExecutor {
             _ => return Err(SysError::InvalidInput),
         };
         let fd = reg.allocate(ResourceHandle::TcpStream(Arc::new(stream)));
-        self.stream_fds.insert(fd, fd);
+        self.stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(fd, fd);
         Ok((Value::List(vec![Value::Fd(fd), Value::Addr(peer)]), None))
     }
 
@@ -752,7 +847,10 @@ impl TokioExecutor {
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let stream = TcpStream::connect(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpStream(Arc::new(stream)));
-        self.stream_fds.insert(fd, fd);
+        self.stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(fd, fd);
         Ok((Value::Fd(fd), None))
     }
 
@@ -925,8 +1023,14 @@ impl TokioExecutor {
         let (_rb, wb) = tokio::io::split(b);
         let rfd = reg.allocate(ResourceHandle::PipeReader(Arc::new(ra)));
         let wfd = reg.allocate(ResourceHandle::PipeWriter(Arc::new(wb)));
-        self.pipe_reader_fds.insert(rfd, rfd);
-        self.pipe_writer_fds.insert(wfd, wfd);
+        self.pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(rfd, rfd);
+        self.pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(wfd, wfd);
         Ok((Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]), None))
     }
 
@@ -958,7 +1062,10 @@ impl TokioExecutor {
         let child = tc.spawn().map_err(to_sys_err)?;
         let pid = child.id().ok_or(SysError::InvalidInput)?;
         let fd = reg.allocate(ResourceHandle::Child(Arc::new(child)));
-        self.children.insert(pid, fd);
+        self.children
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .insert(pid, fd);
         Ok((Value::Pid(pid), None))
     }
 
@@ -967,13 +1074,22 @@ impl TokioExecutor {
         pid: u32,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let fd = self.children.get(&pid).copied().ok_or(SysError::NotFound)?;
+        let fd = self
+            .children
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&pid)
+            .copied()
+            .ok_or(SysError::NotFound)?;
         let mut arc = match reg.take(fd).ok_or(SysError::NotFound)? {
             ResourceHandle::Child(a) => a,
             h => {
                 // 类型不符：恢复注册表条目与 pid 映射（blocker-3）。
                 let new_fd = reg.allocate(h);
-                self.children.insert(pid, new_fd);
+                self.children
+                    .lock()
+                    .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                    .insert(pid, new_fd);
                 return Err(SysError::InvalidInput);
             }
         };
@@ -996,7 +1112,10 @@ impl TokioExecutor {
                 return Err(to_sys_err(e));
             }
         };
-        self.children.remove(&pid);
+        self.children
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .remove(&pid);
         // 信号终止时无退出码 → 1（Unix 惯例 128+signal 留作注释）。
         let code = status.code().unwrap_or(1) as u64;
         Ok((Value::U64(code), None))
@@ -1008,13 +1127,22 @@ impl TokioExecutor {
         signal: i32,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let fd = self.children.get(&pid).copied().ok_or(SysError::NotFound)?;
+        let fd = self
+            .children
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&pid)
+            .copied()
+            .ok_or(SysError::NotFound)?;
         let mut arc = match reg.take(fd).ok_or(SysError::NotFound)? {
             ResourceHandle::Child(a) => a,
             h => {
                 // 类型不符：恢复注册表条目与 pid 映射（blocker-3，与 op_wait 一致）。
                 let new_fd = reg.allocate(h);
-                self.children.insert(pid, new_fd);
+                self.children
+                    .lock()
+                    .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                    .insert(pid, new_fd);
                 return Err(SysError::InvalidInput);
             }
         };
@@ -1045,7 +1173,13 @@ impl TokioExecutor {
         pid: u32,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        if signal == SIGKILL && self.children.contains_key(&pid) {
+        if signal == SIGKILL
+            && self
+                .children
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .contains_key(&pid)
+        {
             // 自有子进程：走 start_kill（等价 SIGKILL）。
             return self.op_kill(pid, signal, reg).await;
         }
@@ -1063,9 +1197,9 @@ impl TokioExecutor {
         prot: &MmapProt,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
-        // 审计 R2-F3 修复：读入前校验文件大小上限（tokio::fs::read 按文件全量
-        // 读入——蓝图对宿主大文件 Mmap 即触发与文件等大的分配，debug 下分配
-        // 失败 = 进程级 abort，与 R7-⑤ 修前同族拒绝服务面）。
+                      // 审计 R2-F3 修复：读入前校验文件大小上限（tokio::fs::read 按文件全量
+                      // 读入——蓝图对宿主大文件 Mmap 即触发与文件等大的分配，debug 下分配
+                      // 失败 = 进程级 abort，与 R7-⑤ 修前同族拒绝服务面）。
         let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
         if meta.len() > MAX_IO_LEN as u64 {
             return Err(SysError::InvalidInput);
@@ -1105,6 +1239,8 @@ impl TokioExecutor {
     async fn op_mutex_lock(&mut self, id: u64) -> Result<(Value, Option<UndoOp>), SysError> {
         let m = self
             .mutexes
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
@@ -1145,6 +1281,8 @@ impl TokioExecutor {
         // 停车位：undo（recover 路径）与显式 MutexUnlock 均可取走释放（幂等）。
         let slot = self
             .held_locks
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
             .clone();
@@ -1169,7 +1307,13 @@ impl TokioExecutor {
 
     async fn op_mutex_unlock(&mut self, id: u64) -> Result<(Value, Option<UndoOp>), SysError> {
         // 显式解锁：取走停车位中的 guard 并释放（若 undo 已释放则为 no-op，幂等）。
-        if let Some(slot) = self.held_locks.get(&id) {
+        let slot = self
+            .held_locks
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&id)
+            .cloned();
+        if let Some(slot) = slot {
             if let Some(g) = slot.lock().await.take() {
                 drop(g);
             }
@@ -1204,7 +1348,13 @@ impl TokioExecutor {
         if self.file_fd_stale(input, reg) {
             return Err(SysError::NotFound);
         }
-        let in_file = self.files.get(&input).ok_or(SysError::NotFound)?;
+        let in_file = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&input)
+            .cloned()
+            .ok_or(SysError::NotFound)?;
         let buf = {
             let mut g = in_file.lock().await;
             g.seek(std::io::SeekFrom::Start(offset as u64))
@@ -1230,7 +1380,25 @@ impl TokioExecutor {
         if self.file_fd_stale(out, reg) {
             return Err(SysError::NotFound);
         }
-        let written = if let Some(m) = self.files.get(&out) {
+        // 锁内查表（短临界区）：绑定局部后再进入分支，映射锁不在 await/&mut self
+        // 期间持有（R-6：状态访问持锁、物理 IO 锁外）。
+        let out_file = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&out)
+            .cloned();
+        let out_is_stream = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&out);
+        let out_is_pipe_writer = self
+            .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&out);
+        let written = if let Some(m) = out_file {
             let mut g = m.lock().await;
             let n = g.write(&buf).await.map_err(to_sys_err)?;
             // 写后必须 flush（D-039 对齐；R3c MEDIUM-1）：op_send_file 输出到
@@ -1245,7 +1413,7 @@ impl TokioExecutor {
             // 的约定）。
             g.flush().await.map_err(to_sys_err)?;
             n
-        } else if self.stream_fds.contains_key(&out) {
+        } else if out_is_stream {
             let mut arc = self.take_tcp_stream(out, reg)?;
             let n = {
                 // 错误路径恢复句柄（blocker-3）。
@@ -1260,7 +1428,7 @@ impl TokioExecutor {
             };
             self.put_back(out, ResourceHandle::TcpStream(arc), reg);
             n.map_err(to_sys_err)?
-        } else if self.pipe_writer_fds.contains_key(&out) {
+        } else if out_is_pipe_writer {
             let mut arc = self.take_pipe_writer(out, reg)?;
             let n = {
                 let w = match Arc::get_mut(&mut arc) {
@@ -1292,17 +1460,50 @@ impl TokioExecutor {
         let new_fd = reg.allocate(handle);
         // 共享工作对象：File 共享同一 OS 描述与游标；TcpStream/管道共享同一 Arc
         // （共享后 &mut 访问受限 → InvalidInput，注释见 RFC-05）。
-        if let Some(m) = self.files.get(&fd) {
-            self.files.insert(new_fd, m.clone());
+        let file = self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .get(&fd)
+            .cloned();
+        if let Some(m) = file {
+            self.files
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .insert(new_fd, m);
         }
-        if self.stream_fds.contains_key(&fd) {
-            self.stream_fds.insert(new_fd, new_fd);
+        let fd_is_stream = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if fd_is_stream {
+            self.stream_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .insert(new_fd, new_fd);
         }
-        if self.pipe_reader_fds.contains_key(&fd) {
-            self.pipe_reader_fds.insert(new_fd, new_fd);
+        let fd_is_pipe_reader = self
+            .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if fd_is_pipe_reader {
+            self.pipe_reader_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .insert(new_fd, new_fd);
         }
-        if self.pipe_writer_fds.contains_key(&fd) {
-            self.pipe_writer_fds.insert(new_fd, new_fd);
+        let fd_is_pipe_writer = self
+            .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains_key(&fd);
+        if fd_is_pipe_writer {
+            self.pipe_writer_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .insert(new_fd, new_fd);
         }
         Ok((Value::Fd(new_fd), None))
     }
@@ -1314,22 +1515,41 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
+        // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
         // RFC-05 修复：new_fd 已在 registry 失效（Replace 后旧 fd）→ 不再触碰
         // 共享缓存（D13 隔离：另一分支的同 fd 仍存活），由下方 op_dup 对
         // old_fd 的 registry 校验统一判定（new 失效 + old 存活 → 仍按 POSIX
         // dup2 语义成功，仅不清理共享缓存）。
         let cur_new = self.translated_fd(new_fd).unwrap_or(new_fd);
         if reg.lookup(cur_new).is_some() {
-            if let Some(cur) = self.stream_fds.remove(&new_fd) {
+            if let Some(cur) = self
+                .stream_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
                 reg.remove(cur);
-            } else if let Some(cur) = self.pipe_reader_fds.remove(&new_fd) {
+            } else if let Some(cur) = self
+                .pipe_reader_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
                 reg.remove(cur);
-            } else if let Some(cur) = self.pipe_writer_fds.remove(&new_fd) {
+            } else if let Some(cur) = self
+                .pipe_writer_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd)
+            {
                 reg.remove(cur);
             } else {
                 let _ = reg.take(new_fd);
             }
-            self.files.remove(&new_fd);
+            self.files
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&new_fd);
         }
         // 决策 D1（fd 全局单调、永不复用）使 Dup2 无法精确落到 new_fd：
         // 语义退化为「先关 new_fd，再复制 old_fd 到新 fd」（注释）。
@@ -1351,13 +1571,34 @@ impl TokioExecutor {
         if reg.lookup(cur).is_none() {
             return Err(SysError::NotFound);
         }
-        if let Some(cur) = self.stream_fds.remove(&fd) {
+        if let Some(cur) = self
+            .stream_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .remove(&fd)
+        {
             reg.remove(cur);
-        } else if let Some(cur) = self.pipe_reader_fds.remove(&fd) {
+        } else if let Some(cur) = self
+            .pipe_reader_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .remove(&fd)
+        {
             reg.remove(cur);
-        } else if let Some(cur) = self.pipe_writer_fds.remove(&fd) {
+        } else if let Some(cur) = self
+            .pipe_writer_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .remove(&fd)
+        {
             reg.remove(cur);
-        } else if self.files.remove(&fd).is_some() {
+        } else if self
+            .files
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .remove(&fd)
+            .is_some()
+        {
             reg.remove(fd);
         } else if reg.take(fd).is_some() {
             // 直存句柄（TcpListener/UdpSocket/Child token）。
@@ -1371,6 +1612,21 @@ impl TokioExecutor {
 }
 
 impl SyscallExecutor for TokioExecutor {
+    /// R-6：分支执行器快照——克隆全部内部状态表 Arc（O(1)，与父共享
+    /// per-fd 锁/映射/仲裁器），供 Fork 并行分支独占驱动。
+    fn fork_snapshot(&mut self) -> Option<Box<dyn SyscallExecutor + Send>> {
+        Some(Box::new(TokioExecutor {
+            children: self.children.clone(),
+            mutexes: self.mutexes.clone(),
+            held_locks: self.held_locks.clone(),
+            arbiter: self.arbiter.clone(),
+            files: self.files.clone(),
+            stream_fds: self.stream_fds.clone(),
+            pipe_reader_fds: self.pipe_reader_fds.clone(),
+            pipe_writer_fds: self.pipe_writer_fds.clone(),
+        }))
+    }
+
     fn execute<'a>(
         &'a mut self,
         op: &'a DataOp,
@@ -1449,12 +1705,14 @@ mod tests {
     /// 自动 release。
     #[tokio::test]
     async fn mutex_claim_guard_releases_on_cancel() {
-        let mut ex = TokioExecutor::new();
+        let ex = TokioExecutor::new();
         let id = 999u64;
         // 物理锁被占用且仲裁表空闲：try_claim 成功（无占坑冲突）后 `lock_owned`
         // 必然阻塞，形成 MEDIUM 描述的泄漏窗口。
         let phys = ex
             .mutexes
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
@@ -1523,12 +1781,14 @@ mod tests {
     /// abort 取消任务 → 守卫 drop 的 `lock()` 与外部持锁者重叠（阻塞至其释放）。
     #[tokio::test]
     async fn mutex_claim_guard_drop_contends_with_arbiter_lock() {
-        let mut ex = TokioExecutor::new();
+        let ex = TokioExecutor::new();
         let id = 4242u64;
         // 物理锁被占用且仲裁表空闲：try_claim 成功（无占坑冲突）后 `lock_owned`
         // 必然阻塞，形成守卫 drop 的确定性窗口。
         let phys = ex
             .mutexes
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
@@ -1765,5 +2025,54 @@ mod tests {
             SysError::CrossDevice,
             "kind=CrossesDevices → EXDEV(18) → CrossDevice（非 AlreadyExists）"
         );
+    }
+
+    /// R-6：`fork_snapshot` 契约——TokioExecutor 必须返回 `Some`（快照通道
+    /// 启用），且快照与父共享内部状态表 Arc（O(1) 克隆，不复制物理句柄）：
+    /// 父先分配文件 fd，快照实例立即可见（共享 `files` 映射）——这正是
+    /// run_fork_parallel 分支在预开 fd 上并行读的前提；同一 fd 的游标仍经共享
+    /// per-fd 锁串行（快照读后父读 EOF，游标语义不变）。
+    #[tokio::test]
+    async fn fork_snapshot_shares_state_and_enables_branch_channel() {
+        let mut ex = TokioExecutor::new();
+        let mut snap = ex
+            .fork_snapshot()
+            .expect("TokioExecutor 必须支持快照（R-6 快照通道）");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("snap_share.bin");
+        std::fs::write(&p, b"hello").expect("setup");
+        let mut reg = ResourceRegistry::default();
+        // 父侧 Open（DataOp 局部变量：execute 返回的 BoxFuture 借用 op，
+        // 临时值在语句末 drop 会悬垂，须绑定到局部）。
+        let op = DataOp::Open {
+            path: p.clone(),
+            flags: OpenFlags {
+                read: true,
+                ..Default::default()
+            },
+        };
+        let (v, _) = ex
+            .execute(&op, &mut reg)
+            .await
+            .expect("父侧 Open");
+        let fd = match v {
+            Value::Fd(f) => f,
+            other => panic!("期望 Fd，得到 {other:?}"),
+        };
+        // 快照侧同 fd 读（共享 files 表与 per-fd 锁）。
+        let op = DataOp::Read { fd, len: 5 };
+        let (v, _) = snap
+            .execute(&op, &mut reg)
+            .await
+            .expect("快照共享 fd 读取");
+        assert_eq!(v, Value::Bytes(b"hello".to_vec()));
+        // 父侧再读：同 fd 游标已推进 → EOF（快照与父共享 per-fd 锁/游标，
+        // 游标语义串行不变）。
+        let op = DataOp::Read { fd, len: 5 };
+        let (v2, _) = ex
+            .execute(&op, &mut reg)
+            .await
+            .expect("父共享 fd 读取");
+        assert_eq!(v2, Value::Bytes(vec![]), "同 fd 游标共享：快照读后父读 EOF");
     }
 }

@@ -530,7 +530,10 @@ fn undo_stack_lifo_order() {
         v
     });
     assert_eq!(v, Ok(Value::Unit));
-    assert_eq!(ex.undo_ops(), vec!["undo(read:2:4)", "undo(Close { fd: 999 })"]);
+    assert_eq!(
+        ex.undo_ops(),
+        vec!["undo(read:2:4)", "undo(Close { fd: 999 })"]
+    );
     assert!(undo.is_empty());
 }
 

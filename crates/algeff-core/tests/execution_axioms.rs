@@ -163,7 +163,11 @@ fn exec_syscall_error_propagates() {
         Err(SysError::NotFound),
         "执行器错误经 interpret 原样传播"
     );
-    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"], "错误在 execute 记录后返回");
+    assert_eq!(
+        ex.ops(),
+        vec!["Close { fd: 999 }"],
+        "错误在 execute 记录后返回"
+    );
 }
 
 // ── A1 结合律：执行等价 ────────────────────────────────────────────────
@@ -466,7 +470,11 @@ fn exec_D10_replace_order() {
         "undo 先执行：recover 在 target 之前完成（标记顺序）"
     );
     assert!(undo.is_empty(), "recover 后撤销栈已清空");
-    assert_eq!(ex.ops(), vec!["Close { fd: 999 }"], "原流 Syscall 只执行一次");
+    assert_eq!(
+        ex.ops(),
+        vec!["Close { fd: 999 }"],
+        "原流 Syscall 只执行一次"
+    );
 }
 
 // ── D14 Fork：静态冲突检测 + 顺序执行 ─────────────────────────────────

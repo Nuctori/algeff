@@ -158,7 +158,15 @@ async fn oversized_len_read_does_not_destroy_pipe_handle() {
     };
 
     // 超限 len → InvalidInput（可捕获错误，非分配 abort）
-    let e = exec_err(&mut ex, &mut reg, &DataOp::Read { fd: rfd, len: usize::MAX / 4 }).await;
+    let e = exec_err(
+        &mut ex,
+        &mut reg,
+        &DataOp::Read {
+            fd: rfd,
+            len: usize::MAX / 4,
+        },
+    )
+    .await;
     assert_eq!(e, SysError::InvalidInput, "超限 len 返回 InvalidInput");
 
     // 句柄未被销毁：写端可写、读端可读回（修复前此处 NotFound/写端 EOF）

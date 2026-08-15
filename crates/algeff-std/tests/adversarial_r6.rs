@@ -485,7 +485,10 @@ async fn chain_tcp_connect_refused_maps_connection_refused_not_sticky() {
             Ok(_) => panic!("TcpConnect 意外返回值"),
         }
     }
-    assert!(refused, "5 个临时端口均未得到 ConnectionRefused（端口重用竞态持续）");
+    assert!(
+        refused,
+        "5 个临时端口均未得到 ConnectionRefused（端口重用竞态持续）"
+    );
     assert!(reg.lookup(0).is_none(), "失败不分配句柄");
 
     // 不粘滞：连真实 listener 成功，fd 从 0 起（无流表残留）。

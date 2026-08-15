@@ -558,6 +558,8 @@ async fn wait_timeout<'a>(
 ) -> (bool, Result<Value, SysError>) {
     let sleep = tokio::time::sleep(duration);
     tokio::pin!(sleep);
+    // 单次 select：两臂均直接返回（clippy never_loop 提示下不包 loop——
+    // 语义等价：inner 先完成 → 未超时；sleep 先到 → 广播取消后宽限等待）。
     tokio::select! {
         r = &mut inner => (false, r),
         _ = &mut sleep => {
@@ -572,6 +574,7 @@ async fn wait_timeout<'a>(
             }
         }
     }
+}
 }
 /// 墙钟 Timeout 取消传播实现（RFC-08/09/12 残余统一修复）。
 ///
@@ -630,16 +633,7 @@ async fn run_wall_timeout<'a>(
     drop(inner_result);
     undo.rollback_from(undo_mark).await;
     reg.rollback_linear_to(&linear_snap);
-    run_sub_impl(
-        on_timeout,
-        ctx,
-        undo,
-        reg,
-        access.reborrow(),
-        depth,
-        cancel,
-    )
-    .await
+    run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth, cancel).await
 }
 
 /// 共享执行器通道（CTO 批准方向，D14 阶段 3）：`Runtime` 内部以
@@ -682,6 +676,9 @@ fn drive<F: Future>(f: F) -> F::Output {
 
 /// 经执行器访问通道执行 DataOp。
 /// `Shared` 路径：每调用加锁互斥（Fork 并行时两子任务互斥串行化执行器调用）。
+/// R-6 锁边界收窄：并行 Fork 分支改用 `run_fork_parallel` 内的**分支执行器快照**
+/// （`SyscallExecutor::fork_snapshot`，状态 Arc 共享）独占驱动——物理 IO await 移出
+/// 共享锁外真并行；不支持快照的执行器回退本通道（D17 原行为，零语义变化）。
 async fn exec_via(
     access: &mut ExecAccess<'_>,
     op: &DataOp,
@@ -807,6 +804,28 @@ fn fork_fd_region_offset() -> u64 {
     k << 48
 }
 
+/// R-6：分支执行器访问通道（锁内短临界区取快照）。
+///
+/// 锁内调用 `fork_snapshot`：
+/// - `Some(branch_ex)`：为分支建独立通道（Arc<Mutex> 包裹快照）——分支独占
+///   驱动，物理 IO 移出共享锁外真并行；嵌套 Fork 在分支通道上递归取快照，
+///   任意深度保持并行（`interpret_impl` 的 `parallel` 判定要求 Shared 通道）；
+/// - `None`（默认）：回退共享通道克隆（D17 原行为——分支经同一锁互斥串行化，
+///   Mock/自定义执行器调用序列语义不变）。
+///
+/// 快照与父共享全部内部状态（per-fd 锁表 / 映射 / 仲裁器），分支的映射变更
+/// 自动可见于父，无需合并步骤；同一 fd 的物理 IO 仍在共享 per-fd 锁上串行。
+async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> {
+    let mut guard = shared.lock().await;
+    match guard.fork_snapshot() {
+        Some(branch_ex) => {
+            let channel: SharedExecutor = Arc::new(tokio::sync::Mutex::new(branch_ex));
+            ExecAccess::Shared(channel)
+        }
+        None => ExecAccess::Shared(shared.clone()),
+    }
+}
+
 /// Fork 并行分支执行（D14 阶段 3，CTO 批准方向）：
 ///
 /// 两分支各自持有 registry/context 隔离副本（D13：Clone）+ 独立 UndoStack，
@@ -814,6 +833,15 @@ fn fork_fd_region_offset() -> u64 {
 /// 状态，物理 IO 本身异步）在**独立阻塞线程**上以 current-thread runtime 并发
 /// 驱动（参考 concurrency_stress.rs 已验证的 drive 模式；外层 tokio::spawn N +
 /// 内层 spawn_blocking 驱动 current-thread runtime）。
+///
+/// ## R-6 锁边界重构（阶段 3 并行兑现）
+/// 每个分支在锁内短临界区取**执行器快照**（`SyscallExecutor::fork_snapshot`，
+/// 默认 `None`）：`TokioExecutor` 覆盖返回状态 Arc 共享的独立实例——分支对自身
+/// 实例持 `&mut` 无跨分支竞争，物理 IO await 移出共享锁外、跨分支真并行；
+/// 快照与父共享全部内部状态（per-fd 锁表 / 映射 / 仲裁器），同一 fd 的物理 IO
+/// 仍在共享 per-fd 锁上串行（游标语义不变），映射变更经共享状态表自动可见于父
+/// （无需合并步骤）；不支持快照的执行器（None）回退共享锁通道（D17 原行为，
+/// Mock 测试的调用序列语义不变）。
 ///
 /// 完成后合并回父：
 /// - registry：子 handles 以原 fd 并入 + consumed/owned_consumed 并集 +
@@ -859,18 +887,26 @@ async fn run_fork_parallel(
     let mut l_cancel = cancel.map(|c| CancelToken::clone(c));
     let mut r_cancel = l_cancel.clone();
 
-    // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化）。
-    // 子任务把（结果, 隔离 registry, 独立撤销栈, 隔离 ctx）带回，供完成后合并
-    // —— ctx 带回用于虚拟时钟合并（审计 R1 状态-MEDIUM-1，见下）。
-    // 子任务在独立阻塞线程（`spawn_blocking`，全新栈）上驱动 —— 深度计数器
-    // 从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫按线程栈独立生效）。
+    // R-6：分支执行器快照（锁内短临界区，O(1) Arc 克隆）。
+    // - 快照成功（Some）：分支经独立通道独占驱动（物理 IO 真并行，嵌套 Fork
+    //   在分支通道上递归快照，任意深度保持并行）；
+    // - 快照 None（默认）：回退共享通道（D17 原行为，Mock/自定义执行器不变）。
+    let l_access = branch_snapshot_access(&l_shared).await;
+    let r_access = branch_snapshot_access(&r_shared).await;
+
+    // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化 —— 回退
+    // 通道；快照通道无共享锁竞争）。子任务把（结果, 隔离 registry, 独立撤销栈,
+    // 隔离 ctx）带回，供完成后合并 —— ctx 带回用于虚拟时钟合并（审计 R1
+    // 状态-MEDIUM-1，见下）。子任务在独立阻塞线程（`spawn_blocking`，全新栈）上
+    // 驱动 —— 深度计数器从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫
+    // 按线程栈独立生效）。
     let l_task = tokio::task::spawn_blocking(move || {
         let v = drive(interpret_impl(
             left,
             &mut l_ctx,
             &mut l_undo,
             &mut l_reg,
-            ExecAccess::Shared(l_shared),
+            l_access,
             0,
             l_cancel.as_mut(),
         ));
@@ -882,7 +918,7 @@ async fn run_fork_parallel(
             &mut r_ctx,
             &mut r_undo,
             &mut r_reg,
-            ExecAccess::Shared(r_shared),
+            r_access,
             0,
             r_cancel.as_mut(),
         ));
@@ -909,7 +945,10 @@ async fn run_fork_parallel(
     // 同一蓝图并行/顺序两种调度产生不同可观察时钟（确定性重放支柱被破坏）。
     #[cfg(feature = "virtual-clock")]
     {
-        let base = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or_default();
+        let base = ctx
+            .virtual_clock_mut()
+            .map(|vc| vc.now())
+            .unwrap_or_default();
         let l_now = l_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
         let r_now = r_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
         if let Some(vc) = ctx.virtual_clock_mut() {

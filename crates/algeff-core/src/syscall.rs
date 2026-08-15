@@ -33,6 +33,25 @@ pub trait SyscallExecutor: Send {
         registry: &'a mut ResourceRegistry,
     ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>>;
 
+    /// R-6 并行 Fork 分支执行器快照（阶段 3 并行兑现，D17 并行收益）。
+    ///
+    /// 返回一个与 `self` **共享全部内部状态**（per-fd 锁表 / 映射 / 仲裁器）的
+    /// 独立执行器实例，供 Fork 并行分支独占驱动：分支对自身实例持 `&mut`
+    /// 无跨分支竞争 → 物理 IO await 移出共享锁外，真并行（`run_fork_parallel`）。
+    /// 状态共享保证语义不变：同一 fd 的物理 IO 仍在共享 per-fd 锁上串行（游标
+    /// 语义），互斥锁/仲裁器/句柄映射跨分支一致（与 D17 共享执行器等价）。
+    ///
+    /// **默认 `None` = 不支持快照** → 运行时回退共享锁通道（D17 原行为，
+    /// 对既有执行器零语义变化）。`TokioExecutor` 覆盖：克隆内部 `Arc` 状态表
+    /// （O(1)，不复制物理句柄）。
+    ///
+    /// 注：本方法为 R-6 新增的**纯增量默认方法**（不改变任何既有方法签名，
+    /// 冻结面 `execute` 契约原样保留）；快照执行器运行期间的映射变更经共享
+    /// 状态表自动可见于父执行器，无需额外合并步骤。
+    fn fork_snapshot(&mut self) -> Option<Box<dyn SyscallExecutor + Send>> {
+        None
+    }
+
     /// 信号监听（pdr.md §2.1 WatchSignal）。默认不支持（ENOSYS）。
     fn watch_signal<'a>(
         &'a mut self,
