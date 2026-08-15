@@ -15,8 +15,8 @@ Algeff 写法：   先把"要做的事"写成一份数据蓝图（Action）→ �
 
 ## 目录
 
-1. [这是什么？30 秒理解](#这是什么30-秒理解)
-2. [快速上手（5 分钟）](#快速上手5-分钟)
+1. [这是什么？](#这是什么)
+2. [快速上手](#快速上手)
 3. [核心概念：蓝图、执行、资源](#核心概念蓝图执行资源)
 4. [常用模式速查](#常用模式速查)
 5. [深入：确定性、重放与撤销机制](#深入确定性重放与撤销机制)
@@ -80,7 +80,7 @@ fn main() {
 ### 3. 真实文件 IO：写一个文件并读回来
 
 ```rust
-use algeff_core::prelude::*;
+use algeff_core::{Action, DataOp, OpenFlags, ReadOnly, ResourceInner, ResourceUsage, Runtime, TypedResource, Value, WriteOnly};
 use algeff_std::TokioExecutor;
 
 fn main() {
@@ -148,7 +148,7 @@ fn read_fd(fd: u64) -> ResourceUsage {
 `algeff_std::adapters` 提供预包装的常用操作（返回可直接组合的 `Action`）：
 
 ```rust
-use algeff_core::prelude::*;
+use algeff_core::{Action, OpenFlags, Value};
 use algeff_std::{TokioExecutor, adapters::{open_file, write, read, close}};
 
 let blueprint = Action::Sequential {
@@ -239,12 +239,12 @@ plan! { Action::Pure(Value::U64(1)); Action::Pure(Value::U64(2)); }
 
 ```rust
 let blueprint = fork! {
-    Action::Pure(Value::U64(10)),   // 左分支
-    Action::Pure(Value::U64(20)),   // 右分支
-    // combine 默认 Unit；想合并结果就自定义：
-    // |l, r| Action::Pure(Value::List(vec![l, r]))
+    left: Action::Pure(Value::U64(10)),    // 左分支
+    right: Action::Pure(Value::U64(20)),   // 右分支
 };
 ```
+
+> 宏版 `fork!` 的合并函数固定为「忽略两侧值，收敛为 `Value::Unit`」。需要自定义合并（如取两侧结果拼成 List）时，手写 `Action::Fork { left, right, combine }` 即可。
 
 两个分支若**静态冲突**（同一资源被两侧写/独占），运行时自动退化为顺序执行（确定性保证，D14/D17 契约）。
 
@@ -280,7 +280,7 @@ let blueprint = Action::Replace { target: Box::new(Action::Pure(Value::Unit)) };
 ### 完整 TCP echo 服务器骨架
 
 ```rust
-use algeff_core::prelude::*;
+use algeff_core::{Action, DataOp, Value};
 use algeff_std::TokioExecutor;
 
 fn main() {
@@ -290,7 +290,7 @@ fn main() {
     let blueprint = Action::Syscall {
         op: DataOp::TcpBind { addr },
         resources: vec![],
-        next: Box::new(|v| match v {
+        next: Box::new(move |v| match v {
             Value::Fd(listener) => {
                 // accept → 循环 TcpRead/TcpWrite（分片到达需循环读，见 tests/e2e.rs）
                 Action::Syscall {
@@ -303,9 +303,14 @@ fn main() {
         }),
     };
 
-    rt.run_blocking(blueprint).unwrap();
+    // 无客户端连接时 TcpAccept 会一直阻塞——用 Timeout 包裹避免挂死
+    let bounded = Action::Timeout {
+        action: Box::new(blueprint),
+        duration: std::time::Duration::from_millis(50),
+        on_timeout: Box::new(Action::Pure(Value::Unit)),
+    };
+    rt.run_blocking(bounded).unwrap();
 }
-```
 
 > 完整可运行示例与分片处理：`crates/algeff-std/tests/e2e.rs`（真实端到端，含 TCP 原生客户端对测）。
 
@@ -358,7 +363,7 @@ fn main() {
 | 4   | 契约冻结    | D1–D19 决策表 = 正确性承诺边界                                                                                  | `contracts.md`                 |
 | 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 96 = 实测崩溃边界 104–108 留 8% 余量（D-052） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
-| 7   | 验证分层    | 305 个测试函数（约 297 二进制 + 8 doc-test），44 个测试二进制                                                           | `spec/verification-plan.md`    |
+| 7   | 验证分层    | 309 个测试函数（约 301 二进制 + 8 doc-test），42 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
 | 8   | 对抗审计 ×5 | 120 个 E2E 测试，每轮独立发现（句柄活性/fd 区间/盲区/栈溢出…）                                                               | `spec/proof-obligations.md`    |
 | 9   | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决）                                                    | `spec/proof-obligations.md`    |
 | 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
