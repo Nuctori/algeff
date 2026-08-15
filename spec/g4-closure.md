@@ -5,6 +5,7 @@
 > （注：任务单称 §19.5，实际 §19.5 为「关键风险与应对」，收敛定义在 §19.2 行 1175 —— 以实际位置为准）。
 > 前置文档：`spec/final-audit.md`（批 5 G4 放行终审，条件 C1–C5）、`spec/contract-final-audit.md`（批 4 预检）。
 > 审计基线：
+>
 > - worktree `.wt/a1` 分支 `s6/a1` @ `c968ebd` = **main @ `c968ebd`（零落后）**。已含 A2 批 4 Fork 并行化
 >   （`57b53d1`/`430d64d`）、A5 批 4 错误路径修复（`f28236c`/`ab662c7`）、契约 D15–D18 补录
 >   （`d356368`/`6cb3de9`/`ed84a3c`）、A2 批 4 合并后的集成修复（`2f612f9`/`eb380f5`/`c968ebd`）。
@@ -55,7 +56,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 
 ---
 
-## 3. API 冻结终验（contracts.md D1–D18 ↔ 代码，C1–C5 核销复核）
+## 3. API 冻结终验（contracts.md D1–D19 ↔ 代码，C1–C5 核销复核）
 
 ### 3.1 批 5 放行条件（final-audit.md §6）核销复核
 
@@ -67,19 +68,20 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 | **C4（观察项）** `op_mutex_lock` 阻塞 `lock_owned` vs try_lock | 新增观察 | `executor.rs::op_mutex_lock`（:855）仍 `m.lock_owned().await`（阻塞），未接 arbiter `try_claim`/try_lock；arbiter 本身已作为独立原语闭环（§1 A7）。D16 决策表明示「接入待 C4 裁决」 | ⚠️ **保持观察项**（裁决建议见 §4 残余-1） |
 | **C5（基线核销）** 以 main 为基复核 | 部分核销 | worktree `s6/a1` @ `c968ebd` = **main @ `c968ebd`，零落后**；批 5 时落后的 4 commits（Runtime 批3、Verification 批4）已全部合入 | ✅ **核销**（流程级） |
 
-### 3.2 D1–D18 与代码逐项终审（批 5 final-audit §2 结论 + 本批复核）
+### 3.2 D1–D19 与代码逐项终审（批 5 final-audit §2 结论 + 本批复核）
 
 - **D1–D14**：批 5 终审结论 **12 项完全落地 + D10/D13 核心语义落地**；本批复核 D10/D13 缺口已由 C1/C2 核销 → **D1–D14 全部完全落地**（final-audit §2 表格逐项证据：D1 唯一句柄 / D2 Box 递归 / D3 BoxFuture / D4 UndoOp / D5 duplex / D6 保守并行 / D7 typestate / D8 SendFile.input / D9 自持 reactor / D10 Replace 语义 / D11 Alloc / D12 词法规范化 / D13 Clone+merge / D14 冲突检测+调度）。
 - **D15**（undo 闭包只捕获物理数据，禁捕 registry 引用）：`executor.rs` undo 闭包均捕获 Arc 句柄/原内容/路径（`op_write`/`op_truncate`/`op_rename`/`op_mutex_lock` 等），无 registry 引用捕获 —— ✅ **落地**。
 - **D16**（ResourceArbiter 动态仲裁原语）：`resource.rs:385` + `tests/arbiter.rs` 8 项 + proptest + 并发层 —— ✅ **落地**（MutexLock 级接入待 C4 裁决，D16 措辞已如实记录）。
-- **D17**（Fork 并行路径：`Arc<Mutex<Box<dyn SyscallExecutor>>>` 共享 + 子任务隔离 + 合并回父 + Send 边界不满足时回退顺序）：`runtime.rs` `SharedExecutor`（:285）/`SendExecutor`（unsafe impl Send，带安全性论证：执行器仅在 Mutex 独占锁内 `&mut` 访问）/`run_fork_parallel`（spawn_blocking 双线程 + `drive` current-thread runtime）；调度判定 `parallel = !conflict && matches!(&access, ExecAccess::Shared(_))` —— **Direct 公共签名路径恒顺序（阶段 1 回退）、Shared Runtime 路径冲突即顺序** —— ✅ **落地**。
+- **D17**（Fork 并行路径：`Arc<Mutex<Box<dyn SyscallExecutor + Send>>>` 共享 + 子任务隔离 + 合并回父 + fd 区间预分割 + Send 边界不满足时回退顺序）：`runtime.rs` `SharedExecutor`（:285）/`run_fork_parallel`（spawn_blocking 双线程 + `drive` current-thread runtime）；调度判定 `parallel = !conflict && matches!(&access, ExecAccess::Shared(_))` —— **Direct 公共签名路径恒顺序（阶段 1 回退）、Shared Runtime 路径冲突即顺序** —— ✅ **落地**（A2 批 5 后 `SendExecutor` unsafe 包装已删除，见 D19）。
 - **D18**（四闭包类型别名 `+ Send`，Action 变 Send）：`action.rs:41-44` `NextFn`/`CondFn`/`CombineFn`/`HandlerFn` 均 `+ Send`；`adapters.rs`/测试闭包全部满足 Send 约束（`2f612f9` 集成修复使其全量编译）—— ✅ **落地**。
+- **D19**（`SyscallExecutor: Send` 超 trait + `Runtime::new(Box<dyn SyscallExecutor + Send>)`，unsafe 包装删除）：`syscall.rs:27` + `runtime.rs:129`，`grep unsafe impl` 全仓库零命中（38bca67）—— ✅ **落地**（注意：D19 变更了 `Runtime::new` 签名，API 冻结面以 D1–D19 为准）。
 
 ### 3.3 冻结类型 §2 一致性（final-audit §2.1 9 项）
 
 批 6 复核**无变化**：`Fd=u64`、`Action` 全 CPS + Box 递归、`SendFile.input`、`TypedResource<M>`、`Value` 10 变体、`DataOp` 36 变体（executor match 36 分支全覆盖、0 todo）、`SysError` 14+Other、`SyscallExecutor` BoxFuture 签名、`UndoOp` —— 均与 contracts.md §2 一致。A2 批 4/A5 批 4 改动集中于 `runtime.rs`/`executor.rs`（非冻结文件，契约 §1 所有权表内），未触碰 `action.rs`/`error.rs`/`syscall.rs`/`lib.rs`（git log 佐证）。
 
-**小结**：C1/C2/C3/C5 全部核销，D1–D18 决策表与代码逐项一致，冻结类型零漂移。「合并主分支、冻结 API」条件满足（worktree=main 零落后；API 冻结面自批 5 起无签名变化）。
+**小结**：C1/C2/C3/C5 全部核销，D1–D19 决策表与代码逐项一致，冻结类型零漂移。「合并主分支、冻结 API」条件满足（worktree=main 零落后；API 冻结面以 D1–D19 为准，D19 为 Send 超 trait 的冻结期前最后一次契约修订，38bca67 已闭环）。
 
 ---
 
@@ -103,8 +105,8 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 **放行依据（pdr §19.2 闭环收敛三条件逐条判定）**：
 
 1. **所有公理被证明/测试覆盖** —— ✅ 满足：A1–A4、A6–A7 全部「已验证」（执行级），A5 语义层已验证（Choose/Fork 隔离 + 并行路径），物理层 make_mut 归阶段 3（规范边界内非阻塞）；P1–P5 对应闭环。本批 `cargo test --workspace` **151/151 全绿（24 测试二进制）**，`--features coeffects,virtual-clock` 组合全绿。
-2. **性能满足预期** —— ⚠️ 条件满足：静态路径达标（echo 100.0% ≈ 预期 103%，append 29.4% 优于预期）；并行类（parallel_reads/shared_read）批 3 数据为 **D14 顺序基线**（340%/307.6%），并行载体已合入、**A7 批 4 复测进行中** —— 附条件-1。
-3. **合并主分支、冻结 API** —— ✅ 满足：worktree = main @ `c968ebd` 零落后（C5 核销）；D1–D18 决策表与代码逐项一致、冻结类型 §2 零漂移（C1/C2/C3 核销）；批 5 条件清单中 C1/C2/C3/C5 全部核销，仅 C4 观察项按「接受+待办」处理（R-1）。
+2. **性能满足预期** —— ✅ 条件满足：静态路径达标（echo 103.1% ≈ 预期 103%）；并行类（parallel_reads 366%、shared_read 571%）经 A7 批 4 复测确认锁串行化归因（CTO 裁决：pdr §17 已知局限，工程缓解归阶段 3+，非缺陷）—— 条件-1 核销。
+3. **合并主分支、冻结 API** —— ✅ 满足：worktree = main 零落后（C5 核销）；D1–D19 决策表与代码逐项一致、冻结类型 §2 零漂移（C1/C2/C3 核销）；批 5 条件清单中 C1/C2/C3/C5 全部核销，仅 C4 观察项按「接受+待办」处理（R-1）。
 
 **条件清单（核销后 G4 正式放行）**：
 
@@ -113,7 +115,7 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
 | **条件-1** | A7 批 4 性能复测数据（并行 Fork 后）合入 `perf/`，确认 parallel_reads/shared_read 回归 ~100% 目标，或对偏离作 CTO 裁决记录 | A7 / CTO | 数据级 |
 | **条件-2** | A3 执行级双序 commutation 等价测试（对称 combine 下 left∥right vs right∥left）补录 | A6 | 测试级 |
 
-**观察项（不阻塞）**：R-1（arbiter–MutexLock 接入，接受 + 低优先待办）、R-3（make_mut 阶段 3）、R-5（SendExecutor unsafe 单点）。
+**观察项（不阻塞）**：R-1（arbiter–MutexLock 接入，接受 + 低优先待办）、R-3（make_mut 阶段 3）、R-6（executor 锁串行化，pdr §17 已知局限）。
 
 **对冻结影响的总判定**：全部残余项均不构成冻结类型层面的阻塞（无签名破坏、无契约承诺被静默改写）；条件核销与观察项跟踪不影响 0.1.0 发布与 API 冻结面。
 
@@ -127,6 +129,6 @@ pdr §16 预期表（原生 tokio = 100%）× 基线实测（A7 批 3，`perf/ba
   - `cargo fmt --check` → 干净（exit 0）
   - `cargo clippy --workspace` → 0 error 0 warning
 - **测试明细（24 二进制）**：core 11（unit 18 + arbiter 8 + axioms 22 + concurrency_stress 3 + execution_axioms 7 + features_regression 0 + interpreter 28 + registry_integration 4 + replay_property 3 + runtime_features 0 + undo_resource 3）、macro 5（unit 0 + blueprint 5 + doc_examples 1 + exec_integration 5 + macros 8）、std 5（unit 0 + adapters 5 + adapters_flow 6 + e2e 4 + executor 13）、doc-tests 3（core 0 + macro 8 + std 0）= 151 fn。
-- **代码**（worktree 实读）：`crates/algeff-core/src/{runtime,resource,action}.rs`（Fork 并行 `run_fork_parallel`/`SharedExecutor`/`SendExecutor`、`merge`、`clear`、四闭包 +Send、`ResourceArbiter`）；`crates/algeff-std/src/executor.rs`（`op_mutex_lock` :855 阻塞 lock_owned —— C4 依据）。
-- **契约**：`contracts.md`（D1–D18 终版）；`spec/{final-audit,contract-final-audit,verification-plan,axioms,proofs,resource-notes}.md`；`perf/baseline-2026-08-15.txt`（批 3 数据，批 4 复测未合并）。
+- **代码**（worktree 实读）：`crates/algeff-core/src/{runtime,resource,action,syscall}.rs`（Fork 并行 `run_fork_parallel`/`SharedExecutor`、`merge`、`clear`、四闭包 +Send、`SyscallExecutor: Send`、`ResourceArbiter`）；`crates/algeff-std/src/executor.rs`（`op_mutex_lock` :855 阻塞 lock_owned —— C4 依据）。
+- **契约**：`contracts.md`（D1–D19 终版）；`spec/{final-audit,contract-final-audit,verification-plan,axioms,proofs,resource-notes}.md`；`perf/baseline-2026-08-15.txt`（批 3/批 4 数据，含 D17 并行复测对比列）。
 - **模型**：`tla/scheduler.tla` + `tla/README.md`（TLC 4 不变式 + Progress，批 3 记录在案，未重跑）。
