@@ -51,7 +51,7 @@
 2. 因此，在 **combine 对称**（`Sym(f)`）的前提下，`Fork(a,b,f)` 与 `Fork(b,a,f)` 产生相同的语义（结果值经对称 combine 合并一致）。这正是公理 A3 的内容。
 3. 由公理 A3 直接成立。∎
 
-**依赖的前提**：A3（含 `Sym(f)` 与 Δ-覆盖，R2 已并入 axioms.md A3 形式化陈述）；以及 combine 对称性。
+**依赖的前提**：A3（含 `Sym(f)` 与 Δ-覆盖，R2 已并入 axioms.md A3 形式化陈述）；以及 combine 对称性。**静态可见性前提（R3 数学审计）**：`fork_conflict` 的静态资源收集对 `next`/`handler` 闭包内效果不可见（链长 ≥2 的 Sequential 分支系统性不完全）——本命题的工程应用「零锁并行调度」仅对顶层可见资源不相交成立；闭包内隐藏冲突不证伪本命题（语义 Δ 下前提不满足），但需在应用层声明（axioms.md A3 风险备注）。
 
 **工程含义**：运行时可根据冲突矩阵（`ResourceRegistry::can_parallel`）**资源级零锁并行调度**（注：D17 下执行器调用经 `Arc<Mutex<Box<dyn SyscallExecutor + Send>>>` 逐 op 互斥，零锁仅资源级成立，非全链路——数学审计 M6 修正）；Append∥Append 需显式声明顺序无关（决策 D6）后才允许并行。
 
@@ -81,10 +81,10 @@
 **Fork 情形**：Fork 时每个子任务获得 registry 的**隔离副本**（决策 D13：`ResourceRegistry: Clone`），句柄本体为 `Arc` 共享（`resource.rs::ResourceHandle`）：
 
 - **ReadOnly**：两个分支共享同一 `Arc`（零拷贝，pdr.md §9.2）；
-- **Mutable**：共享 `Arc` 句柄，首次写入触发 `Arc::make_mut` 产生私有副本（延迟复制）——写入发生在副本上，兄弟分支的 Read 仍指向原数据；
+- **Mutable**：物理层设计为共享 `Arc` 句柄、首次写入触发 `Arc::make_mut` 产生私有副本（延迟复制，pdr.md §9.2）——**当前实现（阶段 1）**：make_mut 尚未落地（resource-notes §9 评估，阶段 3 推迟），分支间物理写冲突经**静态串行化**（fork_conflict → 顺序路径）与执行器 `Arc<Mutex<>>` 互斥**不可达**（R3 数学审计：证明文本原按 make_mut 机制陈述，与现状不符，已同步为范围声明）；
 - **Own**：所有权转移，仅一个分支持有。
 
-因此任何子任务的 Write 都作用于私有副本，不可能影响兄弟分支的 Read。∎（Fork）
+因此任何子任务的 Write 都作用于隔离副本/经串行化隔离，不可能影响兄弟分支的 Read。∎（Fork）
 
 **工程实现链**：`ResourceRegistry::clone`（D13，已冻结）→ `Arc::make_mut`（A2/A3 交付）→ `Action::Fork` 解释（A2 交付）。
 
@@ -132,7 +132,7 @@ recover ∘ track(wₙ) ∘ ⋯ ∘ track(w₁)(γ₀, id) = (γ₀, id)
 
 （逆序应用 `w̄₁ ∘ ⋯ ∘ w̄ₙ` 与正序 `wₙ ∘ ⋯ ∘ w₁` 抵消；依赖函数复合的结合性——数学事实，非公理 A1，数学审计 M2 修正。）
 
-**适用范围边界**：只有撤销策略 **Full**（pdr.md §11.2）的操作返回逆操作（`SyscallExecutor::execute -> Option<UndoOp>` 为 `Some` 时才可撤销）；BestEffort/Skip 不满足 A6，不在此命题范围内。不可逆操作（UDP 发送、进程信号）仅提供补偿挂钩。
+**适用范围边界**：本命题只对**运行时已追踪（trackΓ）且撤销策略 Full**（pdr.md §11.2）的操作成立（`SyscallExecutor::execute -> Option<UndoOp>` 为 `Some` 时才可撤销）；BestEffort/Skip 不满足 A6，不在此命题范围内。不可逆操作（UDP 发送、进程信号）仅提供补偿挂钩。**范围例外（R3 数学审计/RFC-08/09）**：Timeout 取消路径下——孤儿分支副作用不可撤销（RFC-08：undo 未合并、物理副作用发生）；持锁分支被取消后锁 id 饥饿至 recover（RFC-09：撤销延迟而非丢失，recover 点 w;w̄=1 仍成立）。两者均为显式声明的边界反例/延迟，不构成命题主体证伪。
 
 **Rust 测试映射（A6 建议）**
 

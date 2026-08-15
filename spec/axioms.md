@@ -107,6 +107,7 @@
 **风险备注**
 
 - **隐含前提（本审计新增）**：`a ∥ b = b ∥ a` 还要求 `CombineFn` 对两个 `Value` 参数交换不变（或结果顺序无关）。pdr.md 未显式声明；若 combine 非对称（如 `(x,y) → x`），并行顺序会改变结果值。**建议 A6 测试统一用对称 combine**，并在本文件记录该前提（见 `proofs.md` P2）。
+- **静态可见性前提（R3 数学审计）**：`fork_conflict` 的静态资源收集只遍历 AST 可见节点——`Sequential` 仅收集 `current`（`next` 闭包不可见）、`Catch` 仅收集 `action`（handler 不可见）——**所有链长 ≥2 的 Sequential 分支只有首 op 资源可见（系统性不完全，非病态场景）**。两分支顶层可见资源不相交 ≠ 真实效果不冲突（闭包内同 fd Write×Write 实测交错结果不确定）。对 P2 定理本体无证伪（语义 Δ 下前提不满足，条件句保真）；对「运行时零锁并行调度」工程应用不健全。失败模式：MutexLock → WouldBlock 安全失败；同资源 Write → 交错不确定（确定性违反）但 A4 线性保持、无数据丢失。测试：`adversarial_r3b.rs::ub_fork_conflict_blindspot_*`（2 测试）。
 - 冲突判定基于 `Resource::Path` 的**词法规范化**标识（D12），符号链接别名可能造成漏报（false parallel）→ A3 保证的强度取决于 D12 语义，见 `contracts-audit.md` D12 条目。
 
 ---
@@ -183,6 +184,12 @@ Fork  ：子任务通过 COW 隔离（ReadOnly 共享、Mutable 延迟复制、O
 不可逆操作（UDP 发送、进程信号等）仅提供补偿挂钩，不满足该公理
 ```
 
+∀ 可逆操作 w，∃ 逆操作 w̄：  w ; w̄ = 1   （资源状态恢复至执行前）
+不可逆操作（UDP 发送、进程信号等）仅提供补偿挂钩，不满足该公理
+
+```
+（R3 数学审计范围限定：本公理只对**运行时已追踪（trackΓ）且撤销策略 Full** 的操作成立——Timeout 取消路径（RFC-08 孤儿分支副作用不可撤销、RFC-09 锁饥饿窗口至 recover）与 BestEffort/Skip 均为显式范围例外，见 §10。）
+
 **工程实现位置**
 
 | 层 | 文件 : 符号 | 说明 |
@@ -214,8 +221,10 @@ Fork  ：子任务通过 COW 隔离（ReadOnly 共享、Mutable 延迟复制、O
 **形式化陈述**
 
 ```
+
 动态资源获取采用：原子占坑（atomic placeholder）+ 失败回滚 + 有限重试（bounded retry）
 ⇒ 不存在任务互相等待资源形成的循环等待链（circular wait chain）
+
 ```
 
 **工程实现位置**
