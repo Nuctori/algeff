@@ -321,7 +321,9 @@ mod tests {
     #[tokio::test]
     async fn set_is_reversible() {
         let store = CoeffectStore::new();
-        store.set(1, Value::U64(42)).await;
+        // 首次绑定（1→42）仅作基线，不需要撤销：后续 set 的 undo 负责恢复 42。
+        // UndoOp 是 must-use future，此处显式丢弃（注释语义见上）。
+        drop(store.set(1, Value::U64(42)).await);
         assert_eq!(store.get(1).await, Some(Value::U64(42)));
         let undo = store.set(1, Value::U64(7)).await;
         assert_eq!(store.get(1).await, Some(Value::U64(7)));
@@ -334,7 +336,7 @@ mod tests {
 
     #[test]
     fn notify_states() {
-        let mut s = DependencyTable::new();
+        let s = DependencyTable::new();
         let deps: HashSet<DepKey> = [1u64].into_iter().collect();
         assert_eq!(notify(&s, &s, &deps), Activation::Neutral);
         let mut s2 = s.clone();
