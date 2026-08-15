@@ -301,6 +301,110 @@ impl ResourceRegistry {
     }
 }
 
+// ── 动态资源仲裁（公理 A7 的工程载体）────────────────────────────────────
+
+/// 独占占坑标记（Write/Own/Append 持有）。见 `ResourceArbiter` 的占坑计数编码。
+const EXCLUSIVE_CLAIM: usize = usize::MAX;
+
+/// 动态资源仲裁原语：原子占坑 + 失败回滚 + 有限重试（pdr.md 公理 A7 的工程载体）。
+///
+/// 与静态层 `ResourceRegistry::can_parallel` 分层（pdr.md §9.1）：
+/// - **静态层（Fork 级，零锁）**：调度前基于 `ResourceSet` 的冲突矩阵判定，
+///   冲突 → 降级串行（公理 A3「否则串行」），从不进入等待，无死锁；
+/// - **动态层（MutexLock 级）**：运行期互斥资源（如 `DataOp::MutexLock`）由
+///   `try_claim` 原子占坑，失败**整体回滚**，调用方**有限重试**（失败回滚 +
+///   有限重试，A7）。本原语**不提供阻塞等待**——不等待 = 不存在循环等待链
+///   （命题 P5；同步互斥的 `.lock().await` 不得在解释器任务内直接使用）。
+///
+/// 仲裁表语义：`claims` 是动态占坑表，记录**所有当前占坑者**的占用；
+/// 后续 `try_claim` 与该表比对，冲突即失败。解释器单线程（trampoline）内
+/// 以 `&mut self` 串行访问即天然互斥；Fork 并行时按 D13 克隆隔离。
+/// 跨任务的实际互斥由物理层（如 `tokio::sync::Mutex::try_lock`，A5 执行器）
+/// 保证，本原语负责 set 级原子性：失败不残留部分占坑，可安全重试。
+///
+/// 占用模式对（对齐 pdr.md §9.1 冲突矩阵）：
+/// - `Read` 可共享：同一资源可被多个 Read 占坑（占坑计数累加）；
+/// - `Write` / `Own` 互斥：资源已被任何模式占坑时拒绝新占坑（独占）；
+/// - `Append` 按互斥处理（保守默认，对齐决策 D6：Append∥Append 默认串行，
+///   顺序无关的 opt-in 由静态层 `can_parallel_with` 表达）。
+///
+/// 占坑计数编码（`claims: HashMap<Resource, usize>`）：
+/// - `0`：未占坑；`1..=usize::MAX-1`：Read 占坑数；`usize::MAX`：独占占坑标记。
+///   独占与 Read 互斥，故任一资源要么是纯 Read 计数、要么是独占标记，不会混叠。
+#[derive(Debug, Default, Clone)]
+pub struct ResourceArbiter {
+    claims: HashMap<Resource, usize>,
+}
+
+impl ResourceArbiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 对 `set` 中每个资源尝试原子占坑：全部可占才成功，否则**整体回滚**
+    /// 已尝试的占坑（原子性，A7「原子占坑 + 失败回滚」）。
+    ///
+    /// 失败时自身状态完全不变（无部分占坑残留），调用方可直接有限重试，
+    /// 无需手动回滚。实现：先在副本上模拟全部占坑，全部成功才提交。
+    pub fn try_claim(&mut self, set: &ResourceSet) -> bool {
+        let mut trial = self.claims.clone();
+        for usage in set {
+            if !Self::claim_one(&mut trial, usage) {
+                return false; // trial 被丢弃：self 状态不变（整体回滚）
+            }
+        }
+        self.claims = trial;
+        true
+    }
+
+    /// 在给定计数表上尝试单个占坑（Read 共享 / Write·Own·Append 独占）。
+    fn claim_one(claims: &mut HashMap<Resource, usize>, usage: &ResourceUsage) -> bool {
+        let count = claims.entry(usage.resource.clone()).or_insert(0);
+        match usage.mode {
+            AccessMode::Read => {
+                if *count == EXCLUSIVE_CLAIM {
+                    return false; // 已被独占占坑，Read 不可共享
+                }
+                *count += 1;
+            }
+            AccessMode::Write | AccessMode::Own | AccessMode::Append => {
+                if *count != 0 {
+                    return false; // 已被任何模式占坑，互斥
+                }
+                *count = EXCLUSIVE_CLAIM;
+            }
+        }
+        true
+    }
+
+    /// 释放 `set` 中每个资源的占坑（Read 递减计数；独占直接清空）。
+    /// 幂等：未占坑的资源被忽略，不会 panic。
+    pub fn release(&mut self, set: &ResourceSet) {
+        for usage in set {
+            let r = &usage.resource;
+            match self.claims.get(r).copied() {
+                Some(EXCLUSIVE_CLAIM) => {
+                    self.claims.remove(r);
+                }
+                Some(n) if n > 0 => {
+                    let next = n - 1;
+                    if next == 0 {
+                        self.claims.remove(r);
+                    } else {
+                        self.claims.insert(r.clone(), next);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 资源当前是否被本仲裁器占坑（Read 计数 > 0 或独占）。
+    pub fn held(&self, r: &Resource) -> bool {
+        self.claims.get(r).is_some_and(|&c| c != 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

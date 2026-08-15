@@ -76,7 +76,7 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
 | --- | --- | --- |
 | A3 冲突矩阵 | `conflict_matrix_exhaustive_4x4`（4×4 模式对 × 同/异资源）、`conflict_matrix_read_read_ok`、`conflict_matrix_write_blocks`、`append_parallel_needs_opt_in` | resource.rs |
 | A4 线性 | `linearity_write_then_own_legal`、`linearity_own_is_terminal`、`linearity_double_write_rejected`、`linearity_read_append_repeatable`、`clear_resets_linear_state_and_handles` | resource.rs |
-| A7 无死锁 | 静态层由上述冲突矩阵覆盖；动态层 TLA+ 模型 `tla/scheduler.tla`（A6 拥有） | — |
+| A7 无死锁 | 静态层由上述冲突矩阵覆盖；动态层由 `arbiter.rs` 的 `try_claim` 原子回滚 / Read-Read 共享 / Read-Write 互斥 / 有限重试测试覆盖（ResourceArbiter） | resource.rs + tests/arbiter.rs |
 | §5.2.2 notify | `registry_sync_activation_sequence`、`registry_sync_multi_component_and_neutral`、`notify_states` | coeffects.rs |
 
 ## 6. 变更记录
@@ -88,6 +88,10 @@ Windows 路径（盘符、`\`）由 `std::path` 组件语义处理，与词法�
   Fork clone 隔离-合并、A4 随机序列状态机）；配套集成测试
   `crates/algeff-core/tests/registry_integration.rs`（不依赖 interpret，用公共
   API 预演 A2 解释器调用序列，为 A2 合并后集成铺路）。
+- s3/a3：新增 `ResourceArbiter`（动态占坑原语：try_claim 原子占坑 + 整体回滚、
+  release、held；Read 共享 / Write·Own·Append 互斥）；配套测试
+  `crates/algeff-core/tests/arbiter.rs`（原子回滚、模式矩阵、释放重占、有限重试
+  不变量）；新增 §8「ResourceArbiter 与 A7 的映射」。
 
 ## 7. 解释器集成模式（A2 合并前的预演）
 
@@ -165,3 +169,50 @@ fd 重分配导致子注册表内部的 `Resource::Fd` 键与父侧不一致，�
 > 备注：任务文本提及「与 D10/D14 的对应关系」，但当前 contracts.md 决策表只有
 > D1–D13，**D14 未定义**（全仓库检索无 D14 条目）。本节按现存决策 D1/D10/D13
 > 撰写对应关系；D14 的存在性需 CTO 澄清（见 RFC-A3-3）。
+
+## 8. ResourceArbiter 与公理 A7 的映射（批 3 落地）
+
+批 2 的 §2 给出了 A7 的工程分层建议；本批在 core 落地动态层原语
+`ResourceArbiter`（`crates/algeff-core/src/resource.rs`，测试 `tests/arbiter.rs`）。
+
+**静态层（Fork 级，零锁）**：`ResourceRegistry::can_parallel` /
+`can_parallel_with` 在调度前对两个 `ResourceSet` 做 §9.1 冲突矩阵判定。
+冲突 → 降级串行（公理 A3「否则串行」），从不进入等待；不冲突 → 零锁并行。
+静态可判定路径不等待，故无死锁。
+
+**动态层（MutexLock 级，try_claim + 回滚 + 有限重试）**：
+`ResourceArbiter::try_claim(set)` 对 set 中每个资源原子占坑——先在副本上
+模拟全部占坑，全部可占才提交，任一失败**整体回滚**（自身状态完全不变，
+无部分占坑残留）。调用方在失败后执行已累积逆操作并**有限重试**（如指数退避
++ 上限），超限报 `WouldBlock`；本原语**不提供阻塞等待**。同步互斥的
+`.lock().await` 不得在解释器任务内直接使用（会挂起等待，引入循环等待风险，
+见 §2）。
+
+**仲裁表语义**：`claims: HashMap<Resource, usize>` 是动态占坑表，记录**所有
+当前占坑者**的占用；后续 `try_claim` 与该表比对，冲突即失败。解释器单线程
+（trampoline）内以 `&mut self` 串行访问天然互斥；Fork 并行时按 D13 克隆隔离
+（与 registry 同策略）。跨任务的实际互斥由物理层（如 `tokio::sync::Mutex::
+try_lock`，A5 执行器）保证，本原语负责 set 级原子性：失败不残留部分占坑，
+重试在干净状态下重新尝试，可重入、可确定性复现。
+
+**模式判定（对齐 §9.1 矩阵）**：Read 可共享（占坑计数累加）；Write/Own 互斥
+（资源已被任何模式占坑则拒绝）；Append 按互斥的保守默认（对齐决策 D6：
+Append∥Append 默认串行，顺序无关的 opt-in 由静态层 `can_parallel_with` 表达）。
+
+**分层无循环等待论证**：
+
+1. 静态层零等待：冲突即串行，串行执行天然无等待；
+2. 动态层不等待：`try_claim` 失败立即返回，调用方回滚后让出执行权，延迟重试
+   而非挂起等待持锁方——不存在「任务 A 持 X 等 Y、任务 B 持 Y 等 X」的持有-
+   等待关系（命题 P5）；
+3. 重试有界：有限重试次数 + 超限报 `WouldBlock`，不会无限循环；
+4. 原子性：`try_claim` 失败不改状态（整体回滚），重试等价于在干净状态下重新
+   尝试，行为可确定性复现（配合 A6 的 `tla/scheduler.tla` 模型，测试
+   `finite_retry_eventually_succeeds` 固定序列验证）。
+
+**与 registry 的关系**：`ResourceArbiter` 独立于 `ResourceRegistry`。registry
+持有物理句柄与 A4 线性状态；arbiter 只跟踪动态占坑（占坑计数）。二者配合：
+MutexLock 执行时先 `registry.lookup(fd)` 取物理句柄（A5 执行器 `try_lock` 保证
+跨任务互斥），arbiter 记录本仲裁域的占坑并提供 set 级原子性与失败回滚的可重试
+性。`can_parallel`（静态）负责 Fork 级并行判定，arbiter（动态）负责 MutexLock
+级占坑——两层职责正交，互不依赖。
