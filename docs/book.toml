@@ -1,0 +1,9 @@
+[book]
+title = "Algeff"
+authors = ["Algeff Team"]
+language = "zh"
+description = "Algeff — 将 Unix 效应代数化的跨平台确定性运行时框架（规范文档，权威源：pdr.md v3.2）"
+src = "src"
+
+[build]
+build-dir = "book"
