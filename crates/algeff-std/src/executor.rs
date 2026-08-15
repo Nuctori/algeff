@@ -95,36 +95,64 @@ impl TokioExecutor {
         self.children.insert(pid, fd);
     }
 
-    /// 从 `ResourceHandle` 提取对应内部 `Arc`（take 后 &mut 访问路径）。
-    fn as_pipe_reader(
-        h: ResourceHandle,
+    /// 取走管道读端句柄并做类型转换；类型不符时恢复注册表条目与内部映射
+    /// （blocker-3：take 后任何错误路径都不得丢句柄）。
+    fn take_pipe_reader(
+        &mut self,
+        fd: u64,
+        reg: &mut ResourceRegistry,
     ) -> Result<Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>, SysError> {
-        match h {
+        let cur = self
+            .pipe_reader_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
+        match reg.take(cur).ok_or(SysError::NotFound)? {
             ResourceHandle::PipeReader(a) => Ok(a),
-            _ => Err(SysError::InvalidInput),
+            h => {
+                self.put_back(fd, h, reg);
+                Err(SysError::InvalidInput)
+            }
         }
     }
 
-    fn as_pipe_writer(
-        h: ResourceHandle,
+    /// 取走管道写端句柄并做类型转换；类型不符时恢复注册表条目与内部映射（blocker-3）。
+    fn take_pipe_writer(
+        &mut self,
+        fd: u64,
+        reg: &mut ResourceRegistry,
     ) -> Result<Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>, SysError> {
-        match h {
+        let cur = self
+            .pipe_writer_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
+        match reg.take(cur).ok_or(SysError::NotFound)? {
             ResourceHandle::PipeWriter(a) => Ok(a),
-            _ => Err(SysError::InvalidInput),
+            h => {
+                self.put_back(fd, h, reg);
+                Err(SysError::InvalidInput)
+            }
         }
     }
 
-    fn as_tcp_stream(h: ResourceHandle) -> Result<Arc<TcpStream>, SysError> {
-        match h {
+    /// 取走 TCP 流句柄并做类型转换；类型不符时恢复注册表条目与内部映射（blocker-3）。
+    fn take_tcp_stream(
+        &mut self,
+        fd: u64,
+        reg: &mut ResourceRegistry,
+    ) -> Result<Arc<TcpStream>, SysError> {
+        let cur = self
+            .stream_fds
+            .get(&fd)
+            .copied()
+            .ok_or(SysError::NotFound)?;
+        match reg.take(cur).ok_or(SysError::NotFound)? {
             ResourceHandle::TcpStream(a) => Ok(a),
-            _ => Err(SysError::InvalidInput),
-        }
-    }
-
-    fn as_child(h: ResourceHandle) -> Result<Arc<Child>, SysError> {
-        match h {
-            ResourceHandle::Child(a) => Ok(a),
-            _ => Err(SysError::InvalidInput),
+            h => {
+                self.put_back(fd, h, reg);
+                Err(SysError::InvalidInput)
+            }
         }
     }
 
@@ -166,16 +194,25 @@ impl TokioExecutor {
             buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
         }
-        if let Some(cur) = self.pipe_reader_fds.get(&fd).copied() {
-            let mut arc = Self::as_pipe_reader(reg.take(cur).ok_or(SysError::NotFound)?)?;
+        if self.pipe_reader_fds.contains_key(&fd) {
+            let mut arc = self.take_pipe_reader(fd, reg)?;
             let mut buf = vec![0u8; len];
             let n = {
                 // 被 Dup 共享时无法 &mut → InvalidInput（注释）。
-                let rh = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-                rh.read(&mut buf).await?
+                let rh = match Arc::get_mut(&mut arc) {
+                    Some(rh) => rh,
+                    None => {
+                        // 错误路径：恢复注册表条目与内部映射后再返回（blocker-3）。
+                        self.put_back(fd, ResourceHandle::PipeReader(arc), reg);
+                        return Err(SysError::InvalidInput);
+                    }
+                };
+                rh.read(&mut buf).await
             };
-            buf.truncate(n);
+            // 成功与 I/O 错误均先恢复句柄再传播（blocker-3）。
             self.put_back(fd, ResourceHandle::PipeReader(arc), reg);
+            let n = n?;
+            buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
         }
         Err(SysError::NotFound)
@@ -234,24 +271,38 @@ impl TokioExecutor {
             };
             return Ok((Value::Unit, undo));
         }
-        // 管道写端（轮换型）。
-        if let Some(cur) = self.pipe_writer_fds.get(&fd).copied() {
-            let mut arc = Self::as_pipe_writer(reg.take(cur).ok_or(SysError::NotFound)?)?;
-            {
-                let wh = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-                wh.write_all(data).await?;
-            }
+        // 管道写端（轮换型；错误路径恢复句柄，blocker-3）。
+        if self.pipe_writer_fds.contains_key(&fd) {
+            let mut arc = self.take_pipe_writer(fd, reg)?;
+            let r = {
+                let wh = match Arc::get_mut(&mut arc) {
+                    Some(w) => w,
+                    None => {
+                        self.put_back(fd, ResourceHandle::PipeWriter(arc), reg);
+                        return Err(SysError::InvalidInput);
+                    }
+                };
+                wh.write_all(data).await
+            };
             self.put_back(fd, ResourceHandle::PipeWriter(arc), reg);
+            r?;
             return Ok((Value::Unit, None));
         }
-        // TCP 流（Write 对流的复用，轮换型）。
-        if let Some(cur) = self.stream_fds.get(&fd).copied() {
-            let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
-            {
-                let s = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-                s.write_all(data).await?;
-            }
+        // TCP 流（Write 对流的复用，轮换型；错误路径恢复句柄，blocker-3）。
+        if self.stream_fds.contains_key(&fd) {
+            let mut arc = self.take_tcp_stream(fd, reg)?;
+            let r = {
+                let s = match Arc::get_mut(&mut arc) {
+                    Some(s) => s,
+                    None => {
+                        self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+                        return Err(SysError::InvalidInput);
+                    }
+                };
+                s.write_all(data).await
+            };
             self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+            r?;
             return Ok((Value::Unit, None));
         }
         Err(SysError::NotFound)
@@ -476,19 +527,22 @@ impl TokioExecutor {
         len: usize,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self
-            .stream_fds
-            .get(&fd)
-            .copied()
-            .ok_or(SysError::NotFound)?;
-        let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
+        let mut arc = self.take_tcp_stream(fd, reg)?;
         let mut buf = vec![0u8; len];
         let n = {
-            let s = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-            s.read(&mut buf).await?
+            // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
+            let s = match Arc::get_mut(&mut arc) {
+                Some(s) => s,
+                None => {
+                    self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+                    return Err(SysError::InvalidInput);
+                }
+            };
+            s.read(&mut buf).await
         };
-        buf.truncate(n);
         self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+        let n = n?;
+        buf.truncate(n);
         Ok((Value::Bytes(buf), None))
     }
 
@@ -498,17 +552,20 @@ impl TokioExecutor {
         data: &[u8],
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self
-            .stream_fds
-            .get(&fd)
-            .copied()
-            .ok_or(SysError::NotFound)?;
-        let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
-        {
-            let s = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-            s.write_all(data).await?;
-        }
+        let mut arc = self.take_tcp_stream(fd, reg)?;
+        let r = {
+            // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
+            let s = match Arc::get_mut(&mut arc) {
+                Some(s) => s,
+                None => {
+                    self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+                    return Err(SysError::InvalidInput);
+                }
+            };
+            s.write_all(data).await
+        };
         self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+        r?;
         Ok((Value::Unit, None))
     }
 
@@ -518,20 +575,47 @@ impl TokioExecutor {
         how: &std::net::Shutdown,
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let cur = self
-            .stream_fds
-            .get(&fd)
-            .copied()
-            .ok_or(SysError::NotFound)?;
-        let arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
+        let arc = self.take_tcp_stream(fd, reg)?;
         // tokio 未公开 std::net::Shutdown 的 Read/Both 语义（shutdown_std 为
         // pub(super)），经 std 层往返实现完整 how 语义（被 Dup 共享时无法 → InvalidInput）。
-        let stream = Arc::try_unwrap(arc)
-            .map_err(|_| SysError::InvalidInput)?
-            .into_std()?;
-        stream.set_nonblocking(true)?;
-        stream.shutdown(*how)?;
-        let stream = tokio::net::TcpStream::from_std(stream)?;
+        let stream = match Arc::try_unwrap(arc) {
+            Ok(s) => s,
+            Err(arc) => {
+                // 被 Dup 共享（仍有强引用）：恢复注册表条目与内部映射（blocker-3）。
+                self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+                return Err(SysError::InvalidInput);
+            }
+        };
+        // std 往返的每一步失败都尽量恢复句柄（blocker-3）：set_nonblocking/shutdown
+        // 失败时 std 句柄仍在手，可重新包装回 tokio 放回注册表。
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(e) => return Err(SysError::from(e)), // 底层句柄失效，无法恢复（深边缘）。
+        };
+        if let Err(e) = std_stream.set_nonblocking(true) {
+            let err = SysError::from(e);
+            return match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(s) => {
+                    self.put_back(fd, ResourceHandle::TcpStream(Arc::new(s)), reg);
+                    Err(err)
+                }
+                Err(_) => Err(err), // 恢复失败（深边缘）：std 句柄被 from_std 消费。
+            };
+        }
+        if let Err(e) = std_stream.shutdown(*how) {
+            let err = SysError::from(e);
+            return match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(s) => {
+                    self.put_back(fd, ResourceHandle::TcpStream(Arc::new(s)), reg);
+                    Err(err)
+                }
+                Err(_) => Err(err),
+            };
+        }
+        let stream = match tokio::net::TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => return Err(SysError::from(e)), // std 句柄被 from_std 消费，无法恢复。
+        };
         self.put_back(fd, ResourceHandle::TcpStream(Arc::new(stream)), reg);
         Ok((Value::Unit, None))
     }
@@ -641,11 +725,33 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let fd = self.children.get(&pid).copied().ok_or(SysError::NotFound)?;
-        let mut arc = Self::as_child(reg.take(fd).ok_or(SysError::NotFound)?)?;
+        let mut arc = match reg.take(fd).ok_or(SysError::NotFound)? {
+            ResourceHandle::Child(a) => a,
+            h => {
+                // 类型不符：恢复注册表条目与 pid 映射（blocker-3）。
+                let new_fd = reg.allocate(h);
+                self.children.insert(pid, new_fd);
+                return Err(SysError::InvalidInput);
+            }
+        };
         let status = {
-            // 被 Dup 共享时无法 &mut → InvalidInput（注释）。
-            let child = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-            child.wait().await?
+            // 被 Dup 共享时无法 &mut → InvalidInput（注释）；错误路径恢复句柄（blocker-3）。
+            let child = match Arc::get_mut(&mut arc) {
+                Some(c) => c,
+                None => {
+                    self.put_child_back(pid, arc, reg);
+                    return Err(SysError::InvalidInput);
+                }
+            };
+            child.wait().await
+        };
+        // wait 失败（如 ECHILD）：句柄恢复，后续 Close/Kill 仍可寻址（blocker-3）。
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => {
+                self.put_child_back(pid, arc, reg);
+                return Err(SysError::from(e));
+            }
         };
         self.children.remove(&pid);
         // 信号终止时无退出码 → 1（Unix 惯例 128+signal 留作注释）。
@@ -660,7 +766,15 @@ impl TokioExecutor {
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
         let fd = self.children.get(&pid).copied().ok_or(SysError::NotFound)?;
-        let mut arc = Self::as_child(reg.take(fd).ok_or(SysError::NotFound)?)?;
+        let mut arc = match reg.take(fd).ok_or(SysError::NotFound)? {
+            ResourceHandle::Child(a) => a,
+            h => {
+                // 类型不符：恢复注册表条目与 pid 映射（blocker-3，与 op_wait 一致）。
+                let new_fd = reg.allocate(h);
+                self.children.insert(pid, new_fd);
+                return Err(SysError::InvalidInput);
+            }
+        };
         let res = {
             let child = match Arc::get_mut(&mut arc) {
                 Some(c) => c,
@@ -705,8 +819,12 @@ impl TokioExecutor {
         len: usize,
         prot: &MmapProt,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let _ = (len, prot); // len/prot 忽略：读入内存即完成映射语义（用户态 COW）。
-        let bytes = tokio::fs::read(path).await?;
+        let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
+        let mut bytes = tokio::fs::read(path).await?;
+        // 按 len 截断（medium-7）：映射长度语义；文件短于 len 时返回实际长度。
+        if bytes.len() > len {
+            bytes.truncate(len);
+        }
         // undo=None：内存 COW 语义，撤销由上层（A2 用户态 COW 层）负责。
         Ok((Value::Bytes(bytes), None))
     }
@@ -802,22 +920,35 @@ impl TokioExecutor {
         let written = if let Some(m) = self.files.get(&out) {
             let mut g = m.lock().await;
             g.write(&buf).await?
-        } else if let Some(cur) = self.stream_fds.get(&out).copied() {
-            let mut arc = Self::as_tcp_stream(reg.take(cur).ok_or(SysError::NotFound)?)?;
+        } else if self.stream_fds.contains_key(&out) {
+            let mut arc = self.take_tcp_stream(out, reg)?;
             let n = {
-                let s = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-                s.write(&buf).await?
+                // 错误路径恢复句柄（blocker-3）。
+                let s = match Arc::get_mut(&mut arc) {
+                    Some(s) => s,
+                    None => {
+                        self.put_back(out, ResourceHandle::TcpStream(arc), reg);
+                        return Err(SysError::InvalidInput);
+                    }
+                };
+                s.write(&buf).await
             };
             self.put_back(out, ResourceHandle::TcpStream(arc), reg);
-            n
-        } else if let Some(cur) = self.pipe_writer_fds.get(&out).copied() {
-            let mut arc = Self::as_pipe_writer(reg.take(cur).ok_or(SysError::NotFound)?)?;
+            n?
+        } else if self.pipe_writer_fds.contains_key(&out) {
+            let mut arc = self.take_pipe_writer(out, reg)?;
             let n = {
-                let w = Arc::get_mut(&mut arc).ok_or(SysError::InvalidInput)?;
-                w.write(&buf).await?
+                let w = match Arc::get_mut(&mut arc) {
+                    Some(w) => w,
+                    None => {
+                        self.put_back(out, ResourceHandle::PipeWriter(arc), reg);
+                        return Err(SysError::InvalidInput);
+                    }
+                };
+                w.write(&buf).await
             };
             self.put_back(out, ResourceHandle::PipeWriter(arc), reg);
-            n
+            n?
         } else {
             return Err(SysError::NotFound);
         };
