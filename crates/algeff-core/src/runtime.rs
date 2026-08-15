@@ -400,9 +400,6 @@ fn virtual_get_time(_ctx: &mut Context, _op: &DataOp) -> Option<Value> {
 ///   Sleep 永不触发）；
 /// - 慢 syscall（墙钟 100ms > 10ms）→ 墙钟通道触发（原 `timeout_fires_on_timeout`
 ///   语义，VC 下保持）；
-///   Sleep 永不触发）；
-/// - 慢 syscall（墙钟 100ms > 10ms）→ 墙钟通道触发（原 `timeout_fires_on_timeout`
-///   语义，VC 下保持）；
 /// - 瞬时完成的 inner（虚拟 0ms < deadline）→ 返回 inner 结果（错误原样透传）。
 ///
 /// 注意：墙钟通道仍有取消语义（真实超时丢弃飞行中 future，RFC-12 残余缺口
