@@ -13,7 +13,7 @@
 | R1 | ✅ 完成（adversarial_r1.rs 17 测试，5d24166）：游标撤销修复 + Replace 旧 fd 可写反例 + 12 项声称验证 | ✅ 完成（formal-convergence）：P1 有效、P2 有缺口（combine 对称未入 A3 陈述）、P3/P4/P5 部分（证据补足中/句柄反例/映射修正） | 游标恢复（A6 新维度证据）；旧 fd 句柄活性反例（D10/P4 未闭环） | 4 处未收敛点 → 派发修复（A6 批8 隔离测试 / proofs·axioms 修正 / 登记表更新） |
 | R2 | ✅ 完成（adversarial_r2.rs 19 测试，2eb7312）：fd 区间压力/arbiter 争用/R1 回归/错误路径/时间面/资源计数 + RFC-06/07/08 登记 + flaky 修复（写后 flush，Write 返回⇔OS 落盘可观察性契约 D-039） | ✅ 完成（formal-convergence）：P2 收敛为「有效（附声明前提）」；A3 陈述已并入 Sym(f)+Δ-覆盖；RFC-06→D1 边界反例、RFC-08→P4/A6 部分可撤销反例；axioms 总表死信息清除 | RFC-06（fd 二次增长 u64 溢出）、RFC-07（管道半端）、RFC-08（Timeout 孤儿分支） | 3 处登记级未收敛点已修（A3 陈述/P2 同步、总表刷新、RFC-08 编号） |
 | R3 | ✅ 完成（adversarial_r3{a,b,c}.rs 共 28 测试：r3a 11 Catch/Scope/撤销栈 + r3b 9 Alloc/确定性/用户责任 + r3c 8 网络/R2 回归）；发现：闭包盲区实证、SendFile flush 缺口（已修）、锁饥饿（RFC-09）、退避串行化（LOW） | ✅ 完成（formal-convergence）：P3/P5 升级「有效（附范围声明）」；盲区=系统性（链长≥2 仅首 op 可见）→ 前提入 spec 三处；A6/P4 范围限定句（trackΓ+RFC-08/09）落地；P2 闭环确认 | RFC-09（Timeout 锁饥饿）、盲区实证（2 测试）、SendFile flush（D-039 扩展，3922bf6） | 5 处登记级修正已落地（A6/P4 限定句、盲区前提、P3 文本同步、义务表收口、README 计数） |
-| R4 | ✅ 完成（adversarial_r4{a,b,c}.rs 共 32 测试：组合态深挖/多 Runtime 隔离·错误透传·Open 矩阵/规模栈深）；发现：RFC-10（Windows 错误码）、RFC-11（递归栈溢出 HIGH，已修复） | ✅ 完成（formal-convergence）：P1 有效（1000 链规模证据）、P2 有效附声明前提（16 路）、P3/P5 有效附范围声明、P4 收敛中；6 处极小性修正已落地 | RFC-10（Windows errno 映射）、RFC-11（深度守卫，阈值 96，已修） | 收口完成：README 273、A4 证据引用、make_mut 残留清零、RFC-A3-3 核销 |
+| R4 | ✅ 完成（adversarial_r4{a,b,c}.rs 共 32 测试：组合态深挖/多 Runtime 隔离·错误透传·Open 矩阵/规模栈深）；发现：RFC-10（Windows 错误码）、RFC-11（递归栈溢出 HIGH，已修复） | ✅ 完成（formal-convergence）：P1 有效（1000 链规模证据）、P2 有效附声明前提（16 路）、P3/P5 有效附范围声明、P4 收敛中；6 处极小性修正已落地 | RFC-10（Windows errno 映射）、RFC-11（深度守卫，阈值 96，已修） | 收口完成：README 276、A4 证据引用、make_mut 残留清零、RFC-A3-3 核销 |
 | R5 | 待启动（终轮） | 待派 | — | — |
 
 ## 义务明细
