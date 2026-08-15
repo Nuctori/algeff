@@ -44,7 +44,7 @@
 - `SyscallExecutor`：dyn 兼容 trait（方法返回 `BoxFuture`，非 async fn）——决策 D3。
 - `UndoOp = Pin<Box<dyn Future<Output=()> + Send>>`：异步逆操作——决策 D4。
 
-## 3. 契约决策（D1–D8）
+## 3. 契约决策（D1–D14）
 
 | # | 决策 | 理由 |
 | --- | --- | --- |
@@ -61,6 +61,7 @@
 | D11 | `Alloc` 返回 `Value::Bytes(vec![0; len])` | 确定性；COW 优化留给 A2 自选 |
 | D12 | 路径规范化：词法（绝对化+消除 `.`/`..`），不碰真实 FS | 确定性；符号链接解析属物理层 |
 | D13 | `ResourceRegistry` 实现 `Clone` | Fork 并行时子任务隔离状态，完成后合并回父（A1 审计补录） |
+| D14 | Fork 阶段 1 语义：静态冲突检测 + 顺序执行（left→right→combine）；并行化由 A7 基准驱动（阶段 3） | A3 交换律是「可并行」而非「必须并行」；顺序执行保持 combine 语义且零状态共享风险 |
 
 ## 4. 阶段门禁（CTO 执行）
 
