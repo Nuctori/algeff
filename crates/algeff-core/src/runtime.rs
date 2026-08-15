@@ -87,7 +87,7 @@ impl UndoStack {
 }
 
 #[cfg(feature = "coeffects")]
-use crate::coeffects::{CoeffectStore, Component};
+use crate::coeffects::{Activation, CoeffectStore, Component, ComponentState, DepKey};
 
 /// Algeff 运行时（pdr.md §12.3）。
 ///
@@ -104,6 +104,9 @@ pub struct Runtime {
     dependency_table: Option<CoeffectStore>,
     #[cfg(feature = "coeffects")]
     loaded_components: Option<Vec<Component>>,
+    /// 组件满足状态机（与 `loaded_components` 索引对齐，pdr.md §5.2.2 notify）。
+    #[cfg(feature = "coeffects")]
+    component_state: Option<ComponentState>,
     /// 自持 tokio reactor。注意：`Runtime::new` 需在 tokio 上下文之外调用（D9）。
     reactor: tokio::runtime::Runtime,
 }
@@ -119,6 +122,8 @@ impl Runtime {
             dependency_table: Some(CoeffectStore::new()),
             #[cfg(feature = "coeffects")]
             loaded_components: Some(Vec::new()),
+            #[cfg(feature = "coeffects")]
+            component_state: Some(ComponentState::new()),
             reactor: tokio::runtime::Runtime::new()
                 .expect("Runtime::new: 无法创建 tokio reactor（已在 tokio 上下文中？）"),
         }
@@ -139,6 +144,49 @@ impl Runtime {
     #[cfg(feature = "coeffects")]
     pub fn dependency_table(&mut self) -> Option<&CoeffectStore> {
         self.dependency_table.as_ref()
+    }
+
+    /// `loaded_components` 的公开可变存取（pdr.md §12.3）：注册组件 = push。
+    #[cfg(feature = "coeffects")]
+    pub fn components(&mut self) -> Option<&mut Vec<Component>> {
+        self.loaded_components.as_mut()
+    }
+
+    /// 组件同步（pdr.md §5.2.2 notify 的运行时载体）：以 `dependency_table`
+    /// 当前快照驱动全部已加载组件的激活/停用状态机，状态翻转时触发组件
+    /// 生命周期回调，返回 (组件索引, Activation) 事件列表（仅翻转事件）。
+    /// 依赖表或组件列表未初始化（None）时返回空列表。
+    #[cfg(feature = "coeffects")]
+    pub async fn sync_components(&mut self) -> Vec<(usize, Activation)> {
+        let Some(store) = self.dependency_table.as_ref() else {
+            return Vec::new();
+        };
+        let Some(state) = self.component_state.as_mut() else {
+            return Vec::new();
+        };
+        let Some(comps) = self.loaded_components.as_mut() else {
+            return Vec::new();
+        };
+        state.sync(comps, store).await
+    }
+
+    /// 注册依赖 k ↦ v（pdr.md §5.2.3 依赖作为效果）：包装 `CoeffectStore::set`，
+    /// 逆操作压入撤销栈——`recover()` 一并撤销依赖，实现效果与余效应的统一。
+    /// 返回一份等价逆操作供调用方即时撤销；栈内副本由 `recover()` 消费，
+    /// 两份只应执行其中一份（pdr.md §5.2.3 可逆性保证）。
+    /// 依赖表未初始化（None）时返回 ENOSYS（`SysError::Other(38)`）。
+    #[cfg(feature = "coeffects")]
+    pub async fn set_dependency(
+        &mut self,
+        k: DepKey,
+        v: Value,
+    ) -> Result<UndoOp, SysError> {
+        let Some(store) = self.dependency_table.as_ref() else {
+            return Err(SysError::Other(38));
+        };
+        let (undo, handed) = store.set_replicated(k, v).await;
+        self.undo_stack.push(undo);
+        Ok(handed)
     }
 
     #[cfg(feature = "virtual-clock")]
