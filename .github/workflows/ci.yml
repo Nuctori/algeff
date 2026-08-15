@@ -21,7 +21,6 @@ jobs:
         # 语义存在差异，仅此平台可捕获），并构成 ubuntu/windows/macos 三平台矩阵覆盖。
         os: [ubuntu-latest, windows-latest, macos-latest]
 
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4

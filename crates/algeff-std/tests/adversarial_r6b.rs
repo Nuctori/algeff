@@ -9,8 +9,8 @@
 //! 1. **文件面**：Open/Stat/Truncate/Unlink/Rename/Mkdir/Rmdir/ReadDir 不存在的
 //!    路径（NotFound）、写只读句柄（Windows PermissionDenied / Unix Other(9)
 //!    EBADF——平台固有差异，非 RFC-10 回归）；
-//! 2. **管道面**：读端关闭后写（Windows BrokenPipe / Unix Other(0)——后者为
-//!    RFC-10 未覆盖的纯 kind 错误（无 raw errno）语义丢失点，见文件内注释）、
+//! 2. **管道面**：读端关闭后写（两平台均 BrokenPipe——JD-1 kind-first 后
+//!    纯 kind 错误语义统一；修复前 Unix 为 Other(0)，见文件内注释）、
 //!    SendFile 到无读端管道 + SendFile 自拷贝（InvalidInput）；
 //! 3. **网络面**：UDP 绑占用端口（Other(98) EADDRINUSE，与 rfc10 场景同源，
 //!    本文件补状态毒化断言：首 socket 不受影响、Close 后端口可复用）；
@@ -519,10 +519,9 @@ fn r6b_write_readonly_fd_error_no_poison_linearity() {
 /// （`BrokenPipe.into()`，无 raw errno，tokio io/util/mem.rs:279）。RFC-10
 /// 两平台行为：
 /// - Windows：kind 优先路径 BrokenPipe → errno 32 → `SysError::BrokenPipe`；
-/// - Unix：`to_sys_err` = 冻结 `From<io::Error>`（raw_os_error 优先），纯
-///   kind 错误 raw=None → **`Other(0)`，kind 语义丢失** —— RFC-10 未覆盖的
-///   跨平台不一致点（error.rs 冻结 + src 禁止修改，记录不修；Windows 实测值
-///   优先断言，Unix 分支断言 Other(0) 并注明）。
+/// - Unix：JD-1（609c393）后同样走 kind-first——纯 kind 错误
+///   raw=None → `SysError::BrokenPipe`（修复前冻结 From 透传为 `Other(0)`，
+///   kind 语义丢失；R6 审查 Blocker 已同步断言）。
 ///
 /// 状态毒化面：无 undo；Close 写端后 Write → NotFound（映射干净释放）。
 /// 句柄恢复（put_back，blocker-3）的重复错误断言见
@@ -572,9 +571,9 @@ fn r6b_pipe_write_no_reader_error() {
     #[cfg(unix)]
     assert_eq!(
         e,
-        SysError::Other(0),
-        "Unix：duplex BrokenPipe（纯 kind，raw=None）→ 冻结 From → Other(0)——\
-         RFC-10 未修复的 kind 语义丢失点（Unix 分支；Windows 为 BrokenPipe）"
+        SysError::BrokenPipe,
+        "Unix：duplex BrokenPipe（纯 kind，raw=None）→ kind-first 路径 → BrokenPipe\
+         （JD-1 修复后；修复前冻结 From 透传为 Other(0)，R6 审查 Blocker 同步）"
     );
     assert!(rt.undo_stack().is_empty(), "失败的 Write 不产生 undo");
 
@@ -663,12 +662,11 @@ async fn r6b_pipe_write_no_reader_error_handle_restored() {
     )
     .await;
     #[cfg(windows)]
-    assert_eq!(e1, SysError::BrokenPipe, "Windows：无读端写 → BrokenPipe");
     #[cfg(unix)]
     assert_eq!(
         e1,
-        SysError::Other(0),
-        "Unix：无读端写 → Other(0)（纯 kind 错误，见 r6b_pipe_write_no_reader_error 注）"
+        SysError::BrokenPipe,
+        "Unix：无读端写 → BrokenPipe（纯 kind → kind-first，JD-1 修复后；修复前 Other(0)）"
     );
 
     // 第二次写：同一错误（非 NotFound）——put_back 已恢复句柄与映射。
@@ -757,8 +755,8 @@ fn r6b_send_file_closed_pipe_error_and_self_copy_invalid() {
     #[cfg(unix)]
     assert_eq!(
         e,
-        SysError::Other(0),
-        "Unix：SendFile 到无读端管道 → Other(0)（纯 kind 错误 raw=None；同上注明）"
+        SysError::BrokenPipe,
+        "Unix：SendFile 到无读端管道 → BrokenPipe（纯 kind → kind-first，JD-1 修复后）"
     );
     assert!(rt.undo_stack().is_empty(), "失败的 SendFile 不产生 undo");
 
@@ -860,12 +858,11 @@ async fn r6b_send_file_error_handle_restored() {
     };
     let e1 = exec_err(&mut ex, &mut reg, &op).await;
     #[cfg(windows)]
-    assert_eq!(e1, SysError::BrokenPipe, "Windows：SendFile 到无读端管道");
     #[cfg(unix)]
     assert_eq!(
         e1,
-        SysError::Other(0),
-        "Unix：SendFile 到无读端管道 → Other(0)（纯 kind 错误，同上注明）"
+        SysError::BrokenPipe,
+        "Unix：SendFile 到无读端管道 → BrokenPipe（纯 kind → kind-first，JD-1 修复后）"
     );
 
     // 第二次 SendFile：同一错误（非 NotFound）——输出句柄已恢复（blocker-3）。
