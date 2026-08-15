@@ -69,8 +69,6 @@ const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 /// errno，透传语义与冻结面
 /// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
 /// （JD-3：其全部条目已被 kind 臂覆盖）。
-/// （Other(raw)）；Unix 上 raw 即 POSIX errno，透传语义与冻结面
-/// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
 /// （JD-3：其全部条目已被 kind 臂覆盖）。
 fn to_sys_err(e: std::io::Error) -> SysError {
     // ErrorKind 优先：语义映射不受平台码值漂移影响（比手写平台码表更稳健）。
