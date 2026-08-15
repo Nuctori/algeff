@@ -306,20 +306,21 @@ fn fix_five_point_regression_single_blueprint() {
     let phase5 = Action::Catch {
         action: Box::new(nested_seq(95)),
         handler: Box::new(|e| {
-            assert_eq!(e, SysError::Other(105), "阶段5：深度守卫错误（ENOBUFS=105）");
+            assert_eq!(
+                e,
+                SysError::Other(105),
+                "阶段5：深度守卫错误（ENOBUFS=105）"
+            );
             Action::Pure(Value::U64(1))
         }),
     };
 
     // 同一组合蓝图：五阶段依次接续（Sequential 链）。
-    let bp = adapters::and_then(
-        phase1,
-        move |_| {
-            adapters::and_then(phase2, move |_| {
-                adapters::and_then(phase3, move |_| adapters::and_then(phase4, move |_| phase5))
-            })
-        },
-    );
+    let bp = adapters::and_then(phase1, move |_| {
+        adapters::and_then(phase2, move |_| {
+            adapters::and_then(phase3, move |_| adapters::and_then(phase4, move |_| phase5))
+        })
+    });
     let v = rt.run_blocking(bp).unwrap();
     assert_eq!(v, Value::U64(1), "五阶段依次执行，末阶段返回 handler 值");
 
@@ -342,7 +343,11 @@ fn fix_five_point_regression_single_blueprint() {
             Action::Pure,
         ))
         .unwrap();
-    assert_eq!(pos, Value::U64(0), "阶段1：undo 恢复游标到写前位置 0（非写后 2）");
+    assert_eq!(
+        pos,
+        Value::U64(0),
+        "阶段1：undo 恢复游标到写前位置 0（非写后 2）"
+    );
 
     // 2. flush 可见性：阶段 2 写入已落盘（内联断言之外再确认）。
     let _pb_fd = pb_fd.lock().unwrap().expect("阶段2 Open 已执行");
@@ -354,10 +359,18 @@ fn fix_five_point_regression_single_blueprint() {
 
     // 3. put_back：写失败后句柄未被吞 → 双端 Close 均成功（未吞句柄证明）。
     let (rfd, wfd) = pipe_fds.lock().unwrap().expect("阶段3 PipeOpen 已执行");
-    rt.run_blocking(syscall(DataOp::Close { fd: rfd }, vec![ow(rfd)], Action::Pure))
-        .unwrap();
-    rt.run_blocking(syscall(DataOp::Close { fd: wfd }, vec![ow(wfd)], Action::Pure))
-        .unwrap();
+    rt.run_blocking(syscall(
+        DataOp::Close { fd: rfd },
+        vec![ow(rfd)],
+        Action::Pure,
+    ))
+    .unwrap();
+    rt.run_blocking(syscall(
+        DataOp::Close { fd: wfd },
+        vec![ow(wfd)],
+        Action::Pure,
+    ))
+    .unwrap();
 
     // 4. WouldBlock 后胜者锁 undo 保留、无状态毒化（阶段 4 锁 undo 仍在栈上）。
     assert_eq!(
@@ -532,11 +545,7 @@ fn combo_storm_50_rounds_catch_fork_timeout_scope_trajectory() {
         // 轨迹一致（2）：Scope finally 恢复 cwd。
         assert_eq!(rt.context().cwd, before, "第 {i} 轮 Scope 退出后 cwd 恢复");
         // 轨迹一致（3）+ flush 回归：右分支 Write 立即可观察（覆盖原文同长前缀）。
-        let expect = [
-            data.clone(),
-            b"storm-original"[data.len()..].to_vec(),
-        ]
-        .concat();
+        let expect = [data.clone(), b"storm-original"[data.len()..].to_vec()].concat();
         assert_eq!(
             std::fs::read(&pa).unwrap(),
             expect,
@@ -616,7 +625,11 @@ fn interact_depth_guard_clean_registry_then_new_blueprint() {
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
-    assert_eq!(std::fs::read(&pa).unwrap(), b"ig-original", "新蓝图 undo 恢复");
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"ig-original",
+        "新蓝图 undo 恢复"
+    );
 }
 
 /// WouldBlock 后同 id 重试成功：首锁成功（undo 入栈）→ 同 id 二次加锁
@@ -716,7 +729,11 @@ fn interact_flush_undo_restores_content_and_cursor() {
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
-    assert_eq!(std::fs::read(&pa).unwrap(), b"hello world", "undo 恢复写前内容");
+    assert_eq!(
+        std::fs::read(&pa).unwrap(),
+        b"hello world",
+        "undo 恢复写前内容"
+    );
     let pos = rt
         .run_blocking(syscall(
             DataOp::Seek {
