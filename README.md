@@ -32,13 +32,13 @@ Algeff（Algebraic Effects）是一份独立于宿主语言的理论规范与工
 | `algeff-core` 解释器（13 种 Action 节点 + UndoStack + Runtime + ResourceArbiter + Fork 并行（D17）；coeffects/virtual-clock 为可选特性） | 已实现并合并（A2/A3/A6） | 90（单元 15 + 集成 75） | 无（契约冻结） |
 | `algeff-std`（TokioExecutor 全 DataOp + 预包装适配器 + 值流组合器 + 错误路径句柄恢复） | 已实现并合并（A5） | 28（adapters 5 + adapters_flow 6 + e2e 4 + executor 13） | 无 |
 | `algeff-macro`（plan!/fork!/scope!/choose!） | 已实现并合并（A4） | 19 + 8 doc-test | 无（可选语法糖） |
-| 基准 benches（echo/parallel_reads/shared_read/append + algeff 对比臂） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 阶段 3 Fork 并行调度落地后刷新对比列 |
+| 基准 benches（echo/parallel_reads/shared_read/append + algeff 对比臂） | 已合并（A7），`scripts/perf.sh` 可跑基线 | — | 并行读对比列受 executor 锁串行化限制（pdr §17 已知局限，阶段 3+ 重构） |
 | CI（`.github/workflows/ci.yml`） | ubuntu + windows：fmt/clippy/test + feature 测试 + mdBook 构建 | — | — |
 | 文档（`docs/` mdBook + `spec/` 形式化） | 已齐备（G3 门禁） | — | — |
 
-- 测试合计：`cargo test --workspace` 151 个测试函数全绿（24 个测试二进制 + 3 个 doc-test 运行）。
+- 测试合计：`cargo test --workspace` 157 个测试函数全绿（21 个测试二进制 + 3 个 doc-test 运行）。
 - 特性测试：`crates/algeff-core/tests/runtime_features.rs` 的 7 个测试由 `--features coeffects,virtual-clock` 门控，默认测试不含；CI 双平台补跑 `cargo test --workspace --features coeffects,virtual-clock` 覆盖。
-- 性能基线：`perf/baseline-2026-08-15.txt`（A7 批 2 + 批 3），含原生 tokio 参照列与 Algeff 对比列（echo 100.0%、parallel_reads 340.0%、shared_read 307.6%、append 29.4%），接入说明见 `crates/algeff-std/benches/README.md`。
+- 性能基线：`perf/baseline-2026-08-15.txt`（A7 批 2-4），含原生 tokio 参照列与 Algeff 对比列（D17 并行 Fork 后复测：echo 103.1%、parallel_reads 366.2%、shared_read 570.9%、append 24.3%；批 3 D14 顺序基线保留为历史对照），接入说明见 `crates/algeff-std/benches/README.md`。
 - 发布准备（G4 终验）：三个 crate 的 `cargo publish --dry-run --registry crates-io` 全部通过（RFC-1 已落地：`algeff-std` 的 path 依赖补 `version = 0.1.0`）。`algeff-std` 因依赖尚未真实发布的 `algeff-core`，需 `scripts/release.sh --allow-unpublished-deps`（以本地成员代偿 registry 存在性校验）——属 cargo 固有的发布顺序约束，先真实发布 core、镜像同步后 std 自然解除。
 
 ## 快速开始
