@@ -2,6 +2,7 @@
 name = "algeff-macro"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Algeff 可选语法糖宏（plan!/fork!/scope!/choose!），仅 AST 构造，不参与类型系统"
 
 [lib]
