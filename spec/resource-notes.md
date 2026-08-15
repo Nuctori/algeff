@@ -339,3 +339,37 @@ Mutable 延迟复制——仅克隆 Arc 句柄，首次写入时触发 `clone_da
 
 不选择「放弃」：pdr.md §9.2 与命题 P3 明确将 make_mut 列为物理载体，阶段 3
 并行写需要它。不选择「立即实施」：冻结面内无测试暴露缺口，性价比不足。
+
+## 10. R2 审计已知缺陷登记（RFC-06 / RFC-07）
+
+> R2 对抗审计（`crates/algeff-std/tests/adversarial_r2.rs`）新确认的两项已知缺陷。
+> 均不在冻结面（runtime.rs / executor.rs / resource.rs）允许的最小修复范围内，
+> 以「断言偏差可复现」测试记录，阶段 3+ 修复。
+
+### RFC-06：Fork 右分支分配使父 next_fd 二次增长（fd 区间归一化失效）
+
+右分支在 `k<<48` 预留区间（`offset_next_fd`，F1/S6/A2 全局唯一区间）**实际分配
+fd** 后，`merge` 的归一化分支失效（`fork_region` 已记录但 `next_fd != base+offset`），
+父 `next_fd` 被抬高 `k·2^48`；连续多轮后二次增长（Σk·2^48），~360 轮溢出 u64
+（debug panic / release 回绕 → fd 碰撞）。修复点：`ResourceRegistry::offset_next_fd`
+/ `merge` 的区间归一化（resource.rs，冻结面外）。
+
+测试记录：`adversarial_r2.rs::fd_region_quadratic_growth_known_deviation`（断言
+`next_fd ≥ 2^50` 的爆涨行为可复现）+ `fd_region_seq_overflow_panics_under_500_rounds`
+（debug 下 catch_unwind 捕获 ~360 轮溢出 panic）。修复后两测试会失败，提醒更新。
+
+### RFC-07：管道半端经 Fork registry Clone 共享 Arc → 分支内管道 IO InvalidInput
+
+registry 经 D13 Clone 做分支隔离时，`ResourceHandle::PipeReader/PipeWriter` 的 Arc
+被**共享**（strong_count > 1）。executor 管道路径依赖 `Arc::get_mut`（take/put_back
+轮换，`op_read`/`op_write`），共享下必然失败 → `InvalidInput`。文件工作对象是
+`Arc<tokio::sync::Mutex<File>>`（双表结构，RFC-05 关联），共享下 lock 可用，不受
+影响——管道是唯一未受双表保护的半端类。
+
+用户视角：未 Dup 的管道在 Fork 分支内 IO 被错误拒绝（executor 无法区分「用户 Dup」
+与「Fork registry 克隆」产生的共享）。修复点：executor 管道双表改造（文件式
+Arc<Mutex> 覆盖管道半端，或 §9 的 make_mut + 代际标记），executor 属 A5 域，
+冻结面外。§9.3.1「无测试暴露其缺失」已被本项修正。
+
+测试记录：`adversarial_r2.rs` 分支冲突负载改用文件（`fd_1000_conflict_forks_region_*
+`、`fd_region_quadratic_growth_*`），保留 fd 分配属性覆盖；修复后可将负载改回管道。
