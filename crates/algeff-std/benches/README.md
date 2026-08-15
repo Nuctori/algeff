@@ -110,6 +110,7 @@ can_parallel=true）。批 4 实测 571%（vs 批 3 D14 顺序 308%，**回归**
 顺序无关的并行追加：A3 冲突矩阵 `Append∥Append` 默认串行（契约 D6），Algeff 臂走
 D6 默认串行路径（`Open{append} → Write → Close` × 10 任务顺序展开，CTO 批准）。
 批 4 复测 24.3%（批 3 为 29.4%，无回归）——小负载下串行追加显著快于原生 10 路
+并行追加（tokio::spawn + 同步开销主导）。opt-in 并行
 （`can_parallel_with append_order_insensitive`）留待后续基准驱动。
 
 > **R6 复测（2026-08-16）**：append 39.1%（2.3618 ms）——af27ce9（R1 写可见性修复，D-039
