@@ -66,52 +66,148 @@ pub struct MmapProt {
 #[derive(Debug)]
 pub enum DataOp {
     // 文件
-    Open { path: PathBuf, flags: OpenFlags },
-    Read { fd: Fd, len: usize },
-    Write { fd: Fd, data: Bytes },
-    Close { fd: Fd },
-    Seek { fd: Fd, offset: i64, whence: std::io::SeekFrom },
-    Stat { path: PathBuf },
-    Chmod { path: PathBuf, mode: u32 },
-    Chown { path: PathBuf, uid: u32, gid: u32 },
-    Truncate { path: PathBuf, len: usize },
-    Unlink { path: PathBuf },
-    Rename { from: PathBuf, to: PathBuf },
+    Open {
+        path: PathBuf,
+        flags: OpenFlags,
+    },
+    Read {
+        fd: Fd,
+        len: usize,
+    },
+    Write {
+        fd: Fd,
+        data: Bytes,
+    },
+    Close {
+        fd: Fd,
+    },
+    Seek {
+        fd: Fd,
+        offset: i64,
+        whence: std::io::SeekFrom,
+    },
+    Stat {
+        path: PathBuf,
+    },
+    Chmod {
+        path: PathBuf,
+        mode: u32,
+    },
+    Chown {
+        path: PathBuf,
+        uid: u32,
+        gid: u32,
+    },
+    Truncate {
+        path: PathBuf,
+        len: usize,
+    },
+    Unlink {
+        path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
     // 目录
-    Mkdir { path: PathBuf, mode: u32 },
-    Rmdir { path: PathBuf },
-    ReadDir { path: PathBuf },
+    Mkdir {
+        path: PathBuf,
+        mode: u32,
+    },
+    Rmdir {
+        path: PathBuf,
+    },
+    ReadDir {
+        path: PathBuf,
+    },
     // 网络 TCP
-    TcpBind { addr: SocketAddr },
-    TcpAccept { listener: Fd },
-    TcpConnect { addr: SocketAddr },
-    TcpRead { fd: Fd, len: usize },
-    TcpWrite { fd: Fd, data: Bytes },
-    TcpShutdown { fd: Fd, how: std::net::Shutdown },
+    TcpBind {
+        addr: SocketAddr,
+    },
+    TcpAccept {
+        listener: Fd,
+    },
+    TcpConnect {
+        addr: SocketAddr,
+    },
+    TcpRead {
+        fd: Fd,
+        len: usize,
+    },
+    TcpWrite {
+        fd: Fd,
+        data: Bytes,
+    },
+    TcpShutdown {
+        fd: Fd,
+        how: std::net::Shutdown,
+    },
     // 网络 UDP
-    UdpBind { addr: SocketAddr },
-    UdpRecvFrom { fd: Fd, len: usize },
-    UdpSendTo { fd: Fd, data: Bytes, addr: SocketAddr },
+    UdpBind {
+        addr: SocketAddr,
+    },
+    UdpRecvFrom {
+        fd: Fd,
+        len: usize,
+    },
+    UdpSendTo {
+        fd: Fd,
+        data: Bytes,
+        addr: SocketAddr,
+    },
     // 管道（跨平台实现：tokio duplex，见 contracts.md 决策 D5）
-    PipeOpen { flags: PipeFlags },
+    PipeOpen {
+        flags: PipeFlags,
+    },
     // 进程
-    Spawn { cmd: std::process::Command },
-    Kill { pid: Pid, signal: Signal },
-    Wait { pid: Pid },
+    Spawn {
+        cmd: std::process::Command,
+    },
+    Kill {
+        pid: Pid,
+        signal: Signal,
+    },
+    Wait {
+        pid: Pid,
+    },
     // 信号
-    SendSignal { signal: Signal, pid: Pid },
+    SendSignal {
+        signal: Signal,
+        pid: Pid,
+    },
     // 内存
-    Mmap { path: PathBuf, len: usize, prot: MmapProt },
-    Munmap { addr: usize, len: usize },
+    Mmap {
+        path: PathBuf,
+        len: usize,
+        prot: MmapProt,
+    },
+    Munmap {
+        addr: usize,
+        len: usize,
+    },
     // 时间
     GetTime,
     // 同步
-    MutexLock { id: u64 },
-    MutexUnlock { id: u64 },
+    MutexLock {
+        id: u64,
+    },
+    MutexUnlock {
+        id: u64,
+    },
     // 其他
-    SendFile { out: Fd, input: Fd, offset: usize, len: usize }, // 契约 D8：in→input（保留字）
-    Dup { fd: Fd },
-    Dup2 { old_fd: Fd, new_fd: Fd },
+    SendFile {
+        out: Fd,
+        input: Fd,
+        offset: usize,
+        len: usize,
+    }, // 契约 D8：in→input（保留字）
+    Dup {
+        fd: Fd,
+    },
+    Dup2 {
+        old_fd: Fd,
+        new_fd: Fd,
+    },
 }
 
 /// 蓝图（pdr.md §2.1）。注意：不含 Debug（NextFn 闭包不可 Debug）。

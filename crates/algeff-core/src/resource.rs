@@ -60,9 +60,7 @@ impl From<ResourceInner> for Resource {
     fn from(inner: ResourceInner) -> Self {
         match inner {
             ResourceInner::Fd(fd) => Resource::Fd(fd),
-            ResourceInner::Path(p) => {
-                Resource::Path(p.to_string_lossy().into_owned())
-            }
+            ResourceInner::Path(p) => Resource::Path(p.to_string_lossy().into_owned()),
             ResourceInner::MemRange(a, b) => Resource::MemRange(a, b),
             ResourceInner::Pid(pid) => Resource::Pid(pid),
             ResourceInner::Signal => Resource::Signal,
@@ -86,46 +84,79 @@ impl<M> TypedResource<M> {
 
 impl TypedResource<ReadOnly> {
     pub fn new_read(inner: ResourceInner) -> Self {
-        Self { inner, _mode: PhantomData }
+        Self {
+            inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_write(self) -> TypedResource<WriteOnly> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_append(self) -> TypedResource<AppendOnly> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_owned(self) -> TypedResource<Owned> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
 }
 
 impl TypedResource<WriteOnly> {
     pub fn new_write(inner: ResourceInner) -> Self {
-        Self { inner, _mode: PhantomData }
+        Self {
+            inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_read(self) -> TypedResource<ReadOnly> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_owned(self) -> TypedResource<Owned> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
 }
 
 impl TypedResource<AppendOnly> {
     pub fn new_append(inner: ResourceInner) -> Self {
-        Self { inner, _mode: PhantomData }
+        Self {
+            inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_read(self) -> TypedResource<ReadOnly> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
     pub fn into_owned(self) -> TypedResource<Owned> {
-        TypedResource { inner: self.inner, _mode: PhantomData }
+        TypedResource {
+            inner: self.inner,
+            _mode: PhantomData,
+        }
     }
 }
 
 impl TypedResource<Owned> {
     pub fn new_owned(inner: ResourceInner) -> Self {
-        Self { inner, _mode: PhantomData }
+        Self {
+            inner,
+            _mode: PhantomData,
+        }
     }
     // Owned 不能降级为 Read/Write，防止意外共享（pdr.md §3.3）。
 }
@@ -286,7 +317,11 @@ impl ResourceRegistry {
     /// 路径规范化：绝对化 + 消除 `.`/`..`（词法，不触碰真实文件系统，
     /// 保证确定性；符号链接解析留给物理执行层）。
     pub fn canonicalize_path(&self, p: &Path, cwd: &Path) -> PathBuf {
-        let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
         let mut out = PathBuf::new();
         for comp in abs.components() {
             match comp {
@@ -306,7 +341,10 @@ mod tests {
     use super::*;
 
     fn usage(r: Resource, m: AccessMode) -> ResourceUsage {
-        ResourceUsage { resource: r, mode: m }
+        ResourceUsage {
+            resource: r,
+            mode: m,
+        }
     }
 
     #[test]
@@ -331,9 +369,18 @@ mod tests {
     fn conflict_matrix_write_blocks() {
         let r = Resource::Fd(1);
         let reg = ResourceRegistry::new();
-        assert!(!reg.can_parallel(&vec![usage(r.clone(), AccessMode::Read)], &vec![usage(r.clone(), AccessMode::Write)]));
-        assert!(!reg.can_parallel(&vec![usage(r.clone(), AccessMode::Write)], &vec![usage(r.clone(), AccessMode::Write)]));
-        assert!(!reg.can_parallel(&vec![usage(r.clone(), AccessMode::Own)], &vec![usage(r.clone(), AccessMode::Read)]));
+        assert!(!reg.can_parallel(
+            &vec![usage(r.clone(), AccessMode::Read)],
+            &vec![usage(r.clone(), AccessMode::Write)]
+        ));
+        assert!(!reg.can_parallel(
+            &vec![usage(r.clone(), AccessMode::Write)],
+            &vec![usage(r.clone(), AccessMode::Write)]
+        ));
+        assert!(!reg.can_parallel(
+            &vec![usage(r.clone(), AccessMode::Own)],
+            &vec![usage(r.clone(), AccessMode::Read)]
+        ));
     }
 
     #[test]
@@ -368,7 +415,9 @@ mod tests {
         // Own 终结，二者互不排斥。
         let mut reg = ResourceRegistry::new();
         let r = Resource::Fd(1);
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok());
         assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
     }
 
@@ -396,10 +445,18 @@ mod tests {
     fn linearity_read_append_repeatable() {
         let mut reg = ResourceRegistry::new();
         let r = Resource::Fd(1);
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Read)).is_ok());
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Read)).is_ok());
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Append)).is_ok());
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Append)).is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Read))
+            .is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Read))
+            .is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Append))
+            .is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Append))
+            .is_ok());
     }
 
     #[test]
@@ -407,7 +464,9 @@ mod tests {
         let mut reg = ResourceRegistry::new();
         let fd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
         let r = Resource::Fd(fd);
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok());
         assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
         assert_eq!(
             reg.check_linear(&usage(r.clone(), AccessMode::Read)),
@@ -417,7 +476,9 @@ mod tests {
         reg.clear();
         // 句柄与线性标记全部清空；fd 分配仍单调递增（不重用）
         assert!(reg.lookup(fd).is_none());
-        assert!(reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok());
+        assert!(reg
+            .check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok());
         assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
     }
 
@@ -447,10 +508,7 @@ mod tests {
                 // 异资源：Δ(a) ∩ Δ(b) = ∅，任何模式组合都可并行（公理 A3）。
                 let a2 = vec![usage(Resource::Fd(1), m1)];
                 let b2 = vec![usage(Resource::Fd(2), m2)];
-                assert!(
-                    reg.can_parallel(&a2, &b2),
-                    "异资源 {m1:?} × {m2:?}"
-                );
+                assert!(reg.can_parallel(&a2, &b2), "异资源 {m1:?} × {m2:?}");
             }
         }
         // Append×Append 顺序无关时 opt-in 并行（pdr.md §9.1 / 决策 D6）
@@ -473,8 +531,17 @@ mod tests {
     fn canonicalize_absolute_and_parents() {
         let reg = ResourceRegistry::new();
         let cwd = Path::new("/app");
-        assert_eq!(reg.canonicalize_path(Path::new("a/./b"), cwd), PathBuf::from("/app/a/b"));
-        assert_eq!(reg.canonicalize_path(Path::new("../x"), cwd), PathBuf::from("/x"));
-        assert_eq!(reg.canonicalize_path(Path::new("/a/b/../c"), cwd), PathBuf::from("/a/c"));
+        assert_eq!(
+            reg.canonicalize_path(Path::new("a/./b"), cwd),
+            PathBuf::from("/app/a/b")
+        );
+        assert_eq!(
+            reg.canonicalize_path(Path::new("../x"), cwd),
+            PathBuf::from("/x")
+        );
+        assert_eq!(
+            reg.canonicalize_path(Path::new("/a/b/../c"), cwd),
+            PathBuf::from("/a/c")
+        );
     }
 }
