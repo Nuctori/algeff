@@ -18,10 +18,10 @@
 
 | 义务 | 形式化陈述 | 数学论证位置 | 测试证据（文件:测试） | 对抗 E2E 补充 | 审计结论 |
 | --- | --- | --- | --- | --- | --- |
-| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity | 轮 R1 | 待 R1 |
-| A2 单位元 | 1;a = a;1 = a | spec/proofs.md | execution_axioms.rs:exec_A2_identity | 轮 R1 | 待 R1 |
-| A3 交换律 | Δ(a)∩Δ(b)=∅ ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs:fork_commutation_disjoint | 轮 R1 | 待 R1 |
-| A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence | 轮 R1 | 待 R1 |
+| A1 结合律 | (a;b);c = a;(b;c) | spec/proofs.md | execution_axioms.rs:exec_A1_associativity + adversarial_r1.rs:conc_repeat_blueprint_100_rounds_deterministic（100 轮确定性=结合律的序列稳定维度） | 轮 R1 ✅ | ✅ 有效（R1：演绎链严格，执行级+对抗双证据） |
+| A2 单位元 | 1;a = a;1 = a | spec/proofs.md | execution_axioms.rs:exec_A2_identity | 轮 R1 ✅ | ✅ 有效（R1：Pure 前缀/后缀/双侧 op 序列一致） |
+| A3 交换律 | Δ(a)∩Δ(b)=∅ ⇒ a∥b=b∥a | spec/proofs.md | commutation.rs:fork_commutation_disjoint + adversarial_r1.rs:conc_fork_parallel_two_files_both_handles_readable（并行双分支句柄活性） | 轮 R1 ✅ | ⚠️ 有缺口（R1：combine 对称性未入 A3 形式化陈述——已记录待 R2 修） |
+| A4 资源线性 | Write/Own 恰好消费一次 | spec/proofs.md | axioms.rs:a4_random_read_write_sequence + adversarial_r1.rs:lin_fork_conflict_double_write_then_parent_blocked（冲突 Fork 后父级拦截）+ lin_stale_fd_write_after_replace_succeeds（Replace 后线性标记清空但句柄残留反例） | 轮 R1 ✅ | ⚠️ 部分（R1：线性标记维度闭环；句柄活性反例→RFC-05 登记） |
 | A5 分支隔离 | 左 Write 不影响右 Read | spec/proofs.md | concurrency_stress.rs:fork_same_fd_write（registry 副本隔离）；branch_isolation.rs（读隔离，A6 批8 补足中） | 轮 R1 | ⚠️ 部分（R1：证据-义务不匹配已识别，读隔离测试补足中） |
 | A6 撤销双态 | w;w̄=1 | spec/proofs.md | execution_axioms.rs:exec_A6_undo_roundtrip + adversarial_r1.rs:rev_undo_restores_file_cursor（游标维度新证据） | 轮 R1 ✅ | ⚠️ 部分（R1：内容+游标维度闭环；句柄活性维度有反例——Replace 后旧 fd 仍可写，RFC-05） |
 | A7 无死锁 | 无循环等待链 | spec/proofs.md + tla/ | arbiter.rs:finite_retry_eventually_succeeds + arbiter_mutex.rs（R-1 强制） | 轮 R1 | ⚠️ 部分→已收敛（R1：模型/原语/执行器三层已交付，运行时载体为「冲突→顺序+分支不相交+单执行器锁」——axioms.md M4 修正后分层如实） |
