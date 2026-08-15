@@ -24,12 +24,16 @@
 //!   ERROR_INVALID_DATA(13)→PermissionDenied、ERROR_TOO_MANY_OPEN_FILES(4)
 //!   →Interrupted、ERROR_SHARING_VIOLATION(32)→BrokenPipe）。正确兜底应为
 //!   未映射码 → `Other(raw)` 而非再经 from_errno。
-//! - F2（跨平台核心逻辑，错误路径毒化）：`check_linear` 在 syscall **执行前**
-//!   插入 Write 消费标记（resource.rs:337），interpret Syscall 臂 exec 失败
-//!   直接上抛不回滚（runtime.rs）→ 失败后同路径再以 Write 模式打开 →
 //!   `InvalidInput`。r4b 的 open_exclusive_existing_fails_no_state_poison 只
 //!   验证了异路径重开（p2），同路径盲区由本文件补齐。与 A7 仲裁「失败回滚」
 //!   原则（executor.rs:442-451）不一致。
+//!
+//! 修复状态（R6 已落地，本文件断言修复后行为）：
+//! - F1 → JD-2（609c393）：kind 臂补 `CrossesDevices → 18`，Windows 跨卷
+//!   rename 现正确映射 `CrossDevice`；未映射码兑底改为 `Other(raw)`（审查
+//!   MEDIUM-1，5648125 后续提交）。
+//! - F2 → RFC-12（6ded2db）：exec 失败路径回滚本批预插入的 Write/Own 标记
+//!   （+ B2 前缀回滚 2bfac05），同路径重试语义恢复。
 //!
 //! 疑似（无测试或仅行为锁定，见对应测试注释）：
 //! - S1：Rmdir 非空 → Windows `Other(145)` vs Unix `Other(39)`（同蓝图跨平台

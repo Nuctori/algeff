@@ -23,8 +23,8 @@
 //! 每个错误路径均断言：① 期望 SysError 变体（本机 Windows 实测值优先；
 //! 与 POSIX 语义有差时断言 Other(n) 并注明）；② 无状态毒化（undo 栈不增长、
 //! registry 不残留句柄、轮换型句柄 put_back 恢复——错误后句柄仍可寻址、
-//! 重复错误同变体而非 NotFound）；③ 线性标记语义（失败的 Syscall 按设计
-//! 消费 Write 标记，但 Own 终结集独立——错误后 Close(Own) 仍合法，r2/r4b
+//! 重复错误同变体而非 NotFound）；③ 线性标记语义（RFC-12 后失败已自动回滚
+//! Write 标记；Own 终结集独立——错误后 Close(Own) 仍合法，r2/r4b
 //! 风格断言）。
 //!
 //! 驱动方式：状态毒化/Catch 断言走 `Runtime::run_blocking`（D9：普通
@@ -238,9 +238,9 @@ fn r6b_unlink_missing_not_found() {
     assert_eq!(e, SysError::NotFound, "Unlink 缺失 → NotFound（跨平台）");
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
 
-    // 重试前 Replace：失败的 Syscall 已消费 wr_path 的 Write 线性标记（A4
-    // check_linear 先行，按设计），Reset 清空标记后同资源可再声明（r1
-    // rev_mkdir 同约定）——错误不粘滞、恢复链完整。
+    // 重试前 Replace（历史测试模式保留）：RFC-12 后失败已自动回滚线性标记，
+    // Replace 仅为额外保险——同资源可再声明（r1 rev_mkdir 同约定）。
+    // 错误不粘滞、恢复链完整。
     std::fs::write(&p, b"x").unwrap();
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
@@ -277,8 +277,8 @@ fn r6b_rename_missing_from_not_found() {
     assert!(!to.exists(), "失败不创建目标");
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
 
-    // 重试前 Replace：清空失败的 Syscall 已消费的 Write 线性标记（同
-    // r6b_unlink 注；r1 rev_mkdir 同约定）。
+    // 重试前 Replace（历史测试模式保留）：RFC-12 后失败已自动回滚线性标记，
+    // Replace 仅为额外保险（同 r6b_unlink 注）。
     std::fs::write(&from, b"x").unwrap();
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
@@ -360,8 +360,8 @@ fn r6b_rmdir_missing_not_found() {
     assert_eq!(e, SysError::NotFound, "Rmdir 缺失 → NotFound（跨平台）");
     assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
 
-    // 重试前 Replace：清空失败的 Syscall 已消费的 Write 线性标记（同
-    // r6b_unlink 注）。
+    // 重试前 Replace（历史测试模式保留）：RFC-12 后失败已自动回滚线性标记，
+    // Replace 仅为额外保险（同 r6b_unlink 注）。
     std::fs::create_dir(&d).unwrap();
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
@@ -468,8 +468,8 @@ fn r6b_write_readonly_fd_error_no_poison_linearity() {
         "失败后只读 fd 仍可寻址"
     );
 
-    // 线性标记：失败 Syscall 已消费 Write 标记（check_linear 先行，按设计），
-    // 但 Own 终结集独立 → 错误后 Close(Own) 仍合法（r2/r4b 风格断言）。
+    // 线性标记（RFC-12 后）：失败 Syscall 的 Write 标记已自动回滚，
+    // Own 终结集独立 → 错误后 Close(Own) 仍合法（r2/r4b 风格断言）。
     rt.run_blocking(syscall(
         DataOp::Close { fd: ro_fd },
         vec![ow(ro_fd)],
@@ -981,13 +981,13 @@ fn r6b_spawn_missing_command_not_found_then_success() {
 
     // 不粘滞：随后真实命令 Spawn + Wait 成功（children 映射干净）。
     #[cfg(windows)]
-    let mut real = {
+    let real = {
         let mut c = std::process::Command::new("cmd");
         c.args(["/C", "exit", "3"]);
         c
     };
     #[cfg(not(windows))]
-    let mut real = {
+    let real = {
         let mut c = std::process::Command::new("sh");
         c.args(["-c", "exit 3"]);
         c

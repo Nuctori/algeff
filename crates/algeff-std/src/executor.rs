@@ -64,7 +64,11 @@ const ARBITER_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 /// Windows WSAEWOULDBLOCK=10035 均解码为 WouldBlock），kind → POSIX errno
 /// 映射天然跨平台正确且不受码值漂移影响。kind 无法归类时 fallback 到
 /// `raw_os_error`：Windows 上 std 已解码的常见 Win32/WSA 码均经 kind 臂命中
-/// （含 WSAECONNABORTED=10053 → ConnectionAborted），未命中码直接透传
+/// （含 WSAECONNABORTED=10053 → ConnectionAborted），未命中码兜底为
+/// **Other(raw)**（避免撞码错映射，F1 文档化方向）；Unix 上 raw 即 POSIX
+/// errno，透传语义与冻结面
+/// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
+/// （JD-3：其全部条目已被 kind 臂覆盖）。
 /// （Other(raw)）；Unix 上 raw 即 POSIX errno，透传语义与冻结面
 /// `From<io::Error>` 一致。原手写 `normalize_windows_errno` 码表删除
 /// （JD-3：其全部条目已被 kind 臂覆盖）。
@@ -101,9 +105,15 @@ fn to_sys_err(e: std::io::Error) -> SysError {
         return SysError::from_errno(errno);
     }
     match e.raw_os_error() {
-        // kind 未命中：Windows 上 std 未解码的码透传为 Other(raw)（JD-3：
-        // 码表删除后，std 已解码码均经 kind 臂命中）；Unix 上 raw 即
-        // POSIX errno，透传与冻结面 From<io::Error> 一致。
+        // kind 未命中兜底（平台分支）：
+        // - Windows：std 未解码的 Win32/WSA 码**不代表 POSIX errno**，直接
+        //   Other(raw) 兜底（F1 文档化方向）——避免撞码错映射：
+        //   ERROR_SHARING_VIOLATION=32 若经 from_errno 会被误标 BrokenPipe（32=EPIPE）、
+        //   ERROR_INVALID_DATA=13 → PermissionDenied、ERROR_TOO_MANY_OPEN_FILES=4 → Interrupted。
+        // - Unix：raw 即 POSIX errno，透传与冻结面 From<io::Error> 一致。
+        #[cfg(windows)]
+        Some(raw) => SysError::Other(raw),
+        #[cfg(not(windows))]
         Some(raw) => SysError::from_errno(raw),
         None => SysError::Other(0),
     }
@@ -1577,6 +1587,24 @@ mod tests {
             to_sys_err(Error::from_raw_os_error(1234)),
             SysError::Other(1234),
             "未映射码透传"
+        );
+        // 撞码防护（审查 MEDIUM-1）：kind 未命中的 Win32 码不得再经
+        // from_errno 重解释——32/13/4 与 POSIX EPIPE/EACCES/EINTR 码值重合，
+        // 修复前会误标 BrokenPipe/PermissionDenied/Interrupted。
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(32)),
+            SysError::Other(32),
+            "ERROR_SHARING_VIOLATION(32) → Other(32)（不得误标 BrokenPipe）"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(13)),
+            SysError::Other(13),
+            "ERROR_INVALID_DATA(13) → Other(13)（不得误标 PermissionDenied）"
+        );
+        assert_eq!(
+            to_sys_err(Error::from_raw_os_error(4)),
+            SysError::Other(4),
+            "ERROR_TOO_MANY_OPEN_FILES(4) → Other(4)（不得误标 Interrupted）"
         );
     }
 
