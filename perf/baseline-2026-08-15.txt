@@ -68,5 +68,84 @@ cargo test --workspace            # G3 回归门禁（提交前验证）
 已知限制：
 - echo 首版参数（30×1000 连接）在 Windows 端口池下不可运行，已按 CTO 裁决
   修改 bench（连接预算 100×1000 往返）；本文件为修改后基线。
-- 所有数值为原生 tokio 参照列；Algeff 对比列待 A5(TokioExecutor)+A2(interpret)
-  合并后补测，接入计划见 crates/algeff-std/benches/README.md。
+- 所有数值为原生 tokio 参照列；Algeff 对比列已于批 3 补测（见下方 [5]-[8] 节，
+  接入计划见 crates/algeff-std/benches/README.md §4）。
+
+--------------------------------------------------------------------------------
+[5]-[8] Algeff 对比列（A7 批 3，2026-08-15 补测；对照 pdr.md §16 性能预期表）
+--------------------------------------------------------------------------------
+对比方式：等负载同参数双对比项（原生参照臂与 Algeff 臂在同一 bench 文件内测量，
+同 setup、同 runtime 线程池配置、同服务端实现），
+对比百分比 = Algeff 中位 / 原生中位 × 100%。
+
+[5] algeff_echo: tokio_native_100conns_x1rtt_1KB vs algeff_100conns_x1rtt_1KB
+    场景:   本地 TCP echo（127.0.0.1），每测量样本 100 连接 × 每连接 1 次
+             1KB 往返（pdr.md §16「网络 Echo（无共享资源）」）
+    负载说明: A4 资源线性（同一资源 Write 恰好消费一次）使批 2 的「100 连接 ×
+             每连接 1000 往返」不可表达（第 2 个往返即 Err(InvalidInput)，见
+             execution_axioms.rs::exec_A4_linearity_runtime）——CTO 裁决改为
+             等负载双对比项（100 连接 × 1 往返）。批 2 的 100×1000 原生基线
+             保留为历史参照列，不可与 Algeff 直接等比。
+    参数:   sample_size=10, warm_up=50ms, measurement_time=100ms
+            （每样本 ~1 iter；Windows 端口池约束限制测量窗口，见已知限制）
+    原生:   time: [31.317 ms 33.193 ms 35.610 ms]   （中位 33.193 ms）
+    Algeff: time: [30.988 ms 33.195 ms 36.498 ms]   （中位 33.195 ms）
+    对比:   Algeff/原生 = 100.0%（pdr 预期 ~103%）
+    备注:   三次实测对比比 96.3% / 116.4% / 100.0% —— 每样本仅 1 iter，受连接
+            延迟噪声限制（±10%），无法可靠区分 103% 预期；点估计取本次 100.0%。
+            解释器 trampoline + A4 线性检查 + 链构建的系统性开销在连接延迟主导
+            的负载下不显著。
+
+[6] algeff_parallel_reads: tokio_native_10x1MB vs algeff_fork10_x1MB
+    场景:   并行读 10 个不同文件（各 1MB，零冲突，pdr.md §16「并行读取 10 个
+             不同文件」）
+    参数:   sample_size=10, measurement_time=3s
+    原生:   time: [3.9290 ms 4.0102 ms 4.1219 ms]   （中位 4.0102 ms；批 2 历史 4.5676 ms）
+    Algeff: time: [11.744 ms 13.635 ms 15.672 ms]   （中位 13.635 ms）
+    对比:   Algeff/原生 = 340.0%（pdr 预期 ~100%）
+    备注:   差距归因契约 D14（Fork 阶段 1 = 静态冲突检测 + 顺序执行）——
+            10 路实际串行执行；并行化属阶段 3 待办（pdr §16 的 ~100% 是
+            并行化后的目标值）。诚实数据，不修饰。
+
+[7] algeff_shared_read: tokio_native_8tasks_8MB vs algeff_fork8_shared_8MB
+    场景:   8 任务并发读同一 8MB 文件（只读共享，pdr.md §16「并行读取同一文件」）
+    参数:   sample_size=10, measurement_time=3s
+    原生:   time: [1.9101 ms 2.0848 ms 2.2742 ms]   （中位 2.0848 ms；批 2 历史 2.2445 ms）
+    Algeff: time: [6.1977 ms 6.4120 ms 6.6885 ms]   （中位 6.4120 ms）
+    对比:   Algeff/原生 = 307.6%（pdr 预期 ~100%）
+    备注:   同 [6]：D14 顺序 Fork 归因。读-读冲突检测通过（can_parallel = true），
+            但执行仍顺序化（阶段 1 语义）。
+
+[8] algeff_append: tokio_native_10tasks_x32KB vs algeff_serial_10tasks_x32KB
+    场景:   10 任务追加同一文件（每任务 32 × 1KB；pdr.md §16「并行追加同一文件」）
+    参数:   sample_size=10, measurement_time=3s
+    原生:   time: [6.5918 ms 6.7828 ms 6.9781 ms]   （中位 6.7828 ms；批 2 历史 7.1652 ms）
+    Algeff: time: [1.8895 ms 1.9943 ms 2.0563 ms]   （中位 1.9943 ms）
+    对比:   Algeff/原生 = 29.4%（pdr 预期 ~100%）
+    备注:   Algeff 走 D6 默认串行路径（10 任务顺序 Open{append}+Write+Close，
+            路径资源声明 AppendOnly 模式，CTO 批准）；该小负载下串行追加
+            （1.99 ms）显著快于原生 10 路并行追加（6.78 ms，tokio::spawn +
+            同步开销主导）——串行默认的诚实数据。原生臂含每任务 flush()
+            （批 2 同款），Algeff 臂走执行器不 flush（小量不对称，如实记录）。
+            opt-in 并行（顺序无关声明 can_parallel_with append_order_insensitive）
+            留给阶段 3。
+
+--------------------------------------------------------------------------------
+本次补测执行命令清单（exit code 均为 0；工作树 .wt/a7，分支 s3/a7）
+--------------------------------------------------------------------------------
+cargo bench --bench algeff_echo -- --test                         # 冒烟（4 个 algeff bench 同）
+cargo bench --bench algeff_echo          # 正式（三次，对比比波动 96-116%）
+cargo bench --bench algeff_parallel_reads
+cargo bench --bench algeff_shared_read
+cargo bench --bench algeff_append
+cargo test --workspace                  # G3 回归门禁（提交前验证）
+
+新增已知限制（批 3）：
+- A4 资源线性使「同一连接 fd 多次 Write」不可表达 → Algeff echo 每连接仅 1 往返
+  （CTO 裁决：等负载双对比项）；Windows 端口池约束进一步限制测量窗口（每样本
+  1 iter → 对比比噪声 ±10%）。更稳的 echo 对比需阶段 3 并行化后加大每样本 iter。
+- parallel_reads/shared_read 的 Algeff 臂受 D14 顺序 Fork 限制（340%/308%）；
+  待阶段 3 Fork 并行调度实现后复测，目标回归 pdr §16 ~100%。
+- append 的 Algeff 臂为 D6 串行路径（29.4%，即 3.4× 快于原生并行）——小负载下
+  并行无益的实证；opt-in 并行路径（can_parallel_with append_order_insensitive）
+  留待阶段 3 基准驱动。

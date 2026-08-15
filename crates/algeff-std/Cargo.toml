@@ -29,3 +29,20 @@ harness = false
 [[bench]]
 name = "append"
 harness = false
+
+# A7 批 3（G3 Algeff 对比列）：Runtime::new(TokioExecutor) + interpret 驱动同一场景
+[[bench]]
+name = "algeff_echo"
+harness = false
+
+[[bench]]
+name = "algeff_parallel_reads"
+harness = false
+
+[[bench]]
+name = "algeff_shared_read"
+harness = false
+
+[[bench]]
+name = "algeff_append"
+harness = false
