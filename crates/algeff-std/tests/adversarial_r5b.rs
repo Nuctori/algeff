@@ -608,7 +608,6 @@ fn fork_sequential_conflict_two_scopes_cwd_not_leaked() {
 #[test]
 fn timeout_nested_3_levels_only_innermost_fires_ontimeout_has_timeout() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let v = rt
         .run_blocking(Action::Timeout {
             action: Box::new(Action::Timeout {

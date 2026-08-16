@@ -135,6 +135,13 @@ def main():
         if "24.3%" in t and "修复前旧数" not in t and "39.1" not in t:
             issues.append(f"[{p}] 24.3% 出现但无「修复前旧数」/39.1 语境（append canonical 现为 39.1）")
 
+    # ---- 8. 合并冲突标记门禁（审查 Note：dx-design 残留教训）----
+    for p in FILES:
+        t = texts[p]
+        for marker in ("<<<<<<<", "=======", ">>>>>>>"):
+            if marker in t:
+                issues.append(f"[{p}] 残留合并冲突标记「{marker}」")
+
     if issues:
         print("=== 差异清单（{} 项）===".format(len(issues)))
         for i in issues:
