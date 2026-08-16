@@ -10,10 +10,14 @@
 //!    do_! 内嵌 plan!/choose!（骨架内声明式子步骤）；
 //! 4. **资源自动推导 + 显式覆盖**——infer_usage 模式表全量断言；
 //!    `syscall_with` 覆盖默认推导。
+//!
+//! 迭代 2 新增（§6）：文件面全操作一个 do_! 覆盖、TCP bind/accept 骨架、
+//! 错误处理 `dx::catch`（do_! 内组合）、do_! 与 plan!/fork! 混合、
+//! munmap/send_file/dup2 包装补齐。
 
 use algeff_core::prelude::*;
 use algeff_core::{AccessMode, MmapProt, OpenFlags, PipeFlags, Resource, ResourceUsage, SysError};
-use algeff_macro::{choose, do_, plan};
+use algeff_macro::{choose, do_, fork, plan};
 use algeff_std::dx;
 use algeff_std::TokioExecutor;
 
@@ -433,4 +437,255 @@ fn empty_block_and_discard_statement() {
         Value::Unit
     };
     assert!(matches!(rt().run_blocking(blueprint).unwrap(), Value::Unit));
+}
+
+// ── 6. 迭代 2：文件全操作 do_! 覆盖 / TCP 骨架 / catch / plan!+fork! 混合 ──
+
+#[test]
+fn file_ops_comprehensive_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("data");
+    let file = sub.join("payload.bin");
+
+    // 一个 do_! 块覆盖文件面常用操作：Mkdir/Open/Write/Seek/Read/Stat/Close/
+    // Unlink。尾表达式组合两个链内值（Value::List），全链真实执行。
+    // 注：file 在链内多处使用，clone 后 move 进闭包（'static），外部保留原件断言。
+    let fc = file.clone();
+    let blueprint = do_! {
+        dx::mkdir(&sub, 0o755);
+        let fd = dx::open(fc.clone(), open_rw_create());
+        dx::write(&fd, b"dx roundtrip".to_vec());
+        dx::seek(&fd, 0, std::io::SeekFrom::Start(0));
+        let data = dx::read(&fd, 64);
+        let meta = dx::stat(fc.clone());
+        dx::close(&fd);
+        dx::unlink(fc.clone());
+        Value::List(vec![data, meta])
+    };
+
+    let v = rt().run_blocking(blueprint).unwrap();
+    match v {
+        Value::List(items) => {
+            assert_eq!(items[0], Value::Bytes(b"dx roundtrip".to_vec()), "读回内容");
+            assert_eq!(
+                items[1],
+                Value::List(vec![Value::U64(12), Value::Bool(false), Value::Bool(true)]),
+                "stat → List([len, is_dir, is_file])"
+            );
+        }
+        other => panic!("期望 List，得到 {other:?}"),
+    }
+    assert!(!file.exists(), "unlink 后文件应已删除");
+    assert!(sub.exists(), "unlink 只删文件，目录仍在");
+}
+
+#[test]
+fn tcp_bind_accept_skeleton() {
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    // 骨架：bind → accept → close（不真实 accept——需并发客户端，见 docs）。
+    let blueprint = do_! {
+        let listener = dx::open_tcp(addr);
+        let _conn = dx::accept(&listener);
+        dx::close(&listener);
+        Value::Unit
+    };
+
+    // 结构断言：链首 Syscall(TcpBind)，资源空集（运行时句柄，pdr.md §18）。
+    let Action::Sequential { current, next } = blueprint else {
+        panic!("do_! 应展开为 Sequential 链");
+    };
+    let Action::Syscall { op, resources, .. } = *current else {
+        panic!("链首应为 Syscall(TcpBind)");
+    };
+    assert!(matches!(op, DataOp::TcpBind { .. }));
+    assert_eq!(resources, vec![], "TcpBind 新句柄静态不可声明 → 空集");
+
+    // 第 2 步：accept，listener 值（Fd）经 CPS 值流贯穿。
+    let Action::Sequential { current, .. } = next(Value::Fd(0)) else {
+        panic!("第 2 步应为 Sequential");
+    };
+    let Action::Syscall { op, .. } = *current else {
+        panic!("第 2 步应为 Syscall(TcpAccept)");
+    };
+    assert!(matches!(op, DataOp::TcpAccept { listener: 0 }));
+
+    // 真实执行（仅 bind → close：127.0.0.1:0 由内核分配端口，不阻塞）。
+    let v = rt()
+        .run_blocking(do_! {
+            let listener = dx::open_tcp(addr);
+            dx::close(&listener);
+            Value::Unit
+        })
+        .unwrap();
+    assert_eq!(v, Value::Unit);
+}
+
+#[test]
+fn catch_handles_error_and_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no_such.txt");
+    let fallback = dir.path().join("fallback.txt");
+    let fb = fallback.clone(); // handler 需 'static：clone 后 move 进闭包
+
+    // do_! 内 dx::catch：Open 缺失文件失败 → handler 收到真实 SysError，
+    // 返回替代 Action（打开可创建文件）→ 链继续，fd 绑定 = handler 的结果值。
+    let blueprint = do_! {
+        let fd = dx::catch(
+            dx::open(&missing, OpenFlags {
+                read: true,
+                ..Default::default()
+            }),
+            move |e| {
+                assert!(matches!(e, SysError::NotFound), "handler 应收到 NotFound");
+                dx::open(fb.clone(), open_rw_create())
+            },
+        );
+        dx::write(&fd, b"recovered".to_vec());
+        dx::seek(&fd, 0, std::io::SeekFrom::Start(0));
+        let data = dx::read(&fd, 64);
+        dx::close(&fd);
+        data
+    };
+
+    let v = rt().run_blocking(blueprint).unwrap();
+    assert_eq!(v, Value::Bytes(b"recovered".to_vec()));
+    assert_eq!(
+        std::fs::read(&fallback).unwrap(),
+        b"recovered",
+        "handler 的替代路径真实落盘"
+    );
+}
+
+#[test]
+fn catch_success_passthrough_skips_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.txt");
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_c = ran.clone();
+
+    // 成功路径：值原样贯穿、handler 不执行。若 handler 误执行会返回 Unit，
+    // 后续 dx::close(&fd) 的 expect_fd 立即 panic——结构上证明未走 handler。
+    let blueprint = do_! {
+        let fd = dx::catch(
+            dx::open(&good, open_rw_create()),
+            move |_e| {
+                ran_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                dx::unit()
+            },
+        );
+        dx::write(&fd, b"ok".to_vec());
+        dx::close(&fd);
+        Value::Unit
+    };
+
+    rt().run_blocking(blueprint).unwrap();
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "成功路径 handler 不得执行"
+    );
+    assert_eq!(std::fs::read(&good).unwrap(), b"ok");
+}
+
+#[test]
+fn do_plan_fork_mix() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("mix");
+    let fa = sub.join("a.txt");
+    let fb = sub.join("b.txt");
+
+    // plan!/fork! 内嵌 do_! 均预构建 Action 值（do_! 展开闭包要求 'static、
+    // plan!/fork! 只做值组合），与迭代 1 plan_wraps_do_blocks 同模式。
+    let mkdir_act = do_! { dx::mkdir(&sub, 0o755); Value::Unit };
+    let left_act = do_! {
+        let f = dx::open(fa.clone(), open_rw_create());
+        dx::write(&f, b"A".to_vec());
+        dx::close(&f);
+        Value::Unit
+    };
+    let right_act = do_! {
+        let f = dx::open(fb.clone(), open_rw_create());
+        dx::write(&f, b"B".to_vec());
+        dx::close(&f);
+        Value::Unit
+    };
+    let stat_act = do_! {
+        let _ = dx::stat(&sub);
+        Value::Unit
+    };
+
+    // do_!（命令式骨架）内嵌 plan!（声明式子步骤）与 fork!（并发分叉，
+    // 左右分支写不同文件 → 无资源冲突）——三者混合，真实执行。
+    let blueprint = do_! {
+        plan! { mkdir_act };
+        fork! {
+            left: left_act,
+            right: right_act,
+        };
+        stat_act;
+        Value::U64(42)
+    };
+
+    let v = rt().run_blocking(blueprint).unwrap();
+    assert_eq!(v, Value::U64(42));
+    assert_eq!(std::fs::read(&fa).unwrap(), b"A");
+    assert_eq!(std::fs::read(&fb).unwrap(), b"B");
+}
+
+#[test]
+fn remaining_op_wrappers_construct_syscall_nodes() {
+    // munmap / send_file / dup2：补齐 DataOp → dx 包装全量映射，
+    // 资源自动推导沿用 infer_usage 表（显式断言）。
+    let m = dx::munmap(0x1000, 4096);
+    let Action::Syscall { op, resources, .. } = &m else {
+        panic!("munmap 应构造 Syscall 节点");
+    };
+    assert!(matches!(
+        op,
+        DataOp::Munmap {
+            addr: 0x1000,
+            len: 4096
+        }
+    ));
+    assert_eq!(resources, &vec![]);
+
+    let s = dx::send_file(&Value::Fd(1), &Value::Fd(2), 0, 5);
+    let Action::Syscall { op, resources, .. } = &s else {
+        panic!("send_file 应构造 Syscall 节点");
+    };
+    assert!(matches!(
+        op,
+        DataOp::SendFile {
+            out: 1,
+            input: 2,
+            offset: 0,
+            len: 5
+        }
+    ));
+    assert_eq!(
+        resources,
+        &vec![
+            usage(f(1), AccessMode::Write),
+            usage(f(2), AccessMode::Read)
+        ]
+    );
+
+    let d = dx::dup2(&Value::Fd(3), 4);
+    let Action::Syscall { op, resources, .. } = &d else {
+        panic!("dup2 应构造 Syscall 节点");
+    };
+    assert!(matches!(
+        op,
+        DataOp::Dup2 {
+            old_fd: 3,
+            new_fd: 4
+        }
+    ));
+    assert_eq!(
+        resources,
+        &vec![
+            usage(f(4), AccessMode::Write),
+            usage(f(3), AccessMode::Read)
+        ]
+    );
 }
