@@ -634,6 +634,7 @@ fn timeout_nested_inner_fires_first() {
     assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]); // 慢 op 已启动后被内层取消
 }
 
+#[test]
 fn timeout_nested_outer_fires_first() {
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();
