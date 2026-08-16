@@ -188,6 +188,93 @@ impl Drop for ArbiterClaimGuard {
     }
 }
 
+// ── R7-A 修复：轮换型句柄 take→await→put_back 窗口的 RAII 归还守卫 ──────
+
+/// 管道读半端 → 注册表句柄（`TakeHandleGuard` 的归还构造器）。
+fn pipe_reader_handle(
+    a: Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+) -> ResourceHandle {
+    ResourceHandle::PipeReader(a)
+}
+/// 管道写半端 → 注册表句柄。
+fn pipe_writer_handle(
+    a: Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
+) -> ResourceHandle {
+    ResourceHandle::PipeWriter(a)
+}
+/// TCP 流 → 注册表句柄。
+fn tcp_stream_handle(a: Arc<TcpStream>) -> ResourceHandle {
+    ResourceHandle::TcpStream(a)
+}
+
+/// 轮换型句柄 take 后、put_back 前的 RAII 归还守卫（R7-A 修复）。
+///
+/// 泄漏窗口（A3 锁定）：`take_pipe_reader/writer`、`take_tcp_stream` 取走注册表
+/// 条目后、`put_back` 前存在 await 点（物理 IO）。取消传播协议的宽限耗尽路径
+/// 会**直接丢弃** inner future（runtime.rs `wait_timeout` grace 分支 / VC 墙钟
+/// 通道）——旧实现中 `put_back` 永不执行：注册表条目丢失、executor 逻辑映射
+/// 残留陈旧项、句柄 Arc 唯一强引用被 drop（物理管道/TCP 关闭），后续同逻辑
+/// fd 一律 NotFound（adversarial_r7ab.rs §2 锁定读端变体、adversarial_r7.rs
+/// §4 F-R7-2 锁定写端变体）。
+///
+/// 守卫把归还绑定到 `Drop`：取消/错误路径（future 被丢弃、`Arc::get_mut`
+/// 失败、物理 IO 错误早退）均自动 `put_back`（分配新 fd + 更新逻辑映射，
+/// 轮换语义不变）；正常路径显式 `put_back()` 消费守卫（防双放）。未取时
+/// 无操作（`handle: Option`）。与 `ArbiterClaimGuard`（防 claim 取消泄漏，
+/// R-1 批 8）同族：取消传播路径的 RAII 兜底。`exec`/`reg` 为借用（非持有型），
+/// 守卫生命周期限于单次 op 调用。
+struct TakeHandleGuard<'a, H> {
+    exec: &'a mut TokioExecutor,
+    fd: u64,
+    handle: Option<H>,
+    to_handle: fn(H) -> ResourceHandle,
+    reg: &'a mut ResourceRegistry,
+}
+
+impl<'a, H> TakeHandleGuard<'a, H> {
+    fn new(
+        exec: &'a mut TokioExecutor,
+        fd: u64,
+        handle: H,
+        to_handle: fn(H) -> ResourceHandle,
+        reg: &'a mut ResourceRegistry,
+    ) -> Self {
+        Self {
+            exec,
+            fd,
+            handle: Some(handle),
+            to_handle,
+            reg,
+        }
+    }
+
+    /// 可变访问已取句柄（物理 IO 前取 `Arc::get_mut`；`put_back` 后不可再访问）。
+    fn handle_mut(&mut self) -> &mut H {
+        self.handle
+            .as_mut()
+            .expect("take 守卫已消费：put_back 后不得再访问句柄")
+    }
+
+    /// 正常路径：显式归还（轮换：分配新 fd、更新逻辑映射），消费守卫防双放。
+    fn put_back(mut self) {
+        if let Some(h) = self.handle.take() {
+            self.exec.put_back(self.fd, (self.to_handle)(h), self.reg);
+        }
+    }
+}
+
+impl<H> Drop for TakeHandleGuard<'_, H> {
+    fn drop(&mut self) {
+        // 取消/错误路径：future 被丢弃（Timeout 宽限耗尽）或本函数早退 →
+        // 自动归还已取句柄（幂等：`put_back` 消费后 handle 为 None，无操作）。
+        // A5 批 9 同理由：put_back 内仅同步短临界区（映射锁 std Mutex + 注册表
+        // 分配），Drop 内同步 lock 安全，无 panic 源（expect 中毒不可达）。
+        if let Some(h) = self.handle.take() {
+            self.exec.put_back(self.fd, (self.to_handle)(h), self.reg);
+        }
+    }
+}
+
 /// 默认物理执行器（pdr.md §12.2）。
 ///
 /// ## R-6 锁边界重构（阶段 3 并行兑现）
@@ -454,22 +541,22 @@ impl TokioExecutor {
             if len > MAX_IO_LEN {
                 return Err(SysError::InvalidInput);
             }
-            let mut arc = self.take_pipe_reader(fd, reg)?;
+            let arc = self.take_pipe_reader(fd, reg)?;
+            // R7-A 修复：已取句柄进入取消窗口（await）前套 RAII 守卫——future
+            // 被丢弃（Timeout 宽限耗尽）时 Drop 自动 put_back，取消/错误路径
+            // 均归还（轮换语义不变）。
+            let mut guard = TakeHandleGuard::new(self, fd, arc, pipe_reader_handle, reg);
             let mut buf = vec![0u8; len];
             let n = {
-                // 被 Dup 共享时无法 &mut → InvalidInput（注释）。
-                let rh = match Arc::get_mut(&mut arc) {
+                // 被 Dup 共享时无法 &mut → InvalidInput（守卫 Drop 自动归还，blocker-3）。
+                let rh = match Arc::get_mut(guard.handle_mut()) {
                     Some(rh) => rh,
-                    None => {
-                        // 错误路径：恢复注册表条目与内部映射后再返回（blocker-3）。
-                        self.put_back(fd, ResourceHandle::PipeReader(arc), reg);
-                        return Err(SysError::InvalidInput);
-                    }
+                    None => return Err(SysError::InvalidInput),
                 };
                 rh.read(&mut buf).await
             };
-            // 成功与 I/O 错误均先恢复句柄再传播（blocker-3）。
-            self.put_back(fd, ResourceHandle::PipeReader(arc), reg);
+            // 成功与 I/O 错误均先归还句柄（守卫消费防双放；blocker-3）。
+            guard.put_back();
             let n = n.map_err(to_sys_err)?;
             buf.truncate(n);
             return Ok((Value::Bytes(buf), None));
@@ -576,18 +663,18 @@ impl TokioExecutor {
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .contains_key(&fd);
         if is_pipe_writer {
-            let mut arc = self.take_pipe_writer(fd, reg)?;
+            let arc = self.take_pipe_writer(fd, reg)?;
+            // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+            let mut guard = TakeHandleGuard::new(self, fd, arc, pipe_writer_handle, reg);
             let r = {
-                let wh = match Arc::get_mut(&mut arc) {
+                // 被 Dup 共享时无法 &mut → InvalidInput（守卫 Drop 自动归还，blocker-3）。
+                let wh = match Arc::get_mut(guard.handle_mut()) {
                     Some(w) => w,
-                    None => {
-                        self.put_back(fd, ResourceHandle::PipeWriter(arc), reg);
-                        return Err(SysError::InvalidInput);
-                    }
+                    None => return Err(SysError::InvalidInput),
                 };
                 wh.write_all(data).await
             };
-            self.put_back(fd, ResourceHandle::PipeWriter(arc), reg);
+            guard.put_back();
             r.map_err(to_sys_err)?;
             return Ok((Value::Unit, None));
         }
@@ -598,18 +685,18 @@ impl TokioExecutor {
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .contains_key(&fd);
         if is_stream {
-            let mut arc = self.take_tcp_stream(fd, reg)?;
+            let arc = self.take_tcp_stream(fd, reg)?;
+            // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+            let mut guard = TakeHandleGuard::new(self, fd, arc, tcp_stream_handle, reg);
             let r = {
-                let s = match Arc::get_mut(&mut arc) {
+                // 被 Dup 共享时无法 &mut → InvalidInput（守卫 Drop 自动归还，blocker-3）。
+                let s = match Arc::get_mut(guard.handle_mut()) {
                     Some(s) => s,
-                    None => {
-                        self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-                        return Err(SysError::InvalidInput);
-                    }
+                    None => return Err(SysError::InvalidInput),
                 };
                 s.write_all(data).await
             };
-            self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+            guard.put_back();
             r.map_err(to_sys_err)?;
             return Ok((Value::Unit, None));
         }
@@ -865,20 +952,19 @@ impl TokioExecutor {
         if len > MAX_IO_LEN {
             return Err(SysError::InvalidInput);
         }
-        let mut arc = self.take_tcp_stream(fd, reg)?;
+        let arc = self.take_tcp_stream(fd, reg)?;
+        // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+        let mut guard = TakeHandleGuard::new(self, fd, arc, tcp_stream_handle, reg);
         let mut buf = vec![0u8; len];
         let n = {
-            // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
-            let s = match Arc::get_mut(&mut arc) {
+            // 被 Dup 共享时无法 &mut → InvalidInput（守卫 Drop 自动归还，blocker-3）。
+            let s = match Arc::get_mut(guard.handle_mut()) {
                 Some(s) => s,
-                None => {
-                    self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-                    return Err(SysError::InvalidInput);
-                }
+                None => return Err(SysError::InvalidInput),
             };
             s.read(&mut buf).await
         };
-        self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+        guard.put_back();
         let n = n.map_err(to_sys_err)?;
         buf.truncate(n);
         Ok((Value::Bytes(buf), None))
@@ -890,19 +976,18 @@ impl TokioExecutor {
         data: &[u8],
         reg: &mut ResourceRegistry,
     ) -> Result<(Value, Option<UndoOp>), SysError> {
-        let mut arc = self.take_tcp_stream(fd, reg)?;
+        let arc = self.take_tcp_stream(fd, reg)?;
+        // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+        let mut guard = TakeHandleGuard::new(self, fd, arc, tcp_stream_handle, reg);
         let r = {
-            // 被 Dup 共享时无法 &mut → InvalidInput；错误路径恢复句柄（blocker-3）。
-            let s = match Arc::get_mut(&mut arc) {
+            // 被 Dup 共享时无法 &mut → InvalidInput（守卫 Drop 自动归还，blocker-3）。
+            let s = match Arc::get_mut(guard.handle_mut()) {
                 Some(s) => s,
-                None => {
-                    self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
-                    return Err(SysError::InvalidInput);
-                }
+                None => return Err(SysError::InvalidInput),
             };
             s.write_all(data).await
         };
-        self.put_back(fd, ResourceHandle::TcpStream(arc), reg);
+        guard.put_back();
         r.map_err(to_sys_err)?;
         Ok((Value::Unit, None))
     }
@@ -1414,33 +1499,31 @@ impl TokioExecutor {
             g.flush().await.map_err(to_sys_err)?;
             n
         } else if out_is_stream {
-            let mut arc = self.take_tcp_stream(out, reg)?;
+            let arc = self.take_tcp_stream(out, reg)?;
+            // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+            let mut guard = TakeHandleGuard::new(self, out, arc, tcp_stream_handle, reg);
             let n = {
-                // 错误路径恢复句柄（blocker-3）。
-                let s = match Arc::get_mut(&mut arc) {
+                // 错误路径恢复句柄（守卫 Drop 自动归还，blocker-3）。
+                let s = match Arc::get_mut(guard.handle_mut()) {
                     Some(s) => s,
-                    None => {
-                        self.put_back(out, ResourceHandle::TcpStream(arc), reg);
-                        return Err(SysError::InvalidInput);
-                    }
+                    None => return Err(SysError::InvalidInput),
                 };
                 s.write(&buf).await
             };
-            self.put_back(out, ResourceHandle::TcpStream(arc), reg);
+            guard.put_back();
             n.map_err(to_sys_err)?
         } else if out_is_pipe_writer {
-            let mut arc = self.take_pipe_writer(out, reg)?;
+            let arc = self.take_pipe_writer(out, reg)?;
+            // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
+            let mut guard = TakeHandleGuard::new(self, out, arc, pipe_writer_handle, reg);
             let n = {
-                let w = match Arc::get_mut(&mut arc) {
+                let w = match Arc::get_mut(guard.handle_mut()) {
                     Some(w) => w,
-                    None => {
-                        self.put_back(out, ResourceHandle::PipeWriter(arc), reg);
-                        return Err(SysError::InvalidInput);
-                    }
+                    None => return Err(SysError::InvalidInput),
                 };
                 w.write(&buf).await
             };
-            self.put_back(out, ResourceHandle::PipeWriter(arc), reg);
+            guard.put_back();
             n.map_err(to_sys_err)?
         } else {
             return Err(SysError::NotFound);

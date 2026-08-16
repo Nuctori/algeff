@@ -858,6 +858,150 @@ async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> 
     }
 }
 
+/// Fork 并行分支产物：(分支结果, 隔离 registry, 独立撤销栈, 隔离 ctx)。
+/// 由 `run_fork_parallel` 的 spawn_blocking 任务带回，供完成后合并回父。
+type BranchOutcome = (Result<Value, SysError>, ResourceRegistry, UndoStack, Context);
+
+/// Fork 并行分支 join 合并守卫（R7-B 修复，A3 核销）。
+///
+/// 职责：轮询两个分支 `JoinHandle`，分支**完成即合并**隔离状态回父——
+/// - 合并顺序保持 [left, right]（与顺序路径/原实现一致）：右分支先完成而
+///   左分支未完成时暂存于 `r_stash`，待左分支合并后按序补合并；
+/// - 整个 Fork future 被丢弃（Timeout 宽限耗尽 / VC 墙钟通道超时）时，
+///   `Drop` 把「已完成但未合并」的分支状态合并回父——不再随局部变量丢失。
+///   （旧行为：两分支都 await 完才合并；宽限耗尽丢弃 inner future → 已完成
+///   持锁分支的释放 undo 随之消失 → arbiter 占坑 + 物理锁永久残留，A3 锁定
+///   R7-B：Replace/recover 均够不到，仅显式 MutexUnlock 可逃逸。）
+/// - 未完成分支：`JoinHandle` 随守卫丢弃而**脱离运行**（保持取消语义：分支
+///   阻塞 IO 完成后于下一 op 边界按取消粘性快速返回），其隔离状态不可达
+///   （spawn_blocking 任务结果无处投递）——持锁占坑残余按
+///   spec/resource-notes.md R7-B 登记处理（部分修复：join 路径闭、耗尽路径
+///   登记）。
+struct ForkJoinMerge<'a> {
+    reg: &'a mut ResourceRegistry,
+    undo: &'a mut UndoStack,
+    /// 父 ctx（virtual-clock 合并用；墙钟构建下无需读取，仅持有以保签名统一）。
+    #[cfg_attr(not(feature = "virtual-clock"), allow(dead_code))]
+    ctx: &'a mut Context,
+    l_task: tokio::task::JoinHandle<BranchOutcome>,
+    r_task: tokio::task::JoinHandle<BranchOutcome>,
+    /// 左分支已合并（左分支完成即合并，不依赖右分支状态）。
+    l_merged: bool,
+    /// 右分支已完成、待按序合并（左分支未完成时暂存；Fork future 被丢弃时
+    /// 由 `Drop` 合并回父）。
+    r_stash: Option<BranchOutcome>,
+    /// Fork 时父时钟基线（virtual-clock 合并用；分支时钟同源克隆自此基线）。
+    #[cfg(feature = "virtual-clock")]
+    clock_base: Duration,
+}
+
+impl<'a> ForkJoinMerge<'a> {
+    fn new(
+        reg: &'a mut ResourceRegistry,
+        undo: &'a mut UndoStack,
+        ctx: &'a mut Context,
+        l_task: tokio::task::JoinHandle<BranchOutcome>,
+        r_task: tokio::task::JoinHandle<BranchOutcome>,
+    ) -> Self {
+        #[cfg(feature = "virtual-clock")]
+        let clock_base = ctx
+            .virtual_clock_mut()
+            .map(|vc| vc.now())
+            .unwrap_or_default();
+        Self {
+            reg,
+            undo,
+            ctx,
+            l_task,
+            r_task,
+            l_merged: false,
+            r_stash: None,
+            #[cfg(feature = "virtual-clock")]
+            clock_base,
+        }
+    }
+
+    /// 轮询两分支至全部完成，返回 (left 结果, right 结果)。
+    /// Fork future 被丢弃（宽限耗尽）时本 future 被 drop → `Drop` 把已完成
+    /// 但未合并的分支状态合并回父（R7-B）。
+    async fn join(mut self) -> (Result<Value, SysError>, Result<Value, SysError>) {
+        let (mut l_res, mut r_res) = (None, None);
+        loop {
+            if l_res.is_some() && r_res.is_some() {
+                break;
+            }
+            tokio::select! {
+                res = &mut self.l_task, if l_res.is_none() => {
+                    let (v, l_reg, l_undo, mut l_ctx) =
+                        res.expect("Fork 并行左分支任务 panic");
+                    l_res = Some(v);
+                    self.merge_left(l_reg, l_undo, &mut l_ctx);
+                    // 右分支若已先完成（暂存中）→ 按序补合并。
+                    if let Some((rv, r_reg, r_undo, mut r_ctx)) = self.r_stash.take() {
+                        r_res = Some(rv);
+                        self.merge_right(r_reg, r_undo, &mut r_ctx);
+                    }
+                }
+                res = &mut self.r_task, if r_res.is_none() && self.r_stash.is_none() => {
+                    let outcome = res.expect("Fork 并行右分支任务 panic");
+                    if self.l_merged {
+                        let (v, r_reg, r_undo, mut r_ctx) = outcome;
+                        r_res = Some(v);
+                        self.merge_right(r_reg, r_undo, &mut r_ctx);
+                    } else {
+                        self.r_stash = Some(outcome);
+                    }
+                }
+            }
+        }
+        (l_res.expect("left 分支已完成"), r_res.expect("right 分支已完成"))
+    }
+
+    /// 合并左分支（完成即合并；顺序 [left, right]）。
+    fn merge_left(&mut self, l_reg: ResourceRegistry, l_undo: UndoStack, l_ctx: &mut Context) {
+        self.reg.merge(l_reg);
+        self.undo.append(l_undo);
+        self.merge_clock(l_ctx);
+        self.l_merged = true;
+    }
+
+    /// 合并右分支。
+    fn merge_right(&mut self, r_reg: ResourceRegistry, r_undo: UndoStack, r_ctx: &mut Context) {
+        self.reg.merge(r_reg);
+        self.undo.append(r_undo);
+        self.merge_clock(r_ctx);
+    }
+
+    /// 分支虚拟时钟推进合并回父（sum，与顺序路径「分支依次推进父时钟」观察
+    /// 等价；审计 R1 状态-MEDIUM-1 修复的逐分支版——基线取 Fork 时父时钟
+    /// `clock_base`，避免「先合并分支的推进被误作下一分支的基线」致总和偏小）。
+    #[cfg(feature = "virtual-clock")]
+    fn merge_clock(&mut self, branch: &mut Context) {
+        let base = self.clock_base;
+        let now = branch.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        if let Some(vc) = self.ctx.virtual_clock_mut() {
+            vc.advance(now.saturating_sub(base));
+        }
+    }
+
+    #[cfg(not(feature = "virtual-clock"))]
+    fn merge_clock(&mut self, _branch: &mut Context) {}
+}
+
+impl Drop for ForkJoinMerge<'_> {
+    fn drop(&mut self) {
+        // Fork future 被丢弃（Timeout 宽限耗尽 / VC 墙钟通道超时）：把已完成
+        // 但未合并的分支状态合并回父（R7-B）——只有右分支可能暂存（左分支
+        // 完成即合并）。未完成分支的 JoinHandle 随守卫字段丢弃 → 脱离运行，
+        // 完成后按取消粘性快速返回（其持锁占坑残余不可达，见登记）。
+        if let Some((_, r_reg, r_undo, mut r_ctx)) = self.r_stash.take() {
+            self.reg.merge(r_reg);
+            self.undo.append(r_undo);
+            self.merge_clock(&mut r_ctx);
+        }
+    }
+}
+
 /// Fork 并行分支执行（D14 阶段 3，CTO 批准方向）：
 ///
 /// 两分支各自持有 registry/context 隔离副本（D13：Clone）+ 独立 UndoStack，
@@ -875,7 +1019,7 @@ async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> 
 /// （无需合并步骤）；不支持快照的执行器（None）回退共享锁通道（D17 原行为，
 /// Mock 测试的调用序列语义不变）。
 ///
-/// 完成后合并回父：
+/// 完成后合并回父（R7-B 修复：分支**完成即合并**，见 `ForkJoinMerge`）：
 /// - registry：子 handles 以原 fd 并入 + consumed/owned_consumed 并集 +
 ///   `next_fd = max` 归一化（`ResourceRegistry::merge`，RFC-A3-2 / D13「合并
 ///   回父」）；F1 修复：spawn 前右分支 `offset_next_fd(fork_fd_region_offset())`
@@ -957,38 +1101,16 @@ async fn run_fork_parallel(
         (v, r_reg, r_undo, r_ctx)
     });
 
-    #[allow(unused_mut, unused_variables)]
-    let (l_res, l_reg, l_undo, mut l_ctx) = l_task.await.expect("Fork 并行左分支任务 panic");
-    #[allow(unused_mut, unused_variables)]
-    let (r_res, r_reg, r_undo, mut r_ctx) = r_task.await.expect("Fork 并行右分支任务 panic");
-
-    // 合并回父（D13「完成后合并回父」/ RFC-A3-2）：
-    // fd 不冲突（F1：右分支区间预分割 + D1 单调，子分配 ≥ 自身 next_fd
-    // 且两分支区间不相交；合并时父 next_fd = max 归一化 = 全部已分配 fd + 1）。
-    reg.merge(l_reg);
-    reg.merge(r_reg);
-    // undo：先并入 left 再并入 right —— 栈序 [left, right] 与顺序路径一致
-    // （left 先执行先压栈、right 后执行后压栈），LIFO recover 先弹 right 的
-    // undo 再弹 left 的（观察序：right 的效果后发生、先撤销）。
-    undo.append(l_undo);
-    undo.append(r_undo);
-    // 审计 R1 状态-MEDIUM-1 修复：并行分支的虚拟时钟推进合并回父（sum，与
-    // 顺序路径「分支依次推进父时钟」观察等价）——此前分支克隆时钟被丢弃，
-    // 同一蓝图并行/顺序两种调度产生不同可观察时钟（确定性重放支柱被破坏）。
-    #[cfg(feature = "virtual-clock")]
-    {
-        let base = ctx
-            .virtual_clock_mut()
-            .map(|vc| vc.now())
-            .unwrap_or_default();
-        let l_now = l_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
-        let r_now = r_ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
-        if let Some(vc) = ctx.virtual_clock_mut() {
-            vc.advance(l_now.saturating_sub(base));
-            vc.advance(r_now.saturating_sub(base));
-        }
-    }
-
+    // R7-B 修复（A3 核销）：分支完成即合并——轮询两个 JoinHandle（见
+    // ForkJoinMerge），任一分支完成立即把隔离 registry/undo 合并回父
+    // （合并顺序保持 [left, right]，与顺序路径一致）。旧行为两分支都
+    // await 完才合并：Timeout 宽限耗尽丢弃 Fork future 时，已完成分支
+    // （如已持锁）的状态随局部变量一并丢弃 → 释放 undo 永不并入父 →
+    // arbiter 占坑 + 物理锁永久残留（Replace/recover 够不到，A3 锁定）。
+    // 未完成分支在丢弃时保持取消语义（JoinHandle 丢弃 → 脱离运行，阻塞
+    // IO 完成后按取消粘性快速返回；持锁占坑残余见 resource-notes R7-B）。
+    let joiner = ForkJoinMerge::new(reg, undo, ctx, l_task, r_task);
+    let (l_res, r_res) = joiner.join().await;
     Ok((l_res?, r_res?))
 }
 
