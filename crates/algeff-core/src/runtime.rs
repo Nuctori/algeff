@@ -257,7 +257,10 @@ impl Runtime {
             &mut self.context,
             &mut self.undo_stack,
             &mut self.resource_registry,
-            ExecAccess::Shared(self.executor.clone()),
+            ExecAccess::Shared {
+                executor: self.executor.clone(),
+                reactor: self.reactor.handle().clone(),
+            },
             0,
             None,
         )
@@ -278,7 +281,10 @@ impl Runtime {
             context,
             undo_stack,
             resource_registry,
-            ExecAccess::Shared(executor),
+            ExecAccess::Shared {
+                executor,
+                reactor: reactor.handle().clone(),
+            },
             0,
             None,
         ))
@@ -290,12 +296,18 @@ impl Runtime {
     }
 }
 
-/// 子 Action 递归用的本地 future 包装。
+/// 子 Action 递归用的 future 包装（`Box::pin` 堆分配，解释器状态机帧只存
+/// 指针 —— 保护 RFC-11 深度守卫的栈预算）。
 ///
-/// 保留非 `Send` 的 `Pin<Box<dyn Future>>` 别名（区别于 syscall.rs 的
-/// `BoxFuture` 强制 `+ Send`）：虽 `SyscallExecutor: Send`（D19）后 `&mut dyn`
-/// 已可 Send，但保持最小改动，不把递归 future Send 化（Send 化留待后续）。
-type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+/// **Send 化（迭代 3-A1）**：本别名原为非 Send（区分 syscall.rs 的
+/// `BoxFuture` 强制 `+ Send`），D19（`SyscallExecutor: Send`）后解释器捕获的
+/// 全部状态（`&mut Context/UndoStack/ResourceRegistry`、`ExecAccess`、
+/// `Action` 闭包 `+ Send`、`CancelToken`、coeffects 的 `Arc<Mutex>` 型状态）
+/// 均已 Send —— 迭代 3-A1 将递归 future 提升为 `+ Send`，使 Fork 并行分支
+/// 可直接 `spawn` 到 Runtime 自持的多线程 reactor（替代逐节点
+/// `spawn_blocking` + current-thread runtime 构建，D9 契约保持：分支在
+/// tokio 上下文内运行）。编译器静态验证全 feature 组合下无 Send 泄漏。
+type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 取消传播协议（RFC-08/09/12 残余修复）的取消令牌：`watch<bool>` 接收端。
 ///
@@ -678,32 +690,29 @@ type SharedExecutor = Arc<tokio::sync::Mutex<Box<dyn SyscallExecutor + Send>>>;
 /// - `Direct`：冻结公共签名 `interpret(action, ..., ex: &mut dyn SyscallExecutor)`
 ///   路径 —— 无 Fork 并行能力（并行需要共享互斥通道）；
 /// - `Shared`：`Runtime::run`/`run_blocking` 路径 —— 每个 Syscall 调用经锁互斥，
-///   Fork 并行分支可用（见 `run_fork_parallel`）。
+///   Fork 并行分支可用（见 `run_fork_parallel`）。迭代 3-A1：携带 Runtime
+///   自持 reactor 的 `Handle`（D9：Runtime 自持 reactor；分支经 `Handle::spawn`
+///   直接投递到该多线程 reactor 的 worker 线程，替代逐节点 spawn_blocking +
+///   current-thread runtime 构建）。
 enum ExecAccess<'a> {
     Direct(&'a mut dyn SyscallExecutor),
-    Shared(SharedExecutor),
+    Shared {
+        executor: SharedExecutor,
+        reactor: tokio::runtime::Handle,
+    },
 }
 
 impl<'a> ExecAccess<'a> {
-    /// 重借用：`Direct` 重借用内部 `&mut`，`Shared` 克隆 Arc（递归/分支复用）。
+    /// 重借用：`Direct` 重借用内部 `&mut`，`Shared` 克隆 Arc/Handle（递归/分支复用）。
     fn reborrow<'b>(&'b mut self) -> ExecAccess<'b> {
         match self {
             ExecAccess::Direct(ex) => ExecAccess::Direct(&mut **ex),
-            ExecAccess::Shared(arc) => ExecAccess::Shared(arc.clone()),
+            ExecAccess::Shared { executor, reactor } => ExecAccess::Shared {
+                executor: executor.clone(),
+                reactor: reactor.clone(),
+            },
         }
     }
-}
-
-/// 本地 current-thread runtime 驱动（interpret future 非 Send，只能在阻塞线程内
-/// `block_on`；`spawn_blocking` 线程位于 tokio 上下文之外，满足 D9）。参考
-/// `tests/concurrency_stress.rs` 已验证的 drive 模式（外层 tokio::spawn N +
-/// 内层 spawn_blocking 驱动 current-thread runtime）。
-fn drive<F: Future>(f: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("无法创建 current-thread tokio runtime")
-        .block_on(f)
 }
 
 /// 经执行器访问通道执行 DataOp。
@@ -718,8 +727,8 @@ async fn exec_via(
 ) -> Result<(Value, Option<UndoOp>), SysError> {
     match access {
         ExecAccess::Direct(ex) => (**ex).execute(op, reg).await,
-        ExecAccess::Shared(arc) => {
-            let mut guard = arc.lock().await;
+        ExecAccess::Shared { executor, .. } => {
+            let mut guard = executor.lock().await;
             guard.execute(op, reg).await
         }
     }
@@ -733,8 +742,8 @@ async fn watch_signal_via(
 ) -> Result<Value, SysError> {
     match access {
         ExecAccess::Direct(ex) => (**ex).watch_signal(signal, reg).await,
-        ExecAccess::Shared(arc) => {
-            let mut guard = arc.lock().await;
+        ExecAccess::Shared { executor, .. } => {
+            let mut guard = executor.lock().await;
             guard.watch_signal(signal, reg).await
         }
     }
@@ -749,8 +758,8 @@ async fn invoke_via(
 ) -> Result<Value, SysError> {
     match access {
         ExecAccess::Direct(ex) => (**ex).invoke(foreign_id, captures, deterministic).await,
-        ExecAccess::Shared(arc) => {
-            let mut guard = arc.lock().await;
+        ExecAccess::Shared { executor, .. } => {
+            let mut guard = executor.lock().await;
             guard.invoke(foreign_id, captures, deterministic).await
         }
     }
@@ -847,14 +856,23 @@ fn fork_fd_region_offset() -> u64 {
 ///
 /// 快照与父共享全部内部状态（per-fd 锁表 / 映射 / 仲裁器），分支的映射变更
 /// 自动可见于父，无需合并步骤；同一 fd 的物理 IO 仍在共享 per-fd 锁上串行。
-async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> {
+async fn branch_snapshot_access(
+    shared: &SharedExecutor,
+    reactor: &tokio::runtime::Handle,
+) -> ExecAccess<'static> {
     let mut guard = shared.lock().await;
     match guard.fork_snapshot() {
         Some(branch_ex) => {
             let channel: SharedExecutor = Arc::new(tokio::sync::Mutex::new(branch_ex));
-            ExecAccess::Shared(channel)
+            ExecAccess::Shared {
+                executor: channel,
+                reactor: reactor.clone(),
+            }
         }
-        None => ExecAccess::Shared(shared.clone()),
+        None => ExecAccess::Shared {
+            executor: shared.clone(),
+            reactor: reactor.clone(),
+        },
     }
 }
 
@@ -862,9 +880,18 @@ async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> 
 ///
 /// 两分支各自持有 registry/context 隔离副本（D13：Clone）+ 独立 UndoStack，
 /// 经共享执行器通道（Arc<Mutex>，每 Syscall 调用互斥 —— 锁仅保护执行器内部
-/// 状态，物理 IO 本身异步）在**独立阻塞线程**上以 current-thread runtime 并发
-/// 驱动（参考 concurrency_stress.rs 已验证的 drive 模式；外层 tokio::spawn N +
-/// 内层 spawn_blocking 驱动 current-thread runtime）。
+/// 状态，物理 IO 本身异步）并发驱动。
+///
+/// ## 迭代 3-A1：分支直接 spawn 到 Runtime 自持 reactor（替代逐节点线程/驱动）
+/// R-6 前实现经 `spawn_blocking` × 2 + current-thread runtime `drive` × 2 驱动
+/// 分支（每 Fork 节点 2 个阻塞线程 + 2 次 runtime 构建）。迭代 3-A1 将解释器
+/// 递归 future Send 化（`LocalBoxFuture` + Send，D19 后全部捕获状态已 Send）
+/// 并把 Runtime 自持 reactor 的 `Handle` 经 `ExecAccess::Shared` 传递下来——
+/// 分支直接 `Handle::spawn` 到多线程 reactor 的 worker 线程：零新线程、零新
+/// runtime 构建，调度为 tokio 任务投递（亚微秒级）。D9 契约保持：分支在 tokio
+/// 上下文（Runtime 自持 reactor）内运行；分支深度计数器从 0 起算、栈预算在
+/// tokio worker 线程（默认 2MB，与旧阻塞线程同量级）上独立生效（RFC-11 守卫
+/// 语义不变）。
 ///
 /// ## R-6 锁边界重构（阶段 3 并行兑现）
 /// 每个分支在锁内短临界区取**执行器快照**（`SyscallExecutor::fork_snapshot`，
@@ -890,18 +917,29 @@ async fn branch_snapshot_access(shared: &SharedExecutor) -> ExecAccess<'static> 
 /// Catch/recover 撤销），再返回错误（left 优先）。
 ///
 /// 取消传播（RFC-08/09）：`cancel` 为所在 Timeout 域的取消令牌（可空）。
-/// 分支把令牌克隆进 `spawn_blocking` 闭包——取消广播后，分支在下一 op
-/// 边界检查到并快速返回（部分 registry/undo 照常合并回父，由 Timeout 臂
-/// 统一回滚），实现「分支取消时传播给并行子任务」的结构化并发近似。
-async fn run_fork_parallel(
+/// 分支把令牌克隆进 spawn 任务——取消广播后，分支在下一 op 边界检查到并
+/// 快速返回（部分 registry/undo 照常合并回父，由 Timeout 臂统一回滚），
+/// 实现「分支取消时传播给并行子任务」的结构化并发近似。超时路径丢弃 inner
+/// future 时分支任务分离（orphan 继续执行，下一 op 边界经取消标志中止）——
+/// 与旧 `spawn_blocking` 的分离语义一致（任务未被 join，runtime drop 同样
+/// 等待在途任务/阻塞任务收尾）。
+///
+/// **返回 `LocalBoxFuture`（Send）而非 async fn 的原因**：`interpret_impl`
+/// （async fn，opaque）与 `run_fork_parallel` 互为递归——若本函数也是 opaque
+/// async fn，其 future 的 Send 判定与 `interpret_impl` 的 Send 判定构成
+/// 循环义务（E0391）。Box 化（`Pin<Box<dyn Future + Send>>`）把 Send 边界
+/// 固化在 trait object 上，切断循环（与 `run_sub_impl` 同模式）。
+fn run_fork_parallel<'a>(
     left: Action,
     right: Action,
-    ctx: &mut Context,
-    reg: &mut ResourceRegistry,
-    undo: &mut UndoStack,
+    ctx: &'a mut Context,
+    reg: &'a mut ResourceRegistry,
+    undo: &'a mut UndoStack,
     shared: SharedExecutor,
-    cancel: Option<&mut CancelToken>,
-) -> Result<(Value, Value), SysError> {
+    reactor: tokio::runtime::Handle,
+    cancel: Option<&'a mut CancelToken>,
+) -> LocalBoxFuture<'a, Result<(Value, Value), SysError>> {
+    Box::pin(async move {
     // 子任务隔离副本（D13）与独立撤销栈。
     let mut l_ctx = ctx.clone();
     let mut r_ctx = ctx.clone();
@@ -923,17 +961,17 @@ async fn run_fork_parallel(
     // - 快照成功（Some）：分支经独立通道独占驱动（物理 IO 真并行，嵌套 Fork
     //   在分支通道上递归快照，任意深度保持并行）；
     // - 快照 None（默认）：回退共享通道（D17 原行为，Mock/自定义执行器不变）。
-    let l_access = branch_snapshot_access(&l_shared).await;
-    let r_access = branch_snapshot_access(&r_shared).await;
+    let l_access = branch_snapshot_access(&l_shared, &reactor).await;
+    let r_access = branch_snapshot_access(&r_shared, &reactor).await;
 
-    // 两个独立阻塞线程并发驱动（真并行；执行器调用经锁互斥串行化 —— 回退
-    // 通道；快照通道无共享锁竞争）。子任务把（结果, 隔离 registry, 独立撤销栈,
-    // 隔离 ctx）带回，供完成后合并 —— ctx 带回用于虚拟时钟合并（审计 R1
-    // 状态-MEDIUM-1，见下）。子任务在独立阻塞线程（`spawn_blocking`，全新栈）上
-    // 驱动 —— 深度计数器从 0 重新起算（栈预算与父线程互不共享；RFC-11 守卫
-    // 按线程栈独立生效）。
-    let l_task = tokio::task::spawn_blocking(move || {
-        let v = drive(interpret_impl(
+    // 两个分支任务直接投递到 Runtime 自持 reactor（worker 线程并发驱动；
+    // 执行器调用经锁互斥串行化 —— 回退通道；快照通道无共享锁竞争）。子任务把
+    // （结果, 隔离 registry, 独立撤销栈, 隔离 ctx）带回，供完成后合并 —— ctx
+    // 带回用于虚拟时钟合并（审计 R1 状态-MEDIUM-1，见下）。分支深度计数器从
+    // 0 重新起算（tokio worker 线程独立栈预算；RFC-11 守卫按线程栈独立生效，
+    // 与旧 spawn_blocking 全新阻塞线程一致）。
+    let l_task = reactor.spawn(async move {
+        let v = interpret_impl(
             left,
             &mut l_ctx,
             &mut l_undo,
@@ -941,11 +979,12 @@ async fn run_fork_parallel(
             l_access,
             0,
             l_cancel.as_mut(),
-        ));
+        )
+        .await;
         (v, l_reg, l_undo, l_ctx)
     });
-    let r_task = tokio::task::spawn_blocking(move || {
-        let v = drive(interpret_impl(
+    let r_task = reactor.spawn(async move {
+        let v = interpret_impl(
             right,
             &mut r_ctx,
             &mut r_undo,
@@ -953,7 +992,8 @@ async fn run_fork_parallel(
             r_access,
             0,
             r_cancel.as_mut(),
-        ));
+        )
+        .await;
         (v, r_reg, r_undo, r_ctx)
     });
 
@@ -990,6 +1030,7 @@ async fn run_fork_parallel(
     }
 
     Ok((l_res?, r_res?))
+    })
 }
 
 /// 解释器内核：Action AST → 运行时语义（A2 交付，`interpret_impl`）。
@@ -1139,7 +1180,7 @@ async fn interpret_impl(
                 // D14 阶段 3：静态冲突检测决定调度；can_parallel=true 且存在共享
                 // 执行器通道（Runtime 路径）时真并行，否则保持顺序执行。
                 let conflict = fork_conflict(reg, &left, &right);
-                let parallel = !conflict && matches!(&access, ExecAccess::Shared(_));
+                let parallel = !conflict && matches!(&access, ExecAccess::Shared { .. });
                 if !parallel {
                     // 顺序路径（阶段 1 语义保持 + F1/F2 修复）：分支 registry 隔离
                     // （D13 Clone），共享同一 undo 栈与 ctx（left 先、right 后，观察序
@@ -1178,9 +1219,10 @@ async fn interpret_impl(
                     let na = combine(lv?, rv?);
                     (Value::Unit, na)
                 } else {
-                    // 并行路径：子任务隔离副本 + 共享执行器，完成后合并回父。
-                    let shared = match &access {
-                        ExecAccess::Shared(arc) => arc.clone(),
+                    // 并行路径：子任务隔离副本 + 共享执行器 + 自持 reactor，
+                    // 完成后合并回父。
+                    let (shared, reactor) = match &access {
+                        ExecAccess::Shared { executor, reactor } => (executor.clone(), reactor.clone()),
                         ExecAccess::Direct(_) => unreachable!("并行分支仅 Shared 通道可达"),
                     };
                     let (lv, rv) = run_fork_parallel(
@@ -1190,6 +1232,7 @@ async fn interpret_impl(
                         reg,
                         undo,
                         shared,
+                        reactor,
                         cancel.as_deref_mut(),
                     )
                     .await?;
