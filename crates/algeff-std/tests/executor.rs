@@ -653,12 +653,14 @@ fn mutex_claim_kept_on_virtual_timeout_cancel() {
     assert_eq!(rt.run_blocking(again).unwrap(), Value::Unit);
 }
 
-// ── g5. Timeout 取消压力 50 轮（A5 批 9：Drop 内 async panic 修复，集成侧）──
-// 审计处方备选构造：高并发多任务 MutexLock 同 id + Timeout 混合压力。每轮 8 个
-// 并发任务（短 Timeout 2ms），取消与完成（undo 释放）路径交错；断言全程无 panic
-// （join 不 err）且轮末同 id 可重新获取（无占坑泄漏/永久 WouldBlock 毒化）。
-// 真正的「drop × 仲裁临界区重叠」由 executor.rs 内部确定性测试覆盖（std Mutex
-// 直接持锁构造 + is_clean 断言）。
+// ── g5. MutexLock 串行 smoke 50 轮（审计 R4-stress #1 如实化）──
+// 审计发现：本测试 8 任务经 Arc<tokio::sync::Mutex<TokioExecutor>> 互斥（锁
+// 跨整个 execute 持有）→ 任务间零并发；每轮 fresh id → 轮内无争用；2ms
+// timeout 因 op 微秒级完成永不触发（实测 50×8 全程 0.01s）——**不是并发/
+// 取消压力测试**（旧注释「高并发多任务…取消与完成路径交错」与实现不符）。
+// 实际价值：串行 smoke（无 panic、轮末无占坑泄漏）。真正的取消×仲裁临界区
+// 由内部确定性测试（std Mutex 直接持锁构造）与 r3c 8×30 风暴（真超时取消
+// 187/240 轮）覆盖。
 
 #[tokio::test]
 async fn mutex_lock_timeout_stress_50_rounds_no_panic() {

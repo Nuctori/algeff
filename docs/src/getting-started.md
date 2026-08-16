@@ -13,7 +13,7 @@ algeff-std  = { path = "crates/algeff-std" }
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
-> 说明：`algeff-core` 只负责**蓝图**（不可变的 Action AST），不含任何物理 IO。物理执行需要 `algeff-std` 的 `TokioExecutor`（实现 `SyscallExecutor` 契约，pdr.md §12.2）。当前工作区中 `TokioExecutor::execute` 为 A5 交付中的 `todo!()` 桩，蓝图构造与编译不受影响，运行需待 A5 完成。
+> 说明：`algeff-core` 只负责**蓝图**（不可变的 Action AST），不含任何物理 IO。物理执行需要 `algeff-std` 的 `TokioExecutor`（实现 `SyscallExecutor` 契约，pdr.md §12.2）——A5 已完整交付（op_open/op_read/op_write/…/op_send_file 全部落地，含 RFC-05/10/11 修复与 R-6 快照通道），示例可直接 `cargo run`。
 
 ## 最小示例（main.rs）
 
@@ -94,8 +94,6 @@ cargo run
 ```
 
 预期输出：`result = Ok(Unit)`（执行器完成整条链后返回最终值）。
-
-> ⚠️ 当前 `TokioExecutor::execute` 仍是 `todo!()` 桩（A5 交付中），`cargo run` 会在物理执行处 panic。在此期间，示例可用于验证**蓝图 API 的编译正确性**与文档示例的一致性。
 
 ## 下一步
 

@@ -25,10 +25,10 @@ fn read_once(fd: Fd) -> Action {
 
 `pdr.md` §14 给出一个 TCP 服务蓝图，展示主要控制流节点：
 
-- `fork!`（展开为 `Action::Fork`）：并发处理两个客户端连接，`join!` 汇合；
-- `scope!`（展开为 `Action::Scope`）：在 `/var/log/myapp` 作用域内写 `shutdown.log`，作用域退出时自动撤销；
-- `sleep!`（展开为 `Action::Sleep`）：等待 1 秒；
-- `replace!`（展开为 `Action::Replace`）：控制流跳转到 `shutdown_blueprint()`；
+- `fork!`（展开为 `Action::Fork`）：并发处理两个客户端连接；
+- `scope!`（展开为 `Action::Scope`）：在 `/var/log/myapp` 作用域内写 `shutdown.log`，作用域退出时自动恢复 cwd；
+- `Action::Sleep`：等待 1 秒（宏未提供，手写 `Action::Sleep { duration, next }`）；
+- `Action::Replace`：控制流跳转到 `shutdown_blueprint()`（宏未提供，手写 `Action::Replace { target }`）；
 - 每个客户端处理函数用 `Resource::new_read/new_write/new_owned` 声明资源访问模式（类型安全资源包装），并以 `Action::Sequential` 链式组合 `Read -> Write -> Close`。
 
 完整代码见 `pdr.md` §14。

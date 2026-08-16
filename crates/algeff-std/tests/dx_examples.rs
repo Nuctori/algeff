@@ -292,10 +292,11 @@ fn infer_usage_table() {
         vec![usage(Resource::Pid(42), Own)]
     );
 
-    // 同步（对齐 adversarial_r2 安全声明模式：unlock 降为 Read）
+    // 同步（审计 R4-F2 修复：MutexLock 降为 Read——Write 声明与同值 fd 的
+    // Write 消费冲突且锁循环不可重入；对齐 adversarial_r2 重入场景 rd(id)）
     assert_eq!(
         dx::infer_usage(&DataOp::MutexLock { id: 7 }),
-        vec![usage(f(7), Write)]
+        vec![usage(f(7), Read)]
     );
     assert_eq!(
         dx::infer_usage(&DataOp::MutexUnlock { id: 7 }),
@@ -688,4 +689,42 @@ fn remaining_op_wrappers_construct_syscall_nodes() {
             usage(f(3), AccessMode::Read)
         ]
     );
+}
+
+/// 审计 R4-F1 修复：TcpShutdown 推导为 Own（终结语义）——write→shutdown
+/// 半关闭链不再被 A4 误拒（Write 声明会与 tcp_write 的 Write 消费冲突）。
+#[test]
+fn tcp_shutdown_declares_own_not_write() {
+    let a = dx::tcp_shutdown(&Value::Fd(9), std::net::Shutdown::Write);
+    let Action::Syscall { resources, .. } = &a else {
+        panic!("tcp_shutdown 应构造 Syscall 节点");
+    };
+    assert_eq!(
+        resources,
+        &vec![usage(f(9), AccessMode::Own)],
+        "TcpShutdown 应声明 Own（对齐 e2e ow(sfd) 先例）"
+    );
+}
+
+/// 审计 R4-F2 修复：锁循环 lock→unlock→lock 同 id 可重入（Write 声明下
+/// 第二次 lock 被 A4 误拒；Read 声明无消费语义）。
+#[test]
+fn mutex_lock_cycle_reentrant_via_dx() {
+    let mut r = rt();
+    // lock → unlock → lock 同 id（Read 声明：无 A4 消费）
+    let blueprint = Action::Sequential {
+        current: Box::new(dx::mutex_lock(5)),
+        next: Box::new(|_| Action::Sequential {
+            current: Box::new(dx::mutex_unlock(5)),
+            next: Box::new(|_| dx::mutex_lock(5)),
+        }),
+    };
+    let v = r.run_blocking(blueprint).unwrap();
+    assert_eq!(v, Value::Unit, "锁循环可重入（修复前第二次 lock InvalidInput）");
+    // 清理：解锁 + 无残留
+    r.run_blocking(Action::Sequential {
+        current: Box::new(dx::mutex_unlock(5)),
+        next: Box::new(|_| Action::Pure(Value::Unit)),
+    })
+    .unwrap();
 }

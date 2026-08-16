@@ -122,7 +122,10 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
         DataOp::TcpAccept { listener } => vec![fd_usage(*listener, AccessMode::Read)],
         DataOp::TcpRead { fd, .. } => vec![fd_usage(*fd, AccessMode::Read)],
         DataOp::TcpWrite { fd, .. } => vec![fd_usage(*fd, AccessMode::Write)],
-        DataOp::TcpShutdown { fd, .. } => vec![fd_usage(*fd, AccessMode::Write)],
+        // 审计 R4-F1 修复：TcpShutdown 声明 Own（终结语义）而非 Write——
+        // write→shutdown 是标准半关闭链，Write 声明会与 tcp_write 的 Write
+        // 消费冲突（A4 至多一次）→ 误拒合法蓝图（对齐 e2e.rs 的 ow(sfd) 先例）。
+        DataOp::TcpShutdown { fd, .. } => vec![fd_usage(*fd, AccessMode::Own)],
         // 网络 UDP
         DataOp::UdpBind { .. } => vec![],
         DataOp::UdpRecvFrom { fd, .. } => vec![fd_usage(*fd, AccessMode::Read)],
@@ -151,7 +154,13 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
         // 时间
         DataOp::GetTime => vec![],
         // 同步
-        DataOp::MutexLock { id } => vec![fd_usage(*id, AccessMode::Write)],
+        // 审计 R4-F2 修复：MutexLock 声明 Read(Fd(id)) 而非 Write——
+        // (a) 锁 id 与真实 fd 共享 u64 空间，Write 声明会与同值 fd 的
+        //     Write 消费冲突（A4 至多一次）→ 误拒；Read 无消费语义。
+        // (b) 同链 lock→unlock→lock 循环：unlock 声明 Read 不撤销 Write
+        //     消费 → 第二次 lock 被 A4 误拒；Read 声明下循环可重入。
+        //     对齐核心测试实践（adversarial_r2 的 rd(id) 重入场景）。
+        DataOp::MutexLock { id } => vec![fd_usage(*id, AccessMode::Read)],
         DataOp::MutexUnlock { id } => vec![fd_usage(*id, AccessMode::Read)],
         // 其他
         DataOp::SendFile { out, input, .. } => vec![
@@ -511,12 +520,13 @@ pub fn send_signal(signal: Signal, pid: &Value) -> Action {
 
 // 同步
 
-/// 获取互斥锁（动态仲裁；同 id 的 MutexLock 声明 Write(Fd(id)) 冲突检测）。
+/// 获取互斥锁（动态仲裁；同 id 的 MutexLock 声明 Read(Fd(id))——审计
+/// R4-F2：Write 声明会与同值 fd 的 Write 消费冲突且锁循环不可重入）。
 pub fn mutex_lock(id: u64) -> Action {
     syscall(DataOp::MutexLock { id })
 }
 
-/// 释放互斥锁（Read 声明：Write 会被 A4 每资源至多消费一次）。
+/// 释放互斥锁（Read 声明：不撤销任何消费，锁循环可重入）。
 pub fn mutex_unlock(id: u64) -> Action {
     syscall(DataOp::MutexUnlock { id })
 }

@@ -39,14 +39,18 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # 示例/基准编译护栏（审计 R4-ex #5）：cargo test 默认不编译 examples/
+      # benches，示例与 8 个 criterion 基准可无声腐烂——此处显式构建。
+      - name: cargo build --workspace --examples --benches
+        run: cargo build --workspace --examples --benches
+
       # 特性测试：crates/algeff-core/tests/runtime_features.rs 的 7 个测试
       # 由 coeffects/virtual-clock 特性门控，默认测试不含，此处三平台补跑。
       # 必须限定 -p algeff-core：特性只声明在 algeff-core；virtual-clock 会把
-      # Action::Sleep 改为“推进逻辑时钟、立即返回”（解释器按设计如此），
-      # algeff-std 的 Timeout 测试（adversarial_r1::err_timeout_keeps_undo_*
-      # 等）依赖真实 sleep 计时，在 --workspace 全量跑下会确定性失败（已本地
-      # 复现，两步同因：Sleep 立即完成 → Timeout 不触发）。故只补跑核心特性
-      # 测试，algeff-std/algeff-macro 由上面默认特性步骤覆盖。
+      # Action::Sleep 改为“推进逻辑时钟、立即返回”（解释器按设计如此）。
+      # 注（审计 R1/R3 后）：algeff-std 的 Timeout 测试已适配 VC 语义（双通道
+      # 判定 + 语义分叉门控），VC 构建下全绿——但保守起见仍只补跑核心特性
+      # 测试（全量 all-features 耗时更长，由本地 target-r7 验证）。
       - name: cargo test -p algeff-core --features coeffects,virtual-clock
         run: cargo test -p algeff-core --features coeffects,virtual-clock
 
