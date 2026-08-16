@@ -30,3 +30,12 @@
 - full fork read chain: med=10.143ms
 - drive (runtime build + block_on empty): med=5.560us/call ← 共享 reactor 目标项
 - spawn_blocking empty (multi-thread rt, warm pool): med=2.130us/call
+
+## append（10×32KB 追加，D-039 flush 契约）
+
+| 路径 | median | vs tokio_native |
+|---|---|---|
+| tokio_native_10tasks_x32KB | 6.61ms | 1.00× |
+| algeff_serial_10tasks_x32KB | 2.94ms | **0.44×**（≈44%，含 flush 契约） |
+
+注：本机负载期间测；append 串行路径不受 executor 锁争用影响。

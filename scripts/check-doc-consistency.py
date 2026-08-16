@@ -125,15 +125,24 @@ def main():
         if any(x in t for x in ("深度守卫", "阈值 64", "Other(105)", "65 步")):
             if "64" not in t or "105" not in t or "65" not in t:
                 issues.append(f"[{p}] 提及深度守卫但缺 64/105/65 之一")
-        stale96 = ("≥97 步" in t) or ("≥ 97 步" in t) or ("阈值 **96**（CTO" in t) or ("阈值 96（CTO" in t)
+        stale96 = (
+            ("≥97 步" in t)
+            or ("≥ 97 步" in t)
+            or ("阈值 **96**（CTO" in t)
+            or ("阈值 96（CTO" in t)
+        )
         if stale96 and "迭代 1" not in t and "→ **64**" not in t:
-            issues.append(f"[{p}] 深度守卫旧口径（97 步/阈值 96）出现但无迭代 1 更新注记")
+            issues.append(
+                f"[{p}] 深度守卫旧口径（97 步/阈值 96）出现但无迭代 1 更新注记"
+            )
 
     # ---- 7. append 24.3% 仅历史语境（canonical 39.1）----
     for p in FILES:
         t = texts[p]
         if "24.3%" in t and "修复前旧数" not in t and "39.1" not in t:
-            issues.append(f"[{p}] 24.3% 出现但无「修复前旧数」/39.1 语境（append canonical 现为 39.1）")
+            issues.append(
+                f"[{p}] 24.3% 出现但无「修复前旧数」/39.1 语境（append canonical 现为 39.1）"
+            )
 
     # ---- 8. 合并冲突标记门禁（审查 Note：dx-design 残留教训）----
     for p in FILES + ["docs/src/dx-design.md"]:

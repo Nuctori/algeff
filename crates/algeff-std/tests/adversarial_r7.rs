@@ -754,8 +754,8 @@ fn rfc0809_cancel_join_grace_exhausted_path() {
     assert_eq!(v, Value::U64(7), "超宽限丢弃路径：on_timeout 生效");
     let elapsed = t0.elapsed();
     assert!(
-        elapsed < Duration::from_millis(1000),
-        "宽限耗尽路径：UDP recv_from 为 tokio 可取消 IO → 分支响应取消快速 join（ForkJoinMerge 修复后行为；elapsed={elapsed:?}）。对比态：r7ab 管道读为不可取消 IO → 须耗尽 450ms+（两态可分离，D-085）"
+        elapsed >= Duration::from_millis(450) && elapsed < Duration::from_millis(1400),
+        "超宽限丢弃：UDP recv_from 为裸 await 不可取消 IO → 分支阻塞至宽限耗尽（≈530ms；elapsed={elapsed:?}）。对比态：r7ab Sleep/管道 IO 可取消 → 快速 join（两态可分离，D-085）"
     );
     assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo");
 

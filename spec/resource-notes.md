@@ -779,3 +779,12 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
 推迟至内层 deadline/宽限；修复后亚毫秒打断，实测 0.04s）。语义裁决（r3ab.md）：嵌套
 on_timeout 仍处取消域内（首个 action 即 CANCELLED_ERR）——保留取消域抑制语义（快速中止
 保证），可诊断性由 R3-F 负责。
+
+### 性能节更新（迭代 3，2026-08-16）
+
+A1 性能二轮（ExecAccess::Shared{executor, reactor} 共享 reactor）：分支驱动由
+spawn_blocking ×2 + current-thread runtime ×2 改为 Handle::spawn 到 Runtime 自持
+多线程 reactor（runtime.rs:1120-1140），消除逐分支 runtime 构建开销（prof_fork
+实测 drive 5.56us/call）。基准（负载期测得，见 perf/baseline-it3-2026-08-16.txt）：
+parallel_reads 154%、shared_read 164%、append 44%（含 D-039 flush 契约）；上轮 R6
+口径 264%/381% 因审计并行负载未复现，负载归零后复测。
