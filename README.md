@@ -80,6 +80,39 @@ fn main() {
 ### 3. 真实文件 IO：写一个文件并读回来
 
 ```rust
+use algeff_core::prelude::*;
+use algeff_core::OpenFlags;
+use algeff_macro::do_;
+use algeff_std::dx;
+use algeff_std::TokioExecutor;
+
+fn main() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let path = std::path::PathBuf::from("hello.txt");
+    let flags = OpenFlags { read: true, write: true, create: true, ..Default::default() };
+
+    // 语法就是普通 Rust：open/write/seek/read/close 直书，
+    // fd 经 let 绑定贯穿，资源声明由 dx 按操作自动推导
+    let blueprint = do_! {
+        let fd = dx::open(&path, flags);
+        dx::write(&fd, b"hello algeff".to_vec());
+        dx::seek(&fd, 0, std::io::SeekFrom::Start(0));
+        let data = dx::read(&fd, 64);
+        dx::close(&fd);
+        data // 尾表达式 = 链的最终值
+    };
+
+    let v = rt.run_blocking(blueprint).unwrap();
+    println!("读回: {:?}", v); // Ok(Bytes(b"hello algeff"))
+}
+```
+
+`do_!` 把这段「正常操作」折叠成一条 CPS 链（`and_then` 嵌套）：**展开后的 `Action` 与手写链逐节点同构**，仍然是纯数据——可缓存、可重放、可撤销。设计论证见 [`docs/src/dx-design.md`](docs/src/dx-design.md)。
+
+<details>
+<summary>对比：同样的事，手写 CPS 链（旧写法）长这样——do_! 展开后就是它</summary>
+
+```rust
 use algeff_core::{Action, DataOp, OpenFlags, ReadOnly, ResourceInner, ResourceUsage, Runtime, TypedResource, Value, WriteOnly};
 use algeff_std::TokioExecutor;
 
@@ -139,47 +172,41 @@ fn read_fd(fd: u64) -> ResourceUsage {
 }
 ```
 
+</details>
+
 > ✅ 本示例与下文示例由 `crates/algeff-std/tests/readme_examples.rs` 编译验证，保证照抄可跑。
 
-> 💡 每个操作都要声明它**怎么使用**资源（读/写/独占）——这是 Algeff 保证撤销安全和冲突检测的基础，见[核心概念](#核心概念蓝图执行资源)。
+> 💡 每个操作都自动携带**资源声明**（`dx` 按 `DataOp` 推导：写 → `Write(path)`、关闭 → `Own(fd)`……；需要精确控制时用 `dx::syscall_with` 覆盖，见 §4）——这是 Algeff 保证撤销安全和冲突检测的基础，见[核心概念](#核心概念蓝图执行资源)。
 
-### 4. 用适配器少写样板
+### 4. 资源声明：自动推导与显式覆盖
 
-`algeff_std::adapters` 提供预包装的常用操作（返回可直接组合的 `Action`）：
+`dx` 的每个操作按 `DataOp` **自动推导**资源声明（`infer_usage` 模式表：写 → `Write(path)`、关闭 → `Own(fd)`……）。需要精确控制时，用 `dx::syscall_with` **显式覆盖**：
 
 ```rust
-use algeff_core::{Action, OpenFlags, Value};
-use algeff_std::{TokioExecutor, adapters::{open_file, write, read, close}};
+use algeff_core::prelude::*;
+use algeff_core::OpenFlags;
+use algeff_std::dx;
 
-let blueprint = Action::Sequential {
-    current: Box::new(open_file(path.clone(), OpenFlags { read: true, write: true, create: true, ..Default::default() })),
-    next: Box::new(move |v| {
-        let fd = match v { Value::Fd(fd) => fd, other => panic!("{other:?}") };
-        Action::Sequential {
-            current: Box::new(write(fd, b"hello".to_vec())),
-            next: Box::new(move |_| Action::Sequential {
-                // 关闭后重开：新句柄从位置 0 读（适配器层无 Seek，手写版见 §3）
-                current: Box::new(close(fd)),
-                next: Box::new(move |_| Action::Sequential {
-                    current: Box::new(open_file(path.clone(), OpenFlags { read: true, write: false, ..Default::default() })),
-                    next: Box::new(move |v| {
-                        let fd2 = match v { Value::Fd(fd) => fd, other => panic!("{other:?}") };
-                        Action::Sequential {
-                            current: Box::new(read(fd2, 64)),
-                            next: Box::new(move |v| Action::Sequential {
-                                current: Box::new(close(fd2)),
-                                next: Box::new(move |_| Action::Pure(v)),
-                            }),
-                        }
-                    }),
-                }),
-            }),
-        }
-    }),
-};
+// 自动推导：write 模式 → Write(path)
+let auto = dx::open("hello.txt", OpenFlags { write: true, ..Default::default() });
+
+// 显式覆盖：自定义资源声明完全替换默认推导（syscall_with 优先于 infer_usage）
+let custom = dx::syscall_with(
+    DataOp::Open {
+        path: "hello.txt".into(),
+        flags: OpenFlags { write: true, ..Default::default() },
+    },
+    vec![ResourceUsage {
+        resource: Resource::Path("/custom".into()),
+        mode: AccessMode::Read,
+    }],
+);
+
+assert!(matches!(auto, Action::Syscall { .. }));
+assert!(matches!(custom, Action::Syscall { .. }));
 ```
 
-适配器清单：`open_file` / `create_dir` / `read_dir` / `stat` / `unlink` / `open_tcp` / `accept` / `connect` / `read` / `write` / `close`（源码：`crates/algeff-std/src/adapters.rs`）。
+> 覆盖优先级：`syscall_with` 显式声明 > `infer_usage` 自动推导 > 空集。更低层的预包装操作 `algeff_std::adapters`（`open_file` / `read` / `write` / `close` / `stat` / `unlink` / `open_tcp` / `connect` …）仍可用——它们返回 `Action`，可直接作 `do_!` 的语句（源码：`crates/algeff-std/src/adapters.rs`）。
 
 ---
 
@@ -235,6 +262,42 @@ let blueprint = Action::Sequential {
 plan! { Action::Pure(Value::U64(1)); Action::Pure(Value::U64(2)); }
 ```
 
+### do_! 命令式链：错误短路上抛
+
+`do_!` 块内**任一步失败，错误沿链上抛**（后续语句不执行），`run*` 返回 `Err(SysError)` 而非 panic；需要恢复时用 `Action::Catch` 包住整个链：
+
+```rust
+use algeff_core::prelude::*;
+use algeff_core::OpenFlags;
+use algeff_macro::do_;
+use algeff_std::dx;
+
+let blueprint = do_! {
+    let fd = dx::open("no_such.txt", OpenFlags { read: true, ..Default::default() });
+    dx::write(&fd, b"x".to_vec());
+    let data = dx::read(&fd, 64);
+    dx::close(&fd);
+    data // 打开失败时链首即 Err，不会执行到这里
+};
+
+let result = rt.run_blocking(blueprint); // rt 见 §2
+assert!(matches!(result, Err(SysError::NotFound)));
+
+// 需要恢复：Catch 包住 do_! 链，NotFound 走 handler 返回 0
+let guarded = Action::Catch {
+    action: Box::new(do_! {
+        let fd = dx::open("no_such.txt", OpenFlags { read: true, ..Default::default() });
+        let data = dx::read(&fd, 64);
+        data
+    }),
+    handler: Box::new(|err| match err {
+        SysError::NotFound => Action::Pure(Value::U64(0)),
+        other => Action::Pure(Value::U64(1)),
+    }),
+};
+assert_eq!(rt.run_blocking(guarded).unwrap(), Value::U64(0));
+```
+
 ### 并行 Fork
 
 ```rust
@@ -280,27 +343,20 @@ let blueprint = Action::Replace { target: Box::new(Action::Pure(Value::Unit)) };
 ### 完整 TCP echo 服务器骨架
 
 ```rust
-use algeff_core::{Action, DataOp, Runtime, Value};
+use algeff_core::prelude::*;
+use algeff_macro::do_;
+use algeff_std::dx;
 use algeff_std::TokioExecutor;
 
 fn main() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let blueprint = Action::Syscall {
-        op: DataOp::TcpBind { addr },
-        resources: vec![],
-        next: Box::new(move |v| match v {
-            Value::Fd(listener) => {
-                // accept → 循环 TcpRead/TcpWrite（分片到达需循环读，见 tests/e2e.rs）
-                Action::Syscall {
-                    op: DataOp::TcpAccept { listener },
-                    resources: vec![],
-                    next: Box::new(|_| Action::Pure(Value::Unit)),
-                }
-            }
-            other => panic!("期望 Fd，得到 {other:?}"),
-        }),
+    // 绑定监听 → accept 一个连接（新句柄运行时分配，资源自动推导为空集）
+    let blueprint = do_! {
+        let listener = dx::open_tcp(addr);
+        let _conn = dx::accept(&listener);
+        Value::Unit
     };
 
     // 无客户端连接时 TcpAccept 会一直阻塞——用 Timeout 包裹避免挂死
@@ -311,6 +367,7 @@ fn main() {
     };
     rt.run_blocking(bounded).unwrap();
 }
+```
 
 > 完整可运行示例与分片处理：`crates/algeff-std/tests/e2e.rs`（真实端到端，含 TCP 原生客户端对测）。
 

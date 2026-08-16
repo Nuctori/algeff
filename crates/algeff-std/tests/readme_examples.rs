@@ -1,14 +1,16 @@
 //! README 示例编译验证（审查 HIGH-1/HIGH-2 修复的永久护栏）：
 //! 本文件是 README 示例的手工镜像（非自动抽取）：README 示例改动后
 //! 若不同步本文件，CI 编译/运行即失败——防止 API 漂移的护栏。
-//! 注意：README §4 片段无 fn main 包裹（本文件为可运行测试）；
+//! 注意：README 片段无 fn main 包裹（本文件为可运行测试）；
 //! 镜像覆盖 = 示例体逐字，测试包裹（临时目录/防挂死 Timeout）为测试侧变体。
 //!
 //! 与 README 的对应关系：
-//! - `readme_file_io_roundtrip` ⇔ README §3（手写 Syscall 链）
-//! - `readme_adapters_chain`   ⇔ README §4（adapters 版）
-//! - `readme_patterns`         ⇔ README 常用模式速查（fork!/Catch/Timeout/Replace）
-//! - `readme_tcp_bind`         ⇔ README TCP echo 骨架（仅 Bind+Accept 一次）
+//! - `readme_file_io_roundtrip_do` ⇔ README §3（do_! 版，推荐写法）
+//! - `readme_file_io_cps_legacy`   ⇔ README §3 折叠对比块（手写 CPS 链旧写法）
+//! - `readme_explicit_resources`   ⇔ README §4（资源声明：自动推导与显式覆盖）
+//! - `readme_patterns`             ⇔ README 常用模式速查（plan!/fork!/Catch/Timeout/Replace）
+//! - `readme_do_error_handling`    ⇔ README 常用模式速查（do_! 错误短路上抛 + Catch 恢复）
+//! - `readme_tcp_bind`             ⇔ README TCP echo 骨架（do_! 版 Bind+Accept 一次）
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,10 +19,10 @@ use algeff_core::{
     Action, DataOp, OpenFlags, ReadOnly, ResourceInner, ResourceUsage, Runtime, SysError,
     TypedResource, Value, WriteOnly,
 };
-use algeff_macro::{fork, plan};
-use algeff_std::TokioExecutor;
+use algeff_macro::{do_, fork, plan};
+use algeff_std::{dx, TokioExecutor};
 
-// ── 资源声明辅助（与 README §3 相同）────────────────────────────
+// ── 资源声明辅助（README §3 折叠对比块：旧写法）────────────────────
 
 fn write_path(p: &PathBuf) -> ResourceUsage {
     TypedResource::<WriteOnly>::new_write(ResourceInner::Path(p.clone())).into_usage()
@@ -32,12 +34,43 @@ fn read_fd(fd: u64) -> ResourceUsage {
     TypedResource::<ReadOnly>::new_read(ResourceInner::Fd(fd)).into_usage()
 }
 
-// ── §3：手写 Syscall 链（与 README 代码逐字一致）────────────────
+// ── §3：do_! 版（与 README 代码逐字一致）────────────────────────
 
 #[test]
-fn readme_file_io_roundtrip() {
+fn readme_file_io_roundtrip_do() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let dir = std::env::temp_dir().join(format!("algeff-readme-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("algeff-readme-do-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hello.txt");
+    let flags = OpenFlags {
+        read: true,
+        write: true,
+        create: true,
+        ..Default::default()
+    };
+
+    // 语法就是普通 Rust：open/write/seek/read/close 直书，
+    // fd 经 let 绑定贯穿，资源声明由 dx 按操作自动推导
+    let blueprint = do_! {
+        let fd = dx::open(&path, flags);
+        dx::write(&fd, b"hello algeff".to_vec());
+        dx::seek(&fd, 0, std::io::SeekFrom::Start(0));
+        let data = dx::read(&fd, 64);
+        dx::close(&fd);
+        data // 尾表达式 = 链的最终值
+    };
+
+    let v = rt.run_blocking(blueprint).unwrap();
+    assert_eq!(v, Value::Bytes(b"hello algeff".to_vec()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── §3 折叠对比块：手写 CPS 链旧写法（与 README 代码逐字一致）────
+
+#[test]
+fn readme_file_io_cps_legacy() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let dir = std::env::temp_dir().join(format!("algeff-readme-cps-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("hello.txt");
 
@@ -94,68 +127,40 @@ fn readme_file_io_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ── §4：adapters 版链 ─────────────────────────────────────────
+// ── §4：资源声明自动推导与显式覆盖（与 README 代码逐字一致）──────
 
 #[test]
-fn readme_adapters_chain() {
-    use algeff_std::adapters::{close, open_file, read, write};
+fn readme_explicit_resources() {
+    use algeff_core::prelude::*;
+    use algeff_core::OpenFlags;
+    use algeff_std::dx;
 
-    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    let dir = std::env::temp_dir().join(format!("algeff-readme-adapters-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("hello.txt");
+    // 自动推导：write 模式 → Write(path)
+    let auto = dx::open(
+        "hello.txt",
+        OpenFlags {
+            write: true,
+            ..Default::default()
+        },
+    );
 
-    let blueprint = Action::Sequential {
-        current: Box::new(open_file(
-            path.clone(),
-            OpenFlags {
-                read: true,
+    // 显式覆盖：自定义资源声明完全替换默认推导（syscall_with 优先于 infer_usage）
+    let custom = dx::syscall_with(
+        DataOp::Open {
+            path: "hello.txt".into(),
+            flags: OpenFlags {
                 write: true,
-                create: true,
                 ..Default::default()
             },
-        )),
-        next: Box::new(move |v| {
-            let fd = match v {
-                Value::Fd(fd) => fd,
-                other => panic!("{other:?}"),
-            };
-            Action::Sequential {
-                current: Box::new(write(fd, b"hello".to_vec())),
-                next: Box::new(move |_| Action::Sequential {
-                    // 关闭后重开：新句柄从位置 0 读（适配器层无 Seek，见 §3 手写版）
-                    current: Box::new(close(fd)),
-                    next: Box::new(move |_| Action::Sequential {
-                        current: Box::new(open_file(
-                            path.clone(),
-                            OpenFlags {
-                                read: true,
-                                write: false,
-                                ..Default::default()
-                            },
-                        )),
-                        next: Box::new(move |v| {
-                            let fd2 = match v {
-                                Value::Fd(fd) => fd,
-                                other => panic!("{other:?}"),
-                            };
-                            Action::Sequential {
-                                current: Box::new(read(fd2, 64)),
-                                next: Box::new(move |v| Action::Sequential {
-                                    current: Box::new(close(fd2)),
-                                    next: Box::new(move |_| Action::Pure(v)),
-                                }),
-                            }
-                        }),
-                    }),
-                }),
-            }
-        }),
-    };
+        },
+        vec![ResourceUsage {
+            resource: Resource::Path("/custom".into()),
+            mode: AccessMode::Read,
+        }],
+    );
 
-    let v = rt.run_blocking(blueprint).unwrap();
-    assert_eq!(v, Value::Bytes(b"hello".to_vec()));
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(auto, Action::Syscall { .. }));
+    assert!(matches!(custom, Action::Syscall { .. }));
 }
 
 // ── 常用模式速查：plan! / fork! / Catch / Timeout / Replace ──
@@ -214,27 +219,55 @@ fn readme_patterns() {
     assert_eq!(rt.run_blocking(r).unwrap(), Value::Unit);
 }
 
-// ── TCP 骨架：Bind → Accept 一次 ─────────────────────────────
+// ── 常用模式速查：do_! 错误短路上抛 + Catch 恢复 ────────────────
+
+#[test]
+fn readme_do_error_handling() {
+    use algeff_core::prelude::*;
+    use algeff_core::OpenFlags;
+    use algeff_macro::do_;
+    use algeff_std::dx;
+
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    let blueprint = do_! {
+        let fd = dx::open("no_such.txt", OpenFlags { read: true, ..Default::default() });
+        dx::write(&fd, b"x".to_vec());
+        let data = dx::read(&fd, 64);
+        dx::close(&fd);
+        data // 打开失败时链首即 Err，不会执行到这里
+    };
+
+    let result = rt.run_blocking(blueprint);
+    assert!(matches!(result, Err(SysError::NotFound)));
+
+    // 需要恢复：Catch 包住 do_! 链，NotFound 走 handler 返回 0
+    let guarded = Action::Catch {
+        action: Box::new(do_! {
+            let fd = dx::open("no_such.txt", OpenFlags { read: true, ..Default::default() });
+            let data = dx::read(&fd, 64);
+            data
+        }),
+        handler: Box::new(|err| match err {
+            SysError::NotFound => Action::Pure(Value::U64(0)),
+            _ => Action::Pure(Value::U64(1)),
+        }),
+    };
+    assert_eq!(rt.run_blocking(guarded).unwrap(), Value::U64(0));
+}
+
+// ── TCP 骨架：do_! 版 Bind → Accept 一次 ───────────────────────
 
 #[test]
 fn readme_tcp_bind() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let blueprint = Action::Syscall {
-        op: DataOp::TcpBind { addr },
-        resources: vec![],
-        next: Box::new(move |v| match v {
-            Value::Fd(listener) => {
-                // accept → 循环 TcpRead/TcpWrite（分片到达需循环读，见 tests/e2e.rs）
-                Action::Syscall {
-                    op: DataOp::TcpAccept { listener },
-                    resources: vec![],
-                    next: Box::new(|_| Action::Pure(Value::Unit)),
-                }
-            }
-            other => panic!("期望 Fd，得到 {other:?}"),
-        }),
+    // 绑定监听 → accept 一个连接（新句柄运行时分配，资源自动推导为空集）
+    let blueprint = do_! {
+        let listener = dx::open_tcp(addr);
+        let _conn = dx::accept(&listener);
+        Value::Unit
     };
 
     // 仅验证构建可执行（无客户端连接时 Accept 会阻塞——用 Timeout 包裹避免挂死）
