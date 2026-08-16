@@ -1,4 +1,4 @@
-//! 临时性能剖析（不入库）：分解 Algeff Fork 链成本。
+//! 性能剖析：分解 Algeff Fork 链成本（迭代 3-A1 产物，配合 perf/ 基线使用）。
 //! 用法：cargo run --release -p algeff-std --example prof_fork
 use std::future::Future;
 use std::path::{Path, PathBuf};

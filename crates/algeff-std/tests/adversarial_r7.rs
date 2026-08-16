@@ -697,6 +697,7 @@ fn rfc0809_cancel_join_grace_join_path() {
             on_timeout: Box::new(Action::Pure(Value::U64(42))),
         })
         .unwrap();
+    assert_eq!(v, Value::U64(42), "on_timeout 生效");
     assert!(
         t0.elapsed() < Duration::from_millis(800),
         "宽限内 join：分支响应取消快速返回（elapsed={:?} < 800ms 上界，全量并行负载余量）",
@@ -754,7 +755,7 @@ fn rfc0809_cancel_join_grace_exhausted_path() {
     let elapsed = t0.elapsed();
     assert!(
         elapsed < Duration::from_millis(1000),
-        "宽限耗尽路径：分支响应取消快速 join（ForkJoinMerge 修复后行为；elapsed={elapsed:?}）"
+        "宽限耗尽路径：UDP recv_from 为 tokio 可取消 IO → 分支响应取消快速 join（ForkJoinMerge 修复后行为；elapsed={elapsed:?}）。对比态：r7ab 管道读为不可取消 IO → 须耗尽 450ms+（两态可分离，D-085）"
     );
     assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo");
 

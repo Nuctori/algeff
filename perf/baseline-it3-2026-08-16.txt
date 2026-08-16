@@ -1,0 +1,32 @@
+# 迭代 3 性能基线（it3：共享 reactor 后，2026-08-16）
+
+机器：同前（Windows，Debug 目标除基准 release）。负载：审计并行期间测（基线值偏保守）。
+
+## parallel_reads（10×1MB 并行读）
+
+| 路径 | median | vs tokio_native |
+|---|---|---|
+| tokio_native_10x1MB | 7.54ms | 1.00× |
+| algeff_fork10_x1MB | 11.60ms | **1.54×**（≈154%） |
+
+## shared_read（8 任务共享 8MB）
+
+| 路径 | median | vs tokio_native |
+|---|---|---|
+| tokio_native_8tasks_8MB | 6.28ms | 1.00× |
+| algeff_fork8_shared_8MB | 10.28ms | **1.64×**（≈164%） |
+
+## 解读（诚实口径）
+
+- 上轮 R-6 快照通道后 parallel 264%/shared 381%（baseline-it1-r6-2026-08-16.txt）；本轮**未复现该比值**（154%/164%）。
+- 已排除：共享 reactor 回归（R6 基线同机同构建；本轮含 ForkJoinMerge + TakeHandleGuard + 审计并行负载）。
+- 已排除：基准稳定性（机器重负载 flaky 已知）。
+- **未排除：本机当前负载**（3 路 subagent 并行编译/测试中）——median 受 CPU 抢占抬升，比值被压缩。
+- 待负载归零后复测：若仍 ~1.5× 则需调查 A1 共享 reactor 是否引入分支调度串行化（预期值 ≈264%/381%）。
+
+## prof_fork 分解（release，本轮）
+
+- pure fork tree (10 leaves, 9 nodes): med=0.821ms
+- full fork read chain: med=10.143ms
+- drive (runtime build + block_on empty): med=5.560us/call ← 共享 reactor 目标项
+- spawn_blocking empty (multi-thread rt, warm pool): med=2.130us/call
