@@ -444,6 +444,8 @@ impl TokioExecutor {
             .create_new(flags.exclusive);
         let file = o.open(path).await.map_err(to_sys_err)?;
         // registry 簿记 token：try_clone 共享同一 OS 描述（真实工作对象在 executor 侧）。
+        // 注（§13 性能分解）：try_clone ~0.1ms/Open 是**契约必需**——r6b 测试锁定
+        // registry 句柄必须是真实 File 类型（类型完整性断言），无法替换为占位。
         let token = file.try_clone().await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::File(Arc::new(token)));
         self.files
