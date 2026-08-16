@@ -631,10 +631,25 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   永不执行：注册表条目已取走、arc 唯一强引用 → 物理资源被关闭（TCP 连接断/管道对端
   EOF/Child 无人 wait）；执行器映射表残留陈旧项（`reg.clear()` 也不清 executor 表）；
   后续同逻辑 fd 一律 NotFound。修复方向：仿 ArbiterClaimGuard 加「已取句柄 RAII 守卫」。
+  **状态（迭代 3-A3 核销轮）：未核销（仍开放）**——写端变体已锁定于
+  `adversarial_r7.rs::rfc0809_timeout_cancels_inflight_write_linear_rollback`（F-R7-2，
+  wfd lookup None）；本迭代补**读端**变体 `adversarial_r7ab.rs::
+  r7a_timeout_cancels_inflight_pipe_read_leak_locked`：取消飞行中管道读 → 注册表条目
+  丢失 + 映射陈旧 → 同 fd 重复 Read / Close 均 NotFound（测试锁定当前行为，未修，
+  CTO 派发修复轮）。无取消正向回归 `r7a_pipe_rotation_repeated_reads_close_normal`
+  （重复读同变体 + Close 正常）全绿，证明轮换机制本身无回归。
 - **R7-B [MEDIUM] Timeout{Fork{MutexLock}} 孤儿分支占坑永久泄漏**：Timeout 丢弃 Fork future
   → spawn_blocking 分支成为孤儿继续执行 → 分支私有 undo（含锁释放）随任务结果丢弃 →
   arbiter 占坑永久残留，同 id 后续 Lock 永久 WouldBlock，**Replace/recover 也无法释放**
   （RFC-09「recover 可恢复」对孤儿分支不成立）。
+  **状态（迭代 3-A3 核销轮）：未核销（仍开放）**——宽限耗尽变体锁定于
+  `adversarial_r7ab.rs::r7b_timeout_fork_lock_grace_exhausted_orphan_leak_locked`：
+  Timeout{Fork{MutexLock, UdpRecvFrom(阻塞)}} 宽限耗尽 → 孤儿分支已持锁 → 同 id
+  Lock WouldBlock（有限重试，A7 不挂死）；Replace（recover+reg.clear）后仍 WouldBlock
+  （孤儿 undo 从不并入父）；显式 MutexUnlock 是唯一逃逸通道（测试锁定当前行为，未修，
+  CTO 派发修复轮）。宽限内 join 变体 `r7b_timeout_fork_lock_join_path_lock_reentrant`
+  **通过**：分支可取消快速返回 → 合并 → rollback_from 执行释放 undo → 同 id 立即可
+  重入（RFC-09 目标在 Fork 并行路径成立，补齐 executor.rs 线性路径主场景之外的面）。
 - **R7-C [LOW] set_dependency 双份等价 undo footgun（coeffects）**：栈副本 + handed 副本
   「只执行其中一份」依赖微妙前提（间隔无中间 set），无测试覆盖。
 - **R7-D [LOW] fork_conflict 静态收集漏 `Invoke.captures`**（闭包盲区之外的另一盲区）。
@@ -643,6 +658,24 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   同一物理文件（resource-notes §4「以规范化路径为准」承诺未兑现）。
 - **R7-F 语义裁决记录**：VC 下 Timeout = 双通道（虚拟累计 + 墙钟防御）、GetTime = `vc.now()`、
   Fork 并行分支时钟 = sum 合并；墙钟路径语义不变。
+
+### R7-A/B 核销判定（迭代 3-A3，2026-08-17，测试驱动）
+
+**结论：R7-A / R7-B 均未核销（仍开放）**，本迭代补回归测试锁定当前行为（src/ 冻结
+零改动，未修；CTO 派发修复轮，修复方向同登记原文：已取句柄 RAII 守卫 / 宽限耗尽
+时先轮询已完成的 JoinHandle 合并 registry/undo 再丢弃未完成的）。
+
+测试载体：`crates/algeff-std/tests/adversarial_r7ab.rs`（基线 7f7285a 新增，4 测试
+全绿；时域门控 `#[cfg(not(feature="virtual-clock"))]` 与既有宽限测试同约定）。
+
+- **R7-A（未核销）**：`r7a_timeout_cancels_inflight_pipe_read_leak_locked` 锁定
+  取消飞行中管道读 → 注册表句柄泄漏 + `pipe_reader_fds` 映射残留陈旧项 → 同 fd
+  重复 Read / Close 一律 NotFound（`rfc07_pipe_roundtrip_close_no_regression` 无取消
+  路径全绿证明非轮换机制自身回归）。
+- **R7-B（未核销，部分面已验证）**：`r7b_timeout_fork_lock_grace_exhausted_orphan_leak_locked`
+  锁定宽限耗尽 → 孤儿分支持锁占坑永久残留（WouldBlock → Replace/recover 仍 WouldBlock
+  → 仅显式 MutexUnlock 可逃逸）；`r7b_timeout_fork_lock_join_path_lock_reentrant` 验证
+  宽限内 join 路径锁立即可重入（RFC-09 目标在 Fork 并行路径成立）。
 
 ## 12. R3 对账审计轮（5 轮串行循环第 3 轮，2026-08-16）——取消传播复核 + 文档对账
 
