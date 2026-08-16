@@ -402,15 +402,20 @@ pub fn choose(input: TokenStream) -> TokenStream {
 /// 语法（`{}` 块）：
 /// - `let <标识符> = <Action 表达式>;` —— 执行并把**结果值**绑定到标识符；
 /// - `let _ = <Action 表达式>;` / `<Action 表达式>;` —— 执行并丢弃结果；
-/// - 尾表达式（不带分号）—— 链的**最终值**，展开为 `Action::Pure(尾表达式)`；
-///   省略时收敛为 `Action::Pure(Value::Unit)`。
+/// - 尾表达式（不带分号）—— 链的**最终值**，展开为 `dx::pure(尾表达式)`
+///   （`pure: Value → Action`）；省略时收敛为 `Action::Pure(Value::Unit)`。
 ///
 /// 语句内**任何返回 `Action` 的表达式**都可用（`dx::open`/`plan!`/`scope!`/
 /// `choose!`/嵌套 `do_!`）。分支/循环体需要多条语句时，用嵌套 `do_!` 块。
 ///
+/// **尾表达式必须是 `Value`**：若误写为 `Action`（如把 `dx::read(...)` 直接
+/// 放在块末不加分号），编译器报 `expected Value, found Action`（诊断指向
+/// `dx::pure` 的签名，A1 发现：经 `dx::pure` 包装比裸 `Action::Pure` 更贴近
+/// DX 层语义）——补分号使其成为语句即可。
+///
 /// 展开说明：`let x = e;` → `algeff_std::dx::and_then(e, move |x| { 后续 })`；
 /// 表达式语句 → `and_then(e, move |_| { 后续 })`；尾表达式 → 最内层
-/// `Action::Pure(尾表达式)`。使用本宏的代码需依赖 `algeff-std`（提供
+/// `dx::pure(尾表达式)`。使用本宏的代码需依赖 `algeff-std`（提供
 /// `dx::and_then`）与 `algeff-core`。
 ///
 /// 用法示例（配合 `algeff_std::dx`，资源声明自动推导）：
@@ -461,7 +466,7 @@ pub fn do_(input: TokenStream) -> TokenStream {
     // 从尾向前折叠成 and_then 链。
     let mut out: TokenStream2 = match tail {
         Some(e) => quote! {
-            algeff_core::action::Action::Pure(#e)
+            algeff_std::dx::pure(#e)
         },
         None => pure_unit(),
     };

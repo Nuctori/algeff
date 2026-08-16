@@ -9,7 +9,9 @@
 //! 3. **与 plan! 共存**——plan! 包裹 do_!（命令式阶段内嵌声明式骨架）、
 //!    do_! 内嵌 plan!/choose!（骨架内声明式子步骤）；
 //! 4. **资源自动推导 + 显式覆盖**——infer_usage 模式表全量断言；
-//!    `syscall_with` 覆盖默认推导。
+//!    `syscall_with` 覆盖默认推导；
+//! 5. **锁重入 + 信号可重复（R7 DX 修复回归）**——mutex lock→unlock→再 lock
+//!    成功；SendSignal 二次发送不被 A4 线性域拒绝。
 
 use algeff_core::prelude::*;
 use algeff_core::{AccessMode, MmapProt, OpenFlags, PipeFlags, Resource, ResourceUsage, SysError};
@@ -288,14 +290,15 @@ fn infer_usage_table() {
         vec![usage(Resource::Pid(42), Own)]
     );
 
-    // 同步（对齐 adversarial_r2 安全声明模式：unlock 降为 Read）
+    // 同步（R7 修复：锁仲裁在 executor 层 arbiter（D16/R-1），与 A4 线性域
+    // 正交——空声明保证 lock→unlock→再 lock 可重入，对齐 adversarial_r2 2b）
+    assert_eq!(dx::infer_usage(&DataOp::MutexLock { id: 7 }), vec![]);
+    assert_eq!(dx::infer_usage(&DataOp::MutexUnlock { id: 7 }), vec![]);
+
+    // 信号（无仲裁层：二次发送允许，A4 不消费 Signal/Pid）
     assert_eq!(
-        dx::infer_usage(&DataOp::MutexLock { id: 7 }),
-        vec![usage(f(7), Write)]
-    );
-    assert_eq!(
-        dx::infer_usage(&DataOp::MutexUnlock { id: 7 }),
-        vec![usage(f(7), Read)]
+        dx::infer_usage(&DataOp::SendSignal { signal: 9, pid: 42 }),
+        vec![]
     );
 
     // 内存
@@ -433,4 +436,82 @@ fn empty_block_and_discard_statement() {
         Value::Unit
     };
     assert!(matches!(rt().run_blocking(blueprint).unwrap(), Value::Unit));
+}
+
+// ── 6. R7 DX 修复回归：锁可重入 + 信号可重复 ─────────────────────────
+
+#[test]
+fn mutex_lock_unlock_relock_succeeds() {
+    // R7 发现：infer_usage 把 MutexLock 推导为 Write(Fd(id))，A4 每资源至多
+    // 消费一次（arbiter release 只清占坑不清 A4 consumed）→ lock→unlock→再
+    // lock 第二次必被 A4 拒 InvalidInput。修复后空声明：仲裁在 executor 层
+    // arbiter（unlock 释放占坑）→ 顺序重入成功。
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let blueprint = do_! {
+        dx::mutex_lock(7);
+        dx::mutex_unlock(7);
+        dx::mutex_lock(7);
+        dx::mutex_unlock(7);
+        Value::Unit
+    };
+    // 修复前：第二次 mutex_lock 在此抛 InvalidInput。
+    rt.run_blocking(blueprint).unwrap();
+
+    // 两把锁的 undo 入栈（显式 unlock 已物理释放，undo 为幂等 no-op）
+    assert_eq!(rt.undo_stack().len(), 2);
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+    assert!(rt.undo_stack().is_empty());
+
+    // 同 id 再次重入仍然成立（undo 释放不破坏可重入性，对齐 r2 2a 断言）。
+    rt.run_blocking(dx::mutex_lock(7)).unwrap();
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+}
+
+#[test]
+fn send_signal_repeatable_no_a4_rejection() {
+    // R7 评估：SendSignal 原推导 Write(Signal)+Write(Pid(pid)) → Signal 全局
+    // 资源至多一次 → 二次发送被 A4 拒 InvalidInput。修复后空声明：executor
+    // 层对 Signal 无仲裁、二次发送语义上允许（SIGTERM→SIGKILL 优雅停机），
+    // 成败由物理层决定，绝不由 A4 线性域拒绝。
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    // 长存活子进程（平台差异：Unix sh -c sleep；Windows cmd timeout）。
+    #[cfg(windows)]
+    let cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "timeout", "60"]);
+        c
+    };
+    #[cfg(not(windows))]
+    let cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", "sleep 60"]);
+        c
+    };
+    let pid = rt.run_blocking(dx::spawn(cmd)).unwrap();
+    assert!(matches!(pid, Value::Pid(_)));
+
+    // 第一次 SIGKILL（9）：路由 op_kill → 物理杀进程。
+    rt.run_blocking(dx::send_signal(9, &pid)).unwrap();
+
+    // 第二次 SIGKILL：修复前在 A4 层被拒（InvalidInput，Signal/Pid 已消费）；
+    // 修复后进入物理层（已终止子进程 start_kill 幂等成功，或平台层错误），
+    // 但绝不可能是 A4 的 InvalidInput。
+    let second = rt.run_blocking(dx::send_signal(9, &pid));
+    match second {
+        Ok(_) => {}
+        Err(e) => assert!(
+            !matches!(e, SysError::InvalidInput),
+            "二次 SendSignal 不应被 A4 拒绝（InvalidInput），实测 {e:?}"
+        ),
+    }
+
+    // 收割子进程（退出码 1 = 信号终止，平台差异不断言具体值）。
+    let v = rt.run_blocking(dx::wait(&pid)).unwrap();
+    assert!(matches!(v, Value::U64(_)));
 }

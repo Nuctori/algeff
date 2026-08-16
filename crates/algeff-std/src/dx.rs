@@ -82,8 +82,12 @@ fn pid_usage(pid: Pid, mode: AccessMode) -> ResourceUsage {
 ///   Unlink → Own（终结），Rename → Write(from)+Write(to)；
 /// - 网络/进程等**运行时才分配句柄**的操作（TcpBind/TcpConnect/UdpBind/PipeOpen/
 ///   Spawn/GetTime/Munmap）→ 空集（新句柄无法静态声明，pdr.md §18 用户责任域）；
-/// - MutexLock → Write(Fd(id))、MutexUnlock → Read(Fd(id))（对齐 adversarial_r2
-///   攻击面 2a 的安全声明模式：Write 会被 A4 每资源至多消费一次，unlock 必须降为 Read）；
+/// - MutexLock/MutexUnlock → 空集（锁 id 的仲裁在 executor 层经 arbiter
+///   （D16/R-1），与 A4 线性域正交——声明 Write(Fd(id)) 会被 A4 每资源至多消费
+///   一次，lock→unlock→再 lock 二次必被拒；空声明对齐 adversarial_r2 攻击面
+///   2b 模式，重入由 arbiter 占坑释放保证）；
+/// - SendSignal → 空集（Signal 属全局资源，executor 层无仲裁；二次发送语义上
+///   允许——SIGTERM→SIGKILL 优雅停机模式，A4 不应拒绝，物理层决定成败）；
 /// - 覆盖：任何调用方可用 `syscall_with` 或手写 `Action::Syscall` 显式声明覆盖。
 pub fn infer_usage(op: &DataOp) -> ResourceSet {
     match op {
@@ -131,11 +135,8 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
         DataOp::Spawn { .. } => vec![],
         DataOp::Kill { pid, .. } => vec![pid_usage(*pid, AccessMode::Write)],
         DataOp::Wait { pid } => vec![pid_usage(*pid, AccessMode::Own)],
-        // 信号
-        DataOp::SendSignal { pid, .. } => vec![
-            usage(Resource::Signal, AccessMode::Write),
-            pid_usage(*pid, AccessMode::Write),
-        ],
+        // 信号（无仲裁层：二次发送允许，A4 不消费 Signal/Pid——见模块文档）
+        DataOp::SendSignal { .. } => vec![],
         // 内存
         DataOp::Mmap { path, prot, .. } => {
             let mode = if prot.write {
@@ -148,9 +149,9 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
         DataOp::Munmap { .. } => vec![],
         // 时间
         DataOp::GetTime => vec![],
-        // 同步
-        DataOp::MutexLock { id } => vec![fd_usage(*id, AccessMode::Write)],
-        DataOp::MutexUnlock { id } => vec![fd_usage(*id, AccessMode::Read)],
+        // 同步（仲裁在 executor 层 arbiter，A4 域空声明——见模块文档）
+        DataOp::MutexLock { .. } => vec![],
+        DataOp::MutexUnlock { .. } => vec![],
         // 其他
         DataOp::SendFile { out, input, .. } => vec![
             fd_usage(*out, AccessMode::Write),
@@ -475,7 +476,8 @@ pub fn kill(pid: &Value, signal: Signal) -> Action {
     })
 }
 
-/// 发送信号（不可逆；非 SIGKILL 由物理层拒绝，需用户补偿挂钩）。
+/// 发送信号（空资源声明：二次发送允许——Signal 无仲裁层，A4 不消费；
+/// 不可逆，非 SIGKILL 由物理层拒绝，需用户补偿挂钩）。
 pub fn send_signal(signal: Signal, pid: &Value) -> Action {
     syscall(DataOp::SendSignal {
         signal,
@@ -485,12 +487,13 @@ pub fn send_signal(signal: Signal, pid: &Value) -> Action {
 
 // 同步
 
-/// 获取互斥锁（动态仲裁；同 id 的 MutexLock 声明 Write(Fd(id)) 冲突检测）。
+/// 获取互斥锁（空资源声明：同 id 的仲裁在 executor 层经 arbiter 独占占坑，
+/// A4 线性域不消费——lock→unlock→再 lock 可重入；并行争用败者 WouldBlock）。
 pub fn mutex_lock(id: u64) -> Action {
     syscall(DataOp::MutexLock { id })
 }
 
-/// 释放互斥锁（Read 声明：Write 会被 A4 每资源至多消费一次）。
+/// 释放互斥锁（空资源声明；executor 层释放 arbiter 占坑，幂等）。
 pub fn mutex_unlock(id: u64) -> Action {
     syscall(DataOp::MutexUnlock { id })
 }
