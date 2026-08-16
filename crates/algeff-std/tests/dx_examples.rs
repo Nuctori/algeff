@@ -14,6 +14,10 @@
 //! 迭代 2 新增（§6）：文件面全操作一个 do_! 覆盖、TCP bind/accept 骨架、
 //! 错误处理 `dx::catch`（do_! 内组合）、do_! 与 plan!/fork! 混合、
 //! munmap/send_file/dup2 包装补齐。
+//!
+//! 迭代 3-A5 新增（§7）：plan! continuation 闭包改 move 后 do_! 块可直接
+//! 内嵌（修复非首元素 E0597）；`dx::usage`/`dx::fd_usage`/`dx::path_usage`/
+//! `dx::pid_usage`/`dx::signal_usage` 资源声明便捷构造（syscall_with 配套）。
 
 //!    `syscall_with` 覆盖默认推导；
 //! 5. **锁重入 + 信号可重复（R7 DX 修复回归）**——mutex lock→unlock→再 lock
@@ -129,9 +133,9 @@ fn plan_wraps_do_blocks() {
     let sub = dir.path().join("sub");
     let file = sub.join("a.txt");
 
-    // 两个命令式 do_! 阶段先构造成 Action 值，再作为元素交给 plan! 骨架——
-    // 注意：plan! 的 continuation 闭包非 move，直接内嵌会借用外部路径；
-    // 预构建后 plan! 只做值组合，无借用问题（蓝图即值、再组合）。
+    // 两个命令式 do_! 阶段直接作为元素交给 plan! 骨架——迭代 3-A5 起 plan!
+    // continuation 闭包为 move，do_! 块（含外部路径捕获）可直接内嵌任意位置；
+    // 此处仍按「预构建 Action 值再组合」写法（等价且可复用阶段），兼容旧形态。
     let mkdir_act = do_! {
         dx::mkdir(&sub, 0o755);
         Value::Unit
@@ -599,8 +603,9 @@ fn do_plan_fork_mix() {
     let fa = sub.join("a.txt");
     let fb = sub.join("b.txt");
 
-    // plan!/fork! 内嵌 do_! 均预构建 Action 值（do_! 展开闭包要求 'static、
-    // plan!/fork! 只做值组合），与迭代 1 plan_wraps_do_blocks 同模式。
+    // plan!/fork! 内嵌 do_!：迭代 3-A5 起 plan! continuation 闭包为 move，
+    // do_! 块可直接内嵌任意位置；此处预构建 Action 值（与迭代 1 同模式，
+    // 便于左右分支复用同一阶段），兼容旧形态。
     let mkdir_act = do_! { dx::mkdir(&sub, 0o755); Value::Unit };
     let left_act = do_! {
         let f = dx::open(fa.clone(), open_rw_create());
@@ -817,4 +822,133 @@ fn send_signal_repeatable_no_a4_rejection() {
     // 收割子进程（退出码 1 = 信号终止，平台差异不断言具体值）。
     let v = rt.run_blocking(dx::wait(&pid)).unwrap();
     assert!(matches!(v, Value::U64(_)));
+}
+
+// ── 7. 迭代 3-A5：plan! move 内嵌 do_! 直接写法 + usage builder ──────
+
+/// plan! continuation 闭包改 move 后，do_! 块（含外部路径捕获）可直接内嵌
+/// plan! 任意位置——修复前：非首元素的 `&外部路径` 被非 move 闭包借用捕获，
+/// 报 E0597 `path does not live long enough`，被迫预构建 Action 值。
+#[test]
+fn plan_embeds_do_blocks_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    let file = sub.join("a.txt");
+
+    // 两个 do_! 块直接内嵌 plan!：首元素借用于构造期，第二个（continuation
+    // 闭包体内）引用 file → move 闭包把 file 移入链（file 被消费，断言用克隆）。
+    let file_check = file.clone();
+    let blueprint: Action = plan! {
+        do_! {
+            dx::mkdir(&sub, 0o755);
+            Value::Unit
+        };
+        do_! {
+            let f = dx::open(&file, open_rw_create());
+            dx::write(&f, b"hi".to_vec());
+            dx::close(&f);
+            Value::Unit
+        };
+    };
+
+    // 结构断言：最外层 Sequential（与预构建写法展开同构）。
+    assert!(matches!(blueprint, Action::Sequential { .. }));
+
+    rt().run_blocking(blueprint).unwrap();
+    assert_eq!(
+        std::fs::read(&file_check).unwrap(),
+        b"hi",
+        "plan! 内直接内嵌的 do_! 阶段应真实落盘"
+    );
+}
+
+/// 与 prelude 的 plan! 值组合形态共存：预构建 Action 值作为元素（值被 move
+/// 进 current/continuation），行为与迭代 1/2 完全一致（回归保障）。
+#[test]
+fn plan_move_keeps_value_composition_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("b.txt");
+
+    let write_act = do_! {
+        let f = dx::open(&file, open_rw_create());
+        dx::write(&f, b"keep".to_vec());
+        dx::close(&f);
+        Value::Unit
+    };
+    let blueprint: Action = plan! {
+        write_act;
+        dx::get_time();
+    };
+    rt().run_blocking(blueprint).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+}
+
+/// `dx::usage`/`dx::fd_usage`/`dx::path_usage`/`dx::pid_usage`/`dx::signal_usage`
+/// 便捷构造 ResourceUsage（迭代 3-A5），消除手写 `ResourceUsage { resource, mode }`
+/// 与 `TypedResource::new_*.into_usage()` 样板；与 `syscall_with` 组合成显式覆盖。
+#[test]
+fn usage_builder_constructs_usage() {
+    use AccessMode::{Append, Own, Read, Write};
+
+    // 通用构造 + 按资源类型便捷构造（与手写结构体逐字段等价）。
+    assert_eq!(
+        dx::usage(Resource::Fd(3), Read),
+        ResourceUsage {
+            resource: Resource::Fd(3),
+            mode: Read,
+        }
+    );
+    assert_eq!(
+        dx::fd_usage(3, Write),
+        ResourceUsage {
+            resource: Resource::Fd(3),
+            mode: Write,
+        }
+    );
+    assert_eq!(
+        dx::path_usage("/a", Append),
+        ResourceUsage {
+            resource: Resource::Path("/a".into()),
+            mode: Append,
+        }
+    );
+    assert_eq!(
+        dx::pid_usage(42, Own),
+        ResourceUsage {
+            resource: Resource::Pid(42),
+            mode: Own,
+        }
+    );
+    assert_eq!(
+        dx::signal_usage(Write),
+        ResourceUsage {
+            resource: Resource::Signal,
+            mode: Write,
+        }
+    );
+
+    // 组合：syscall_with 显式覆盖自动推导（Open flags.write 本应推 Write(path)，
+    // 现覆盖为 Read(custom)）——builder 消解手写 ResourceUsage 样板。
+    let a = dx::syscall_with(
+        DataOp::Open {
+            path: "/x".into(),
+            flags: OpenFlags {
+                write: true,
+                ..Default::default()
+            },
+        },
+        vec![dx::path_usage("/custom", Read)],
+    );
+    let Action::Syscall { op, resources, .. } = &a else {
+        panic!("syscall_with 应构造 Syscall 节点");
+    };
+    assert!(matches!(op, DataOp::Open { .. }));
+    assert_eq!(
+        resources,
+        &vec![ResourceUsage {
+            resource: Resource::Path("/custom".into()),
+            mode: Read,
+        }],
+        "builder 构造的显式声明应完全覆盖自动推导"
+    );
 }

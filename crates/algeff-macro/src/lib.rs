@@ -55,6 +55,40 @@ impl Parse for PlanInput {
 #[doc = "收敛为 `Action::Pure(Value::Unit)`。空列表直接展开为 `Action::Pure(Value::Unit)`。"]
 #[doc = "宏仅拼 AST，不做任何类型检查（pdr.md §八：核心不依赖宏，宏仅为语法糖）。"]
 #[doc = ""]
+#[doc = "**capture 语义（迭代 3-A5 变更：continuation 闭包为 `move`）**：后续元素"]
+#[doc = "（非首个）的表达式体位于 continuation 闭包内，闭包一律 `move`——体内引用的"]
+#[doc = "外部变量被**移入**闭包（与 `do_!`/`choose!` 的 move 闭包一致）："]
+#[doc = "- 使 `do_!` 块（含 `move` 闭包捕获外部路径/fd）可**直接内嵌** plan! 任意位置"]
+#[doc = "  （修复前：非首元素的 `&外部路径` 被非 move 闭包借用捕获 → E0597\n"]
+#[doc = "  `path does not live long enough`，需预构建 Action 值规避）；"]
+#[doc = "- 被引用的外部值被消费（move）：如需保留请先 clone。"]
+#[doc = ""]
+#[doc = "直接内嵌 do_! 示例（迭代 3-A5 新增能力，两个 do_! 块都引用外部 `path`："]
+#[doc = "首元素借用于构造期，后续元素经 move 闭包消费 `path`）："]
+#[doc = "```rust"]
+#[doc = "use algeff_core::prelude::*;"]
+#[doc = "use algeff_core::OpenFlags;"]
+#[doc = "use algeff_macro::{do_, plan};"]
+#[doc = "use algeff_std::dx;"]
+#[doc = ""]
+#[doc = "let path = std::path::PathBuf::from(\"/tmp/dx_a5.txt\");"]
+#[doc = "let flags = OpenFlags { read: true, write: true, create: true, ..Default::default() };"]
+#[doc = "let p: Action = plan! {"]
+#[doc = "    do_! {"]
+#[doc = "        let f = dx::open(&path, flags);"]
+#[doc = "        dx::write(&f, b\"hi\".to_vec());"]
+#[doc = "        dx::close(&f);"]
+#[doc = "        Value::Unit"]
+#[doc = "    };"]
+#[doc = "    do_! {"]
+#[doc = "        let f = dx::open(&path, flags);"]
+#[doc = "        dx::close(&f);"]
+#[doc = "        Value::Unit"]
+#[doc = "    };"]
+#[doc = "};"]
+#[doc = "assert!(matches!(p, Action::Sequential { .. }));"]
+#[doc = "```"]
+#[doc = ""]
 #[doc = "用法示例："]
 #[doc = "```rust"]
 #[doc = "use algeff_macro::plan;"]
@@ -97,7 +131,10 @@ pub fn plan(input: TokenStream) -> TokenStream {
         out = quote! {
             algeff_core::action::Action::Sequential {
                 current: Box::new(#expr),
-                next: Box::new(|_| #out),
+                // 迭代 3-A5：continuation 闭包改 move（与 do_!/choose! 一致）——
+                // 后续元素体内引用的外部变量被移入闭包，使 do_! 块（含 move 捕获）
+                // 可直接内嵌任意位置（修复前非 move 借用 → E0597）。
+                next: Box::new(move |_| #out),
             }
         };
     }
