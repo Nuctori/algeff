@@ -1084,6 +1084,7 @@ impl Drop for ForkJoinMerge<'_> {
 /// async fn，其 future 的 Send 判定与 `interpret_impl` 的 Send 判定构成
 /// 循环义务（E0391）。Box 化（`Pin<Box<dyn Future + Send>>`）把 Send 边界
 /// 固化在 trait object 上，切断循环（与 `run_sub_impl` 同模式）。
+#[allow(clippy::too_many_arguments)]
 fn run_fork_parallel<'a>(
     left: Action,
     right: Action,

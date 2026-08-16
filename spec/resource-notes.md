@@ -685,7 +685,7 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   → 仅显式 MutexUnlock 可逃逸）；`r7b_timeout_fork_lock_join_path_lock_reentrant` 验证
   宽限内 join 路径锁立即可重入（RFC-09 目标在 Fork 并行路径成立）。
 
-### R7-A/B 修复核销（迭代 3-fix，2026-08-17，测试驱动）
+### R7-A/B 修复核销（迭代 3-fix，2026-08-16，测试驱动）
 
 **结论：R7-A 核销；R7-B 核销（部分修复面：join 路径 + 已完成分支合并路径闭合，
 耗尽路径残余登记）**。修复实现：

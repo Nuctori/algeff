@@ -50,7 +50,7 @@ fn nested_seq(depth: u64) -> Action {
     }
     Action::Sequential {
         current: Box::new(nested_seq(depth - 1)),
-        next: Box::new(|v| Action::Pure(v)),
+        next: Box::new(Action::Pure),
     }
 }
 

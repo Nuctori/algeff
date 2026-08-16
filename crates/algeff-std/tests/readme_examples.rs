@@ -115,7 +115,7 @@ fn readme_file_io_cps_legacy() {
                         op: DataOp::Read { fd, len: 64 },
                         resources: vec![read_fd(fd)],
                         // 最后一个操作把结果透传出去（next 收到 Read 的 Bytes）
-                        next: Box::new(|v| Action::Pure(v)),
+                        next: Box::new(Action::Pure),
                     }),
                 }),
             }

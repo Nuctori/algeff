@@ -78,7 +78,7 @@ fn alloc_zero_len_empty_bytes_and_chain() {
     let v = rt
         .run_blocking(Action::Alloc {
             len: 0,
-            next: Box::new(|b| Action::Pure(b)),
+            next: Box::new(Action::Pure),
         })
         .unwrap();
     assert_eq!(v, Value::Bytes(vec![]), "Alloc(0) 应返回空 Bytes");
@@ -91,7 +91,7 @@ fn alloc_zero_len_empty_bytes_and_chain() {
                 assert_eq!(b, Value::Bytes(vec![]), "next 收到空 Bytes");
                 Action::Alloc {
                     len: 4,
-                    next: Box::new(|b2| Action::Pure(b2)),
+                    next: Box::new(Action::Pure),
                 }
             }),
         })
@@ -175,11 +175,11 @@ fn alloc_in_parallel_fork_values_flow() {
         .run_blocking(Action::Fork {
             left: Box::new(Action::Alloc {
                 len: 512 * 1024,
-                next: Box::new(|b| Action::Pure(b)),
+                next: Box::new(Action::Pure),
             }),
             right: Box::new(Action::Alloc {
                 len: 0,
-                next: Box::new(|b| Action::Pure(b)),
+                next: Box::new(Action::Pure),
             }),
             combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
         })

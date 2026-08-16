@@ -1846,7 +1846,7 @@ fn alloc_huge_len_returns_invalid_input() {
     // 边界内正常分配不受影响
     let v = rt.run_blocking(Action::Alloc {
         len: 16,
-        next: Box::new(|v| Action::Pure(v)),
+        next: Box::new(Action::Pure),
     });
     assert_eq!(v, Ok(Value::Bytes(vec![0u8; 16])));
 }

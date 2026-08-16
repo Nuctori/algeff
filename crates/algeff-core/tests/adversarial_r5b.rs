@@ -135,7 +135,7 @@ fn invoke_captures_reach_executor_exactly_and_deterministic_true() {
             captures: captures.clone(),
             yields: vec![],
             deterministic: true,
-            next: Box::new(|v| Action::Pure(v)),
+            next: Box::new(Action::Pure),
         })
         .unwrap();
     assert_eq!(

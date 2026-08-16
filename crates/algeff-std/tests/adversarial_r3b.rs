@@ -26,7 +26,6 @@
 //! 驱动方式：全部普通 `#[test]`（非 `#[tokio::test]`）——D9 要求
 //! `Runtime::new` 与 `run_blocking` 在 tokio 上下文之外调用。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -409,14 +408,9 @@ fn ub_fork_conflict_blindspot_hidden_closure_lock() {
         "并行竞争 → WouldBlock（若静态可见冲突→顺序路径则两分支依次成功→Ok）"
     );
 
-    // 并行证据：两分支的 op 记录来自 ≥2 个不同线程（真并行路径被走通）
-    let entries = log.lock().unwrap().clone();
-    let threads: HashSet<std::thread::ThreadId> = entries.iter().map(|(_, t)| *t).collect();
-    assert!(
-        threads.len() >= 2,
-        "分支 op 来自 ≥2 个不同线程（spawn_blocking 真并行），实测 {} 个线程",
-        threads.len()
-    );
+    // 并行证据（调度无关）：WouldBlock 结果本身即并发竞争证据——顺序路径
+    // 下两分支依次成功 → Ok 而非 Err（共享 reactor 不保证不同 worker，线程
+    // 断言已废弃，迭代 3-A1）；配合上方 WouldBlock 断言构成语义级证据。
 
     // 安全失败 + 未毒化：胜者锁 undo 合并；Replace 后同 id 可重入
     assert_eq!(rt.undo_stack().len(), 1, "胜者锁 undo 合并回父");
@@ -505,7 +499,6 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
             "第 {round} 轮：静态层判定无冲突（隐藏闭包内 Write 资源不可见）"
         );
 
-        let before = log.lock().unwrap().len();
         rt.run_blocking(Action::Fork {
             left: Box::new(branch(fd, b'L')),
             right: Box::new(branch(fd, b'R')),
@@ -521,13 +514,9 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
             b"LR" => lr += 1,
             _ => rl += 1,
         }
-        // 并行证据：本轮分支 op（2×GetTime + 2×Write）来自 ≥2 个不同线程
-        let new_entries = &log.lock().unwrap()[before..];
-        let threads: HashSet<std::thread::ThreadId> = new_entries.iter().map(|(_, t)| *t).collect();
-        assert!(
-            threads.len() >= 2,
-            "第 {round} 轮分支 op 来自不同线程（真并行，非静态串行化）"
-        );
+        // 并行证据（调度无关）：循环后断言两写序均出现——顺序路径恒 LR
+        // （左先右后），仅真并行竞争（50ms 窗口重叠）可出现 RL 序；共享
+        // reactor 不保证不同 worker，线程断言已废弃（迭代 3-A1）。
 
         // A4 线性在并行路径上仍经 merge 并入父：父级同 fd Write 被拦截
         // （盲区不破坏线性保证）
@@ -547,5 +536,9 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
             "第 {round} 轮：并行 Fork 后父级同资源 Write 应被 A4 拦截"
         );
     }
+    assert!(
+        lr > 0 && rl > 0,
+        "8 轮写竞争须出现两种序（LR×{lr} RL×{rl}）——仅真并行可产生 RL"
+    );
     eprintln!("r3b blind-write race distribution: LR×{lr} RL×{rl}");
 }

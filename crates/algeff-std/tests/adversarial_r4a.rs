@@ -399,7 +399,7 @@ fn nested_scope(depth: usize, inner: Action) -> Action {
         Action::Scope {
             base: PathBuf::from(format!("lvl{d}")),
             inner: Box::new(if d == 1 { inner } else { rec(d - 1, inner) }),
-            next: Box::new(|v| Action::Pure(v)),
+            next: Box::new(Action::Pure),
         }
     }
     rec(depth, inner)
@@ -510,7 +510,7 @@ fn scope_inner_replace_outer_exit_restores_cwd_and_continues() {
                 }
             }),
         }),
-        next: Box::new(|v| Action::Pure(v)),
+        next: Box::new(Action::Pure),
     };
     let v = rt.run_blocking(bp).unwrap();
     let pb_fd = match v {

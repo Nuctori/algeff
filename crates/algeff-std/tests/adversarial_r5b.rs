@@ -383,7 +383,7 @@ fn fork_parallel_two_scopes_distinct_bases_3_rounds_isolated() {
                         )
                     },
                 )),
-                next: Box::new(|v| Action::Pure(v)),
+                next: Box::new(Action::Pure),
             }),
             right: Box::new(Action::Scope {
                 base: PathBuf::from("branch-R"),
@@ -405,7 +405,7 @@ fn fork_parallel_two_scopes_distinct_bases_3_rounds_isolated() {
                         )
                     },
                 )),
-                next: Box::new(|v| Action::Pure(v)),
+                next: Box::new(Action::Pure),
             }),
             combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
         };
@@ -476,7 +476,7 @@ fn fork_nested_parallel_scopes_under_active_outer_scope_twice() {
     let scope_time = |base: &'static str| Action::Scope {
         base: PathBuf::from(base),
         inner: Box::new(syscall(DataOp::GetTime, vec![], Action::Pure)),
-        next: Box::new(|v| Action::Pure(v)),
+        next: Box::new(Action::Pure),
     };
 
     for round in 0..2u64 {
@@ -492,7 +492,7 @@ fn fork_nested_parallel_scopes_under_active_outer_scope_twice() {
                     right: Box::new(scope_time("R1")),
                     combine: Box::new(|a, b| Action::Pure(Value::List(vec![a, b]))),
                 }),
-                next: Box::new(|v| Action::Pure(v)),
+                next: Box::new(Action::Pure),
             })
             .unwrap();
         // 值结构：List([List([t, t]), t]) —— 三个 GetTime 值全到达。
@@ -553,7 +553,7 @@ fn fork_sequential_conflict_two_scopes_cwd_not_leaked() {
                     vec![wr(fd)],
                     move |_| Action::Pure(Value::Unit),
                 )),
-                next: Box::new(|v| Action::Pure(v)),
+                next: Box::new(Action::Pure),
             }),
             right: Box::new(Action::Scope {
                 base: PathBuf::from("seq-R"),
@@ -565,7 +565,7 @@ fn fork_sequential_conflict_two_scopes_cwd_not_leaked() {
                     vec![wr(fd)],
                     move |_| Action::Pure(Value::Unit),
                 )),
-                next: Box::new(|v| Action::Pure(v)),
+                next: Box::new(Action::Pure),
             }),
             combine: Box::new(|_, _| Action::Pure(Value::Unit)),
         })
