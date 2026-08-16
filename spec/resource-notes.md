@@ -780,6 +780,34 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
 on_timeout 仍处取消域内（首个 action 即 CANCELLED_ERR）——保留取消域抑制语义（快速中止
 保证），可诊断性由 R3-F 负责。
 
+## 13. 性能分解审计（生产就绪收敛轮，2026-08-16）——实测画像与修复
+
+### 修复：Sleep(0) Windows 定时器 tick 缺陷（150× 加速）
+
+`Action::Sleep { duration: ZERO }` 在 Windows 下实测吃满定时器 tick（15.6ms/次：
+顺序 10×Sleep(0) = 158ms；并行分支各摊 1 tick）——语义本应立即完成。修复：Sleep 臂
+`duration.is_zero()` 短路直接执行 next（零时长无取消/虚拟时钟效果）。TDD 回归：
+`time_sleep_zero_immediate`（r2，断言从 <1s 收紧至 <5ms 量级）。**影响面**：所有用
+Sleep(0) 做「让出/并发窗口」的蓝图（bench/测试构造）在 Windows 上快 150 倍。
+
+### 实测画像（分解 bench，临时文件已清理）
+
+| 变体 | 耗时 | 结论 |
+|---|---|---|
+| 顺序 10×Read（1MB，页缓存） | 0.41ms | 解释器 + IO 路径极快（~40µs/读） |
+| 顺序全链（Open×10+Read×10+Close×10） | 9.26ms | **Open/Close 是主导成本**（~0.44ms/次） |
+| Fork 10 读全链（官方 bench 口径） | 5.4ms | 并行 IO 省时，快于顺序全链 |
+| 单次 Fork（2 叶 Pure） | ~0.08ms | **Fork 机制开销小**（spawn+快照+join+合并） |
+
+**结论修正**：parallel_reads 264%/shared_read 380% 的主因不是 Fork 机制（~0.08ms/次）
+也不是解释器帧（顺序读 ~40µs/读），而是 **Open/Close 的执行器物理路径**（Windows
+tokio fs open/close + registry/映射表操作，~0.44ms/次 vs 原生 tokio::fs::read 全链
+0.285ms/次）。shared_read 的额外成本 = 共享游标读串行（D6 语义，正解=位置读原语
+ReadAt，契约变更）。**优化方向登记**（阶段 3+）：a) Open/Close 执行器层 profile 与
+微优化（预期 ~1-2ms/10 文件）；b) ReadAt 原语（shared ~100% 目标）；c) 官方 bench
+口径统一（原生臂与 algeff 臂同含 Open/Close 后再对比，当前对比略偏向 algeff 仍
+慢——诚实口径下 parallel 实际优于 264%）。
+
 ### 性能节更新（迭代 3，2026-08-16）
 
 A1 性能二轮（ExecAccess::Shared{executor, reactor} 共享 reactor）：分支驱动由
