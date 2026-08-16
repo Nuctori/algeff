@@ -734,13 +734,14 @@ async fn spawn_wait_exit_code() {
     assert_eq!(v, Value::U64(3));
 }
 
-// ── i. blocker-3：Dup 共享后 IO 错误路径不得丢句柄 ────────────────────
-// 修复前：take 后 Arc::get_mut 失败（Dup 共享 → InvalidInput）直接 ? 返回，
-// registry 条目被删、内部映射悬空、Arc 被 drop，fd 永久损坏；修复后错误路径
-// 恢复注册表条目与内部映射，关闭 dup 释放共享后原 fd 仍可用。
+// ── i. blocker-3/RFC-07：Dup 共享管道半端后 IO 成功、关闭 dup 后原 fd 恢复 ──
+// 修复前（RFC-07）：管道半端经 Arc::get_mut 独占（take/put_back 轮换），Dup 共享
+// → 共享下 get_mut 失败 → InvalidInput；修复后（文件式 Arc<Mutex> 双表）Dup/Fork
+// 共享下 lock 可用 → 读/写成功；关闭 dup 释放共享后原 fd 仍可寻址（不丢句柄，
+// blocker-3 语义保持）。
 
 #[tokio::test]
-async fn pipe_dup_read_invalid_then_recover() {
+async fn pipe_dup_read_shared_then_recover() {
     let mut ex = TokioExecutor::new();
     let mut reg = ResourceRegistry::new();
 
@@ -767,64 +768,21 @@ async fn pipe_dup_read_invalid_then_recover() {
     .await
     .unwrap();
 
-    // Dup 共享 Arc → 读端无法 &mut → InvalidInput。
+    // RFC-07 修复：Dup 共享 Arc<Mutex<ReadHalf>> → 读端 lock 仍可用 → 读成功
+    //（修复前共享下 Arc::get_mut 失败 → InvalidInput）。
     let v = ex
         .execute(&DataOp::Dup { fd: rfd }, &mut reg)
         .await
         .unwrap();
     let dup = fd_of(&v.0);
-    let err = exec_err(&mut ex, &mut reg, &DataOp::Read { fd: rfd, len: 4 }).await;
-    assert_eq!(err, SysError::InvalidInput, "Dup 共享后读应 InvalidInput");
-
-    // 关闭 dup 释放共享 → 原 fd 必须仍可读（错误路径已恢复注册表条目与内部映射，
-    // 修复前此处 pipe_reader_fds 悬空 → NotFound 且管道被整体关闭）。
-    ex.execute(&DataOp::Close { fd: dup }, &mut reg)
-        .await
-        .unwrap();
     let (v, _) = ex
         .execute(&DataOp::Read { fd: rfd, len: 4 }, &mut reg)
         .await
         .unwrap();
-    assert_eq!(v, Value::Bytes(b"ping".to_vec()));
-}
+    assert_eq!(v, Value::Bytes(b"ping".to_vec()), "Dup 共享后读应成功");
 
-#[tokio::test]
-async fn pipe_dup_write_invalid_then_recover() {
-    let mut ex = TokioExecutor::new();
-    let mut reg = ResourceRegistry::new();
-
-    let (v, _) = ex
-        .execute(
-            &DataOp::PipeOpen {
-                flags: PipeFlags::default(),
-            },
-            &mut reg,
-        )
-        .await
-        .unwrap();
-    let (rfd, wfd) = match v {
-        Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),
-        other => panic!("期望 List，得到 {other:?}"),
-    };
-
-    // Dup 共享 Arc → 写端无法 &mut → InvalidInput。
-    let v = ex
-        .execute(&DataOp::Dup { fd: wfd }, &mut reg)
-        .await
-        .unwrap();
-    let dup = fd_of(&v.0);
-    let err = exec_err(
-        &mut ex,
-        &mut reg,
-        &DataOp::Write {
-            fd: wfd,
-            data: b"pong".to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(err, SysError::InvalidInput, "Dup 共享后写应 InvalidInput");
-
-    // 关闭 dup → 原写端恢复可用，数据可达读端。
+    // 关闭 dup 释放共享 → 原 fd 必须仍可读（关闭不丢句柄；修复前共享下
+    // 取/放轮换映射错乱 → NotFound 且管道被整体关闭）。
     ex.execute(&DataOp::Close { fd: dup }, &mut reg)
         .await
         .unwrap();
@@ -842,6 +800,62 @@ async fn pipe_dup_write_invalid_then_recover() {
         .await
         .unwrap();
     assert_eq!(v, Value::Bytes(b"pong".to_vec()));
+}
+
+#[tokio::test]
+async fn pipe_dup_write_shared_then_recover() {
+    let mut ex = TokioExecutor::new();
+    let mut reg = ResourceRegistry::new();
+
+    let (v, _) = ex
+        .execute(
+            &DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            &mut reg,
+        )
+        .await
+        .unwrap();
+    let (rfd, wfd) = match v {
+        Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),
+        other => panic!("期望 List，得到 {other:?}"),
+    };
+
+    // RFC-07 修复：Dup 共享 Arc<Mutex<WriteHalf>> → 写端 lock 仍可用 → 写成功
+    //（修复前共享下 Arc::get_mut 失败 → InvalidInput）。
+    let v = ex
+        .execute(&DataOp::Dup { fd: wfd }, &mut reg)
+        .await
+        .unwrap();
+    let dup = fd_of(&v.0);
+    ex.execute(
+        &DataOp::Write {
+            fd: wfd,
+            data: b"ping".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
+
+    // 关闭 dup → 原写端恢复可用，数据可达读端（关闭不回归）。
+    ex.execute(&DataOp::Close { fd: dup }, &mut reg)
+        .await
+        .unwrap();
+    ex.execute(
+        &DataOp::Write {
+            fd: wfd,
+            data: b"pong".to_vec(),
+        },
+        &mut reg,
+    )
+    .await
+    .unwrap();
+    let (v, _) = ex
+        .execute(&DataOp::Read { fd: rfd, len: 8 }, &mut reg)
+        .await
+        .unwrap();
+    assert_eq!(v, Value::Bytes(b"pingpong".to_vec()));
 }
 
 #[tokio::test]

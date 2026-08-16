@@ -12,6 +12,11 @@
 //!   取消窗口（await）前套 RAII 守卫，取消/错误路径 Drop 自动 put_back（轮换
 //!   语义不变）。§2 翻转：取消后句柄可寻址/可继续（写后读回 + Close 正常）；
 //!   写端变体（adversarial_r7.rs §4）同步翻转。
+//!   **迭代 3-A2（RFC-07 真修复）后：管道已改文件式双表**（registry 句柄与
+//!   executor 工作表存同一 `Arc<Mutex<半端>>`，lock 下 IO、管道不轮换）——
+//!   take→await→put_back 窗口对管道**已不存在**，取消丢弃 future 时 MutexGuard
+//!   自动释放、注册表/工作表条目原样保留；§2 测试持续验证取消不丢句柄（双表
+//!   路径下 `lookup(rfd)` 恒为 Some，可寻址性由写后读回 + Close 证明不变）。
 //! - **R7-B [Timeout{Fork{MutexLock}} 孤儿分支占坑永久泄漏]**：`run_fork_parallel`
 //!   只在**两分支均完成后**才合并 registry/undo 回父；宽限耗尽丢弃 inner 时，
 //!   已完成分支（已持锁）的释放 undo 随被丢弃的局部状态一并消失 → arbiter 占坑
@@ -146,17 +151,18 @@ fn udp_bind(rt: &mut Runtime) -> u64 {
 // ══════════════════════════════════════════════════════════════════════
 
 /// R7-A 读端变体（写端变体 = adversarial_r7.rs §4 F-R7-2，同修复）：
-/// 无数据管道 → 读端 `Read` 阻塞于 `take_pipe_reader → rh.read().await`
+/// 无数据管道 → 读端 `Read` 阻塞于 `m.lock().await → rh.read().await`
 /// 窗口 → Timeout(30ms) 触发 → 取消广播不打断 executor 内 await → 宽限
-/// （CANCEL_JOIN_GRACE=500ms）耗尽 → inner future 被丢弃。**R7-A 修复
-/// （迭代 3-fix）翻转**：已取句柄由 RAII 守卫（`TakeHandleGuard`）在取消
-/// 路径自动归还——取消后句柄可寻址/可继续（写后读回数据 + Close 正常）；
-/// 修复前行为（缺陷锁定）：注册表条目丢失、`pipe_reader_fds` 映射残留陈旧
-/// 项 → 同 fd Read / Close 均 NotFound。
+/// （CANCEL_JOIN_GRACE=500ms）耗尽 → inner future 被丢弃。
+/// **RFC-07（迭代 3-A2）后语义**：管道走文件式双表（Arc<Mutex<ReadHalf>>），
+/// 无 take→put_back 窗口——取消丢弃 future 时 MutexGuard 自动释放、注册表
+/// 与工作表条目原样保留 → 取消后句柄可寻址/可继续（写后读回数据 + Close 正常）。
+/// 修复前（缺陷锁定）：take 后注册表条目丢失、`pipe_reader_fds` 映射残留陈旧
+/// 项 → 同 fd Read / Close 均 NotFound；R7-A 修复轮经 RAII 守卫（TakeHandleGuard）
+/// 已闭环，本测试翻转后持续验证双表路径下取消不丢句柄。
 /// - undo 栈干净（阻塞读未入栈）、线性标记无残留（Read 不消费标记）不变；
-/// - 注：轮换语义下注册表键是每次 put_back 新分配的 fd（逻辑 fd rfd 经执行
-///   器 `pipe_reader_fds` 映射寻址），故 `lookup(rfd) == None` 属正常（见
-///   §3 正向测试注释）；可寻址性由「写后读回 + Close 正常」证明。
+/// - 注：双表路径下逻辑 fd 恒等注册表 fd，`lookup(rfd)` 为 Some 属正常；
+///   可寻址性由「写后读回 + Close 正常」证明。
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn r7a_timeout_cancels_inflight_pipe_read_restores_handle() {
@@ -244,10 +250,10 @@ fn r7a_timeout_cancels_inflight_pipe_read_restores_handle() {
 // §3 R7-A 正向回归：轮换机制无取消时正常工作（重复读同变体 + Close）
 // ══════════════════════════════════════════════════════════════════════
 
-/// 无取消时轮换机制必须完整：同逻辑 fd 重复读（每次 take→put_back 分配新
-/// 注册表 fd）不丢数据、不串流；Close 两端正常释放（无泄漏）。本测试为
-/// R7-A 修复后「句柄可寻址」基准的对照面——若修复引入回归（如 put_back
-/// 丢失数据/游标错位），此处先红。
+/// 无取消时管道全链路必须完整：同逻辑 fd 重复读（双表 lock，读端游标顺序
+/// 消费）不丢数据、不串流；Close 两端正常释放（无泄漏）。本测试为
+/// RFC-07 修复后「句柄可寻址」基准的对照面——若修复引入回归（如游标错位/
+/// 条目丢失），此处先红。
 #[test]
 fn r7a_pipe_rotation_repeated_reads_close_normal() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
@@ -270,19 +276,18 @@ fn r7a_pipe_rotation_repeated_reads_close_normal() {
     assert_eq!(
         read3(&mut rt),
         b"aaa",
-        "第一次轮换读（take→put_back→新 fd）"
+        "第一次双表读（lock 顺序消费）"
     );
     assert_eq!(
         read3(&mut rt),
         b"bbb",
-        "第二次轮换读（同逻辑 fd 重复读不串流）"
+        "第二次双表读（同逻辑 fd 重复读不串流）"
     );
-    // 注：轮换后注册表键是每次 put_back 新分配的 fd，逻辑 fd rfd 经
-    // 执行器 pipe_reader_fds 映射寻址——「可寻址」由上面第二次 Read 成功证明
-    // （若映射陈旧/句柄泄漏，第二次读会 NotFound，见 §2 缺陷锁定）。
+    // 注：双表路径下逻辑 fd 恒等注册表 fd（不轮换），可寻址性由上面第二次
+    // Read 成功证明（若条目丢失/映射错乱，第二次读会 NotFound，见 §2 缺陷锁定）。
 
-    // Close 两端：轮换后 Close 必须正常（映射一致 → Ok；若轮换泄漏映射残留
-    // 陈旧项，此处将 NotFound，见 §2）且无 undo（关闭不可逆）。
+    // Close 两端：双表下 Close 必须正常（条目一致 → Ok；若条目残留/丢失，
+    // 此处将 NotFound，见 §2）且无 undo（关闭不可逆）。
     rt.run_blocking(syscall(
         DataOp::Close { fd: rfd },
         vec![ow(rfd)],

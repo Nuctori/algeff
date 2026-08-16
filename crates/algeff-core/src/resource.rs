@@ -198,14 +198,20 @@ impl<M: ModeMarker> TypedResource<M> {
 // ── 物理句柄与资源注册表 ──────────────────────────────────────────────
 
 /// 注册表持有的物理资源。所有变体 Arc 共享，便于 Dup/Fork COW。
+/// 管道半端（RFC-07 修复）：变体为 `Arc<tokio::sync::Mutex<半端>>` —— 文件式
+/// 双表（executor 内部管道工作表 + 本注册表句柄）存**同一** Arc，Dup/Fork
+/// （D13 registry Clone）共享下 executor 经 lock 做 IO，不再依赖
+/// `Arc::get_mut` 独占（修复前共享必然 `get_mut` 失败 → 分支内管道 IO
+/// InvalidInput）。duplex 半端不可 try_clone，故注册表 token 即工作对象
+/// （与 `Mutex` 变体同模式：Arc 既是簿记也是工作载体）。
 #[derive(Debug, Clone)]
 pub enum ResourceHandle {
     File(Arc<tokio::fs::File>),
     TcpListener(Arc<tokio::net::TcpListener>),
     TcpStream(Arc<tokio::net::TcpStream>),
     UdpSocket(Arc<tokio::net::UdpSocket>),
-    PipeReader(Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>),
-    PipeWriter(Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>),
+    PipeReader(Arc<tokio::sync::Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>>),
+    PipeWriter(Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>),
     Mutex(Arc<tokio::sync::Mutex<()>>),
     Child(Arc<tokio::process::Child>),
 }
