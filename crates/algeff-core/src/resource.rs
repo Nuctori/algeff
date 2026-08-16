@@ -774,7 +774,10 @@ mod tests {
         reg.offset_next_fd(2 << 48);
         // 分配不落回旧区间（修复前陈旧基线可能使新分配与 Replace 前句柄区间重叠）
         let nfd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
-        assert!(nfd >= (1 << 48), "clear 后新锚定从当前 next_fd 起（nfd={nfd}）");
+        assert!(
+            nfd >= (1 << 48),
+            "clear 后新锚定从当前 next_fd 起（nfd={nfd}）"
+        );
     }
 
     #[test]

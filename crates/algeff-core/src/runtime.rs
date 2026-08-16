@@ -1616,7 +1616,10 @@ mod tests {
     use crate::resource::{AccessMode, Resource};
 
     fn usage(r: Resource, m: AccessMode) -> crate::resource::ResourceUsage {
-        crate::resource::ResourceUsage { resource: r, mode: m }
+        crate::resource::ResourceUsage {
+            resource: r,
+            mode: m,
+        }
     }
 
     /// R3-B 单元级防护（终审 Note-3）：直接构造**已广播**的外层取消接收端，
