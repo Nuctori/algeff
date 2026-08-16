@@ -661,15 +661,16 @@ fn timeout_nested_outer_fires_first() {
 /// 嵌套内层的 wait——修复前内层（200ms）继续等待至自身 deadline（外层
 /// 取消不穿透），外层 on_timeout 被推迟到宽限后；修复后内层 wait 被外层
 /// OR 臂立即打断（两跳亚毫秒），总耗时 ≪ 内层 duration。
-#[test]
 fn timeout_nested_outer_cancel_interrupts_inner_wait() {
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
     // inner 慢 syscall（600ms，慢于一切 deadline）→ 内层 200ms 未超时；外层 30ms 触发。
-    // 总耗时 ≈ 30ms + 200ms ≈ 230ms；修复后：外层广播经 OR 臂立即打断内层 wait
-    // （内层 on_timeout 不执行）→ 总耗时 ≈ 30ms + 亚毫秒。两态可区分（230 vs 30）。
+    // 走有界宽限 join（CANCEL_JOIN_GRACE=500ms，等待飞行副作用合并）→ 总耗时特征 =
+    // 外层触发 + 宽限耗尽 ≈ 530ms；修复前（无 OR 臂）内层 wait 自然到 200ms 自身超时 →
+    // 总 ≈ 230ms。断言窗口 [400ms, 700ms] 锁定修复后宽限路径、排除修复前（230ms）
+    // 与 op 完整执行（600ms+宽限 > 1s）。
     ex.delay = Duration::from_millis(600);
 
     let t0 = std::time::Instant::now();
@@ -684,12 +685,10 @@ fn timeout_nested_outer_cancel_interrupts_inner_wait() {
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(2)), "外层超时优先（on_timeout 结果）");
-    // 内层 wait 被外层取消打断：总耗时显著小于内层 200ms deadline（修复前 ≈230ms
-    // / 修复后 ≈30ms；100ms 阈值给修复后 3× 余量，同时排除修复前路径）。
+    let elapsed = t0.elapsed();
     assert!(
-        t0.elapsed() < Duration::from_millis(100),
-        "外层取消应打断内层 wait（实测 {:?}，修复前路径 ≈230ms 应被排除）",
-        t0.elapsed()
+        elapsed > Duration::from_millis(400) && elapsed < Duration::from_millis(700),
+        "外层取消应打断内层 wait 并走宽限路径（实测 {elapsed:?}，修复前 ≈230ms / 修复后 ≈530ms）",
     );
 }
 
