@@ -1455,27 +1455,36 @@ async fn interpret_impl(
             }
 
             Action::Sleep { duration, next } => {
-                #[cfg(feature = "virtual-clock")]
-                {
-                    if let Some(vc) = ctx.virtual_clock_mut() {
-                        vc.advance(duration);
-                    } else {
-                        tokio::time::sleep(duration).await;
+                // 性能/语义修复（分解实测）：`Sleep(0)` 短路立即完成——Windows
+                // 定时器 tick（15.6ms）下 `tokio::time::sleep(ZERO)` 实测吃满
+                // 一个 tick（bench 分解：顺序 10×Sleep(0) = 158ms），语义应为
+                // 立即完成。零时长不触发取消/虚拟时钟推进（无效果）。
+                if duration.is_zero() {
+                    let na = next(Value::Unit);
+                    (Value::Unit, na)
+                } else {
+                    #[cfg(feature = "virtual-clock")]
+                    {
+                        if let Some(vc) = ctx.virtual_clock_mut() {
+                            vc.advance(duration);
+                        } else {
+                            tokio::time::sleep(duration).await;
+                        }
                     }
-                }
-                #[cfg(not(feature = "virtual-clock"))]
-                {
-                    if let Some(tok) = cancel.as_deref_mut() {
-                        // 取消传播协议：Sleep 可被取消打断（结构化并发近似）。
-                        // select! 轮询栈已隔离到 `cancellable_sleep` 独立
-                        // coroutine（保护 RFC-11 深度守卫栈预算，见该函数注释）。
-                        cancellable_sleep(duration, tok).await;
-                    } else {
-                        tokio::time::sleep(duration).await;
+                    #[cfg(not(feature = "virtual-clock"))]
+                    {
+                        if let Some(tok) = cancel.as_deref_mut() {
+                            // 取消传播协议：Sleep 可被取消打断（结构化并发近似）。
+                            // select! 轮询栈已隔离到 `cancellable_sleep` 独立
+                            // coroutine（保护 RFC-11 深度守卫栈预算，见该函数注释）。
+                            cancellable_sleep(duration, tok).await;
+                        } else {
+                            tokio::time::sleep(duration).await;
+                        }
                     }
+                    let na = next(Value::Unit);
+                    (Value::Unit, na)
                 }
-                let na = next(Value::Unit);
-                (Value::Unit, na)
             }
 
             Action::WatchSignal { signal, next } => {
