@@ -420,9 +420,9 @@ fn main() {
 | 4   | 契约冻结    | D1–D19 决策表 = 正确性承诺边界                                                                                  | `contracts.md`                 |
 | 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 64（D-052 初版 96 → 迭代 1 取消传播帧膨胀复测裁决 64） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
-| 7   | 验证分层    | 410 个测试函数（约 399 二进制 + 11 doc-test），48 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
-| 8   | 对抗审计 ×6+R7 | 182 个 E2E 测试（R1-R6=167 + R7=15，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
-| 9   | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决）                                                    | `spec/proof-obligations.md`    |
+| 7   | 验证分层    | 418 个测试函数（约 405 二进制 + 13 doc-test），50 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
+| 8   | 对抗审计 ×6+R7 | 186 个 E2E 测试（R1-R6=167 + R7=15 + R7AB=4，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
+| 9   | 数学审计 ×8 | P1/P2/P3/P5「有效（附声明前提）」，P4「有效（附范围声明）」——R7-A 已核销（TakeHandleGuard）、R7-B 部分核销（ForkJoinMerge，耗尽路径残余登记）；P3 物理层 make_mut 阶段 3 登记                                                    | `spec/proof-obligations.md`    |
 | 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
 | 11  | 性能推导    | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制                                                               | `perf/baseline-2026-08-15.txt` |
 | 12  | 结论      | 语义正确性定案；并行性能/跨平台为已知开放面                                                                                | 本文档下方                          |
@@ -451,9 +451,9 @@ fn main() {
 | 并行吞吐 | executor 共享锁串行化所有物理 IO | 阶段 3+ R-6 重构 |
 | 深度上限 | 左结合链 ≥65 步报 `Other(105)`（右结合无限制） | 已修复（RFC-11），见上 |
 | Windows 错误码 | 已归一化到 POSIX 语义（EEXIST/EADDRINUSE/…） | 已修复（RFC-10） |
-| Replace 句柄活性 | Replace 后旧 fd 的残留句柄仍可写（边界反例） | RFC-05，阶段 3+ 已裁决 |
+| Replace 句柄活性 | Replace 后旧 fd 的残留句柄仍可写——已闭环（R7 翻转测试断言 NotFound，义务表 A4 RFC-05 闭合） | RFC-05 已闭合 |
 | fd 区间溢出 | Fork 右分支极端分配 ~360 轮后可能溢出 u64 | RFC-06，阶段 3+ |
-| Timeout 孤儿副作用 | 超时取消的并行分支副作用：墙钟路径已修（取消广播+回滚，668b7ed）；残余=宽限耗尽孤儿（R7-A/B）、嵌套 Timeout 不复合取消、VC 墙钟通道无广播 | RFC-08/09，墙钟已修，残余阶段 3+ |
+| Timeout 孤儿副作用 | 超时取消的并行分支副作用：墙钟路径已修（取消广播+回滚，668b7ed）；残余=R7-B 耗尽路径（分支自身已持锁 + 阻塞 IO）、嵌套 Timeout 不复合取消、VC 墙钟通道无广播（R7-A 已核销） | RFC-08/09 墙钟已修；R7-A/B 迭代 3 核销 |
 | 管道半端 | 未 Dup 的管道在 Fork 分支内 IO 被拒绝（Arc 共享与 `Arc::get_mut` 冲突） | RFC-07，阶段 3+ |
 | 闭包静态盲区 | `next` 闭包内构造的 `Syscall` 对静态冲突检测不可见（运行时仅收集 `current` 的资源声明；执行时仍会真实执行并并入父撤销栈） | 系统性声明前提，已文档化 |
 | 1MB 主线程栈 | 深嵌套蓝图需抬栈（`/STACK` 或 spawn 线程） | 用户责任，已文档化 |

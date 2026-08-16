@@ -247,10 +247,10 @@ impl Runtime {
     /// - `Catch`：仅处理错误值，不触碰撤销栈（recover 语义在 Replace/recover 路径）；
     /// - `WatchSignal`/`Invoke`：委托执行器，默认 ENOSYS（`Other(38)`）原样透传。
     ///
-    /// 注意：`interpret` 的递归 future 经非 Send 的 `LocalBoxFuture` 包装，
-    /// 直接 `.await` 时需在非 Send 要求上下文中进行
-    /// （如 `run_blocking`）；Fork 并行子任务在 `spawn_blocking` 线程内以
-    /// current-thread runtime 驱动（`drive`，同 `tests/concurrency_stress.rs`）。
+    /// 注意：`interpret` 的递归 future 已 Send 化（迭代 3-A1，见下方
+    /// `LocalBoxFuture` 别名注）；Fork 并行分支经 `Handle::spawn` 调度到
+    /// Runtime 自持的多线程 reactor（替代旧 `spawn_blocking` + current-thread
+    /// runtime 构建）。
     pub async fn run(&mut self, action: Action) -> Result<Value, SysError> {
         interpret_impl(
             action,
