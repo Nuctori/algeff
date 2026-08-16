@@ -1,8 +1,8 @@
 //! 临时性能剖析（不入库）：分解 Algeff Fork 链成本。
 //! 用法：cargo run --release -p algeff-std --example prof_fork
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::future::Future;
 
 use algeff_core::action::OpenFlags;
 use algeff_core::prelude::*;
@@ -275,9 +275,7 @@ fn drive_probe<F: Future>(f: F) -> F::Output {
 fn runtime_ref() -> &'static tokio::runtime::Runtime {
     // 复用 Runtime::new 内部 reactor：模拟 run_blocking 的 spawn_blocking 调用点。
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Runtime::new().expect("multi-thread runtime")
-    })
+    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("multi-thread runtime"))
 }
 
 /// 顺序读 10 文件链：预开全部 → 顺序 Read(1MB)+Close → Pure(U64)。

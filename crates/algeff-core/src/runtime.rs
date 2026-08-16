@@ -878,7 +878,12 @@ async fn branch_snapshot_access(
 
 /// Fork 并行分支产物：(分支结果, 隔离 registry, 独立撤销栈, 隔离 ctx)。
 /// 由 `run_fork_parallel` 的 spawn_blocking 任务带回，供完成后合并回父。
-type BranchOutcome = (Result<Value, SysError>, ResourceRegistry, UndoStack, Context);
+type BranchOutcome = (
+    Result<Value, SysError>,
+    ResourceRegistry,
+    UndoStack,
+    Context,
+);
 
 /// Fork 并行分支 join 合并守卫（R7-B 修复，A3 核销）。
 ///
@@ -972,7 +977,10 @@ impl<'a> ForkJoinMerge<'a> {
                 }
             }
         }
-        (l_res.expect("left 分支已完成"), r_res.expect("right 分支已完成"))
+        (
+            l_res.expect("left 分支已完成"),
+            r_res.expect("right 分支已完成"),
+        )
     }
 
     /// 合并左分支（完成即合并；顺序 [left, right]）。
@@ -996,7 +1004,10 @@ impl<'a> ForkJoinMerge<'a> {
     #[cfg(feature = "virtual-clock")]
     fn merge_clock(&mut self, branch: &mut Context) {
         let base = self.clock_base;
-        let now = branch.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(base);
+        let now = branch
+            .virtual_clock_mut()
+            .map(|vc| vc.now())
+            .unwrap_or(base);
         if let Some(vc) = self.ctx.virtual_clock_mut() {
             vc.advance(now.saturating_sub(base));
         }
@@ -1084,74 +1095,74 @@ fn run_fork_parallel<'a>(
     cancel: Option<&'a mut CancelToken>,
 ) -> LocalBoxFuture<'a, Result<(Value, Value), SysError>> {
     Box::pin(async move {
-    // 子任务隔离副本（D13）与独立撤销栈。
-    let mut l_ctx = ctx.clone();
-    let mut r_ctx = ctx.clone();
-    let mut l_reg = reg.clone();
-    let mut r_reg = reg.clone();
-    // F1 修复：spawn 前取全局唯一 fd 区间 —— 右分支偏移 `k<<48`（k 全局唯一，
-    // 见 `FORK_FD_REGION_SEQ` 注释），任意嵌套深度下并发分支区间互斥。
-    r_reg.offset_next_fd(fork_fd_region_offset());
-    let mut l_undo = UndoStack::new();
-    let mut r_undo = UndoStack::new();
-    let l_shared = shared.clone();
-    let r_shared = shared.clone();
-    // 取消令牌克隆进分支（watch Receiver 克隆：每分支独立 seen 状态，
-    // 并发等待互不干扰；取消广播后分支在下一 op 边界快速返回）。
-    let mut l_cancel = cancel.map(|c| CancelToken::clone(c));
-    let mut r_cancel = l_cancel.clone();
+        // 子任务隔离副本（D13）与独立撤销栈。
+        let mut l_ctx = ctx.clone();
+        let mut r_ctx = ctx.clone();
+        let mut l_reg = reg.clone();
+        let mut r_reg = reg.clone();
+        // F1 修复：spawn 前取全局唯一 fd 区间 —— 右分支偏移 `k<<48`（k 全局唯一，
+        // 见 `FORK_FD_REGION_SEQ` 注释），任意嵌套深度下并发分支区间互斥。
+        r_reg.offset_next_fd(fork_fd_region_offset());
+        let mut l_undo = UndoStack::new();
+        let mut r_undo = UndoStack::new();
+        let l_shared = shared.clone();
+        let r_shared = shared.clone();
+        // 取消令牌克隆进分支（watch Receiver 克隆：每分支独立 seen 状态，
+        // 并发等待互不干扰；取消广播后分支在下一 op 边界快速返回）。
+        let mut l_cancel = cancel.map(|c| CancelToken::clone(c));
+        let mut r_cancel = l_cancel.clone();
 
-    // R-6：分支执行器快照（锁内短临界区，O(1) Arc 克隆）。
-    // - 快照成功（Some）：分支经独立通道独占驱动（物理 IO 真并行，嵌套 Fork
-    //   在分支通道上递归快照，任意深度保持并行）；
-    // - 快照 None（默认）：回退共享通道（D17 原行为，Mock/自定义执行器不变）。
-    let l_access = branch_snapshot_access(&l_shared, &reactor).await;
-    let r_access = branch_snapshot_access(&r_shared, &reactor).await;
+        // R-6：分支执行器快照（锁内短临界区，O(1) Arc 克隆）。
+        // - 快照成功（Some）：分支经独立通道独占驱动（物理 IO 真并行，嵌套 Fork
+        //   在分支通道上递归快照，任意深度保持并行）；
+        // - 快照 None（默认）：回退共享通道（D17 原行为，Mock/自定义执行器不变）。
+        let l_access = branch_snapshot_access(&l_shared, &reactor).await;
+        let r_access = branch_snapshot_access(&r_shared, &reactor).await;
 
-    // 两个分支任务直接投递到 Runtime 自持 reactor（worker 线程并发驱动；
-    // 执行器调用经锁互斥串行化 —— 回退通道；快照通道无共享锁竞争）。子任务把
-    // （结果, 隔离 registry, 独立撤销栈, 隔离 ctx）带回，供完成后合并 —— ctx
-    // 带回用于虚拟时钟合并（审计 R1 状态-MEDIUM-1，见下）。分支深度计数器从
-    // 0 重新起算（tokio worker 线程独立栈预算；RFC-11 守卫按线程栈独立生效，
-    // 与旧 spawn_blocking 全新阻塞线程一致）。
-    let l_task = reactor.spawn(async move {
-        let v = interpret_impl(
-            left,
-            &mut l_ctx,
-            &mut l_undo,
-            &mut l_reg,
-            l_access,
-            0,
-            l_cancel.as_mut(),
-        )
-        .await;
-        (v, l_reg, l_undo, l_ctx)
-    });
-    let r_task = reactor.spawn(async move {
-        let v = interpret_impl(
-            right,
-            &mut r_ctx,
-            &mut r_undo,
-            &mut r_reg,
-            r_access,
-            0,
-            r_cancel.as_mut(),
-        )
-        .await;
-        (v, r_reg, r_undo, r_ctx)
-    });
+        // 两个分支任务直接投递到 Runtime 自持 reactor（worker 线程并发驱动；
+        // 执行器调用经锁互斥串行化 —— 回退通道；快照通道无共享锁竞争）。子任务把
+        // （结果, 隔离 registry, 独立撤销栈, 隔离 ctx）带回，供完成后合并 —— ctx
+        // 带回用于虚拟时钟合并（审计 R1 状态-MEDIUM-1，见下）。分支深度计数器从
+        // 0 重新起算（tokio worker 线程独立栈预算；RFC-11 守卫按线程栈独立生效，
+        // 与旧 spawn_blocking 全新阻塞线程一致）。
+        let l_task = reactor.spawn(async move {
+            let v = interpret_impl(
+                left,
+                &mut l_ctx,
+                &mut l_undo,
+                &mut l_reg,
+                l_access,
+                0,
+                l_cancel.as_mut(),
+            )
+            .await;
+            (v, l_reg, l_undo, l_ctx)
+        });
+        let r_task = reactor.spawn(async move {
+            let v = interpret_impl(
+                right,
+                &mut r_ctx,
+                &mut r_undo,
+                &mut r_reg,
+                r_access,
+                0,
+                r_cancel.as_mut(),
+            )
+            .await;
+            (v, r_reg, r_undo, r_ctx)
+        });
 
-    // R7-B 修复（A3 核销）：分支完成即合并——轮询两个 JoinHandle（见
-    // ForkJoinMerge），任一分支完成立即把隔离 registry/undo 合并回父
-    // （合并顺序保持 [left, right]，与顺序路径一致）。旧行为两分支都
-    // await 完才合并：Timeout 宽限耗尽丢弃 Fork future 时，已完成分支
-    // （如已持锁）的状态随局部变量一并丢弃 → 释放 undo 永不并入父 →
-    // arbiter 占坑 + 物理锁永久残留（Replace/recover 够不到，A3 锁定）。
-    // 未完成分支在丢弃时保持取消语义（JoinHandle 丢弃 → 脱离运行，阻塞
-    // IO 完成后按取消粘性快速返回；持锁占坑残余见 resource-notes R7-B）。
-    let joiner = ForkJoinMerge::new(reg, undo, ctx, l_task, r_task);
-    let (l_res, r_res) = joiner.join().await;
-    Ok((l_res?, r_res?))
+        // R7-B 修复（A3 核销）：分支完成即合并——轮询两个 JoinHandle（见
+        // ForkJoinMerge），任一分支完成立即把隔离 registry/undo 合并回父
+        // （合并顺序保持 [left, right]，与顺序路径一致）。旧行为两分支都
+        // await 完才合并：Timeout 宽限耗尽丢弃 Fork future 时，已完成分支
+        // （如已持锁）的状态随局部变量一并丢弃 → 释放 undo 永不并入父 →
+        // arbiter 占坑 + 物理锁永久残留（Replace/recover 够不到，A3 锁定）。
+        // 未完成分支在丢弃时保持取消语义（JoinHandle 丢弃 → 脱离运行，阻塞
+        // IO 完成后按取消粘性快速返回；持锁占坑残余见 resource-notes R7-B）。
+        let joiner = ForkJoinMerge::new(reg, undo, ctx, l_task, r_task);
+        let (l_res, r_res) = joiner.join().await;
+        Ok((l_res?, r_res?))
     })
 }
 
@@ -1344,7 +1355,9 @@ async fn interpret_impl(
                     // 并行路径：子任务隔离副本 + 共享执行器 + 自持 reactor，
                     // 完成后合并回父。
                     let (shared, reactor) = match &access {
-                        ExecAccess::Shared { executor, reactor } => (executor.clone(), reactor.clone()),
+                        ExecAccess::Shared { executor, reactor } => {
+                            (executor.clone(), reactor.clone())
+                        }
                         ExecAccess::Direct(_) => unreachable!("并行分支仅 Shared 通道可达"),
                     };
                     let (lv, rv) = run_fork_parallel(
@@ -1592,22 +1605,19 @@ mod tests {
     #[tokio::test]
     async fn wait_timeout_outer_cancel_interrupts() {
         // 内层：长 sleep（10s）——若 OR 臂失效，本测试会等到宽限/超时。
-        let inner: LocalBoxFuture<'_, Result<Value, SysError>> =
-            Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok(Value::Unit)
-            });
+        let inner: LocalBoxFuture<'_, Result<Value, SysError>> = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(Value::Unit)
+        });
         // 本层通道（未被广播）与**外层已广播**通道。
         let (tx, _rx) = tokio::sync::watch::channel(false);
         let (_outer_tx, outer_rx) = tokio::sync::watch::channel(false);
         let _ = _outer_tx.send(true); // 外层已取消（粘性：changed() 立即 Ready）
 
         let t0 = std::time::Instant::now();
-        let (timed_out, _r) = wait_timeout(inner, Duration::from_secs(10), &tx, Some(&outer_rx)).await;
-        assert!(
-            timed_out,
-            "外层已广播 → OR 臂应触发（timed_out=true）"
-        );
+        let (timed_out, _r) =
+            wait_timeout(inner, Duration::from_secs(10), &tx, Some(&outer_rx)).await;
+        assert!(timed_out, "外层已广播 → OR 臂应触发（timed_out=true）");
         assert!(
             t0.elapsed() < Duration::from_secs(2),
             "OR 臂应立即打断（不等到内层 10s/宽限），实测 {:?}",

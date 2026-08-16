@@ -191,15 +191,11 @@ impl Drop for ArbiterClaimGuard {
 // ── R7-A 修复：轮换型句柄 take→await→put_back 窗口的 RAII 归还守卫 ──────
 
 /// 管道读半端 → 注册表句柄（`TakeHandleGuard` 的归还构造器）。
-fn pipe_reader_handle(
-    a: Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
-) -> ResourceHandle {
+fn pipe_reader_handle(a: Arc<tokio::io::ReadHalf<tokio::io::DuplexStream>>) -> ResourceHandle {
     ResourceHandle::PipeReader(a)
 }
 /// 管道写半端 → 注册表句柄。
-fn pipe_writer_handle(
-    a: Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-) -> ResourceHandle {
+fn pipe_writer_handle(a: Arc<tokio::io::WriteHalf<tokio::io::DuplexStream>>) -> ResourceHandle {
     ResourceHandle::PipeWriter(a)
 }
 /// TCP 流 → 注册表句柄。

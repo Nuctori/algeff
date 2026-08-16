@@ -206,7 +206,10 @@ fn r7a_timeout_cancels_inflight_pipe_read_restores_handle() {
     // 宽限耗尽丢弃 future 时自动 put_back）——经 wfd 写入后 rfd 可读回
     // （可寻址/可继续）；泄漏行为下此处 Read/Close 一律 NotFound。
     rt.run_blocking(syscall(
-        DataOp::Write { fd: wfd, data: b"abc".to_vec() },
+        DataOp::Write {
+            fd: wfd,
+            data: b"abc".to_vec(),
+        },
         vec![wr(wfd)],
         Action::Pure,
     ))
