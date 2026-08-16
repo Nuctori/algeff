@@ -15,12 +15,13 @@
 //!   get_mut 失败）。且分支内失败路径的 put_back 把共享 `pipe_reader_fds`/
 //!   `pipe_writer_fds` 映射重定向到分支新 fd → 父级同一管道随后 IO 持续
 //!   InvalidInput（映射毒化）。§3 两测试锁定该行为。
-//! - **F-R7-2 [已登记 R7-A 复现] Timeout 取消飞行中管道 Write → 句柄泄漏**：
+//! - **F-R7-2 [已登记 R7-A，迭代 3-fix 修复]** Timeout 取消飞行中管道 Write：
 //!   轮换型句柄 take→await→put_back 窗口内 future 被取消丢弃 → 注册表条目
 //!   丢失（实测 wfd lookup → None）、管道写端被物理关闭。线性标记本身已由
 //!   取消传播协议回滚（`rollback_linear_to`，RFC-08/09/12 残余修复生效：
-//!   取消后同 fd Write 声明通过 A4）——§4 测试锁定「标记回滚 OK + 句柄泄漏
-//!   （R7-A 待修）」两半。
+//!   取消后同 fd Write 声明通过 A4）——§4 测试原锁定「标记回滚 OK + 句柄泄漏
+//!   （R7-A 待修）」两半；修复轮已合入已取句柄 RAII 守卫（`TakeHandleGuard`），
+//!   §4 测试翻转：取消后写端句柄可寻址/可继续（排空残留后小写读回成功）。
 //! - **F-R7-3 [疑似/低] 快照通道 + 轮换型句柄的跨分支映射污染**：分支内
 //!   TcpRead 的 put_back 会把共享 `stream_fds` 映射重定向到分支新 fd（父未
 //!   合并前不可见）→ 父级原 fd 的 Close 在分支完成后可能 NotFound（时序依赖，
@@ -526,9 +527,12 @@ fn rfc07_pipe_roundtrip_close_no_regression() {
 ///   同 fd 的 Write 声明通过 A4（`check_linear` Ok）——「同路径可重试」的
 ///   A4 面恢复（resource-notes §12 登记的残余缺口已修复）；
 /// - undo 栈无残留（阻塞写未入 undo）；
-/// - **句柄泄漏锁定（F-R7-2 = 已登记 R7-A）**：take→await→put_back 窗口内
-///   future 被取消丢弃 → wfd 注册表条目丢失（lookup None）——物理句柄随
-///   Arc 唯一引用 drop 关闭。记录不修。
+/// - **R7-A 修复翻转（原 F-R7-2 缺陷锁定）**：take→await→put_back 窗口内
+///   future 被取消丢弃 → 已取句柄由 RAII 守卫（`TakeHandleGuard`）自动归还
+///   （分配新注册表 fd + 更新映射）——写端未被物理关闭：排空取消写残留的缓冲
+///   数据后，小写 → 读回成功（泄漏行为下此处 take 即 NotFound）。
+///   （注：轮换语义下注册表键是 put_back 新分配的 fd，`lookup(wfd)` 为 None
+///   属正常；可寻址性由下述写读回环证明。）
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn rfc0809_timeout_cancels_inflight_write_linear_rollback() {
@@ -543,7 +547,7 @@ fn rfc0809_timeout_cancels_inflight_write_linear_rollback() {
         ))
         .unwrap();
     let (rfd, wfd) = pair_of(&v);
-    let _ = rfd; // 无读者：写端阻塞窗口的唯一前提。
+    // 保留读端：排空取消写残留 + 读回小写验证写端活性（见下）。
 
     let inner = syscall(
         DataOp::Write {
@@ -567,22 +571,45 @@ fn rfc0809_timeout_cancels_inflight_write_linear_rollback() {
         t0.elapsed()
     );
 
-    // 线性标记回滚（RFC-08/09/12 残余修复生效）。
-    assert!(
-        rt.undo_stack().is_empty(),
-        "取消路径不产生 undo（阻塞写未入栈）"
-    );
-    let u = wr(wfd);
-    assert!(
-        rt.registry().check_linear(&u).is_ok(),
-        "取消后 Write 声明应通过 A4（线性标记已回滚，同路径可重试）"
-    );
+    // 线性标记回滚（RFC-08/09/12 残余修复生效）：下述轮换写读回环的 Write
+    // 成功本身即证明——若取消飞行中 Write 的预插标记未回滚，同 fd 再次
+    // Write 会被 A4 拒绝（InvalidInput）。
+    assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo（阻塞写未入栈）");
 
-    // F-R7-2（R7-A 已登记）：句柄泄漏锁定——取消丢弃 take 后的管道写端。
-    assert!(
-        rt.registry().lookup(wfd).is_none(),
-        "F-R7-2 行为锁定：取消飞行中轮换型 IO → 注册表句柄泄漏（R7-A 待修）"
-    );
+    // R7-A 修复翻转（原 F-R7-2 锁定）：写端句柄已归还（RAII 守卫取消路径
+    // 自动 put_back）且物理未关闭——先排空取消写可能已灌入的缓冲数据
+    // （256KB 写满 64KB 缓冲区后阻塞被取消），再小写读回验证写端活性。
+    // 泄漏行为下：take_pipe_writer 因注册表条目丢失 + 映射陈旧 → NotFound。
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Read { fd: rfd, len: 128 * 1024 },
+            vec![rd(rfd)],
+            Action::Pure,
+        ))
+        .unwrap();
+    if let Value::Bytes(b) = &v {
+        assert!(b.len() <= 64 * 1024, "残留不超过管道缓冲区容量");
+    }
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: wfd,
+            data: b"ok".to_vec(),
+        },
+        vec![wr(wfd)],
+        Action::Pure,
+    ))
+    .unwrap();
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::Read { fd: rfd, len: 2 },
+            vec![rd(rfd)],
+            Action::Pure,
+        ))
+        .unwrap();
+    match v {
+        Value::Bytes(b) => assert_eq!(b, b"ok", "取消后写端句柄可寻址/可继续：小写读回"),
+        other => panic!("期望 Bytes，得到 {other:?}"),
+    }
 }
 
 /// Timeout 取消子树内含 Write 声明（Open rw+create 声明 Write(path)）的

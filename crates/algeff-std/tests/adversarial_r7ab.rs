@@ -1,5 +1,5 @@
-//! R7-A/B 核销轮（迭代 3-A3）——取消传播协议（run_wall_timeout，668b7ed 合入）
-//! 合并后这两面的回归盲区补齐：
+//! R7-A/B 核销轮（迭代 3-A3）→ 修复轮（迭代 3-fix）——取消传播协议
+//! （run_wall_timeout，668b7ed 合入）的回归盲区补齐与修复：
 //!
 //! - **R7-A [take→await→put_back 旋转窗口取消泄漏]**：`op_read`/`op_write` 的
 //!   轮换型管道路径为 `take_pipe_reader/writer → IO await → put_back`，无「已取
@@ -8,6 +8,10 @@
 //!   残留陈旧项 → 后续同 fd 一律 NotFound。adversarial_r7.rs §4 F-R7-2 已锁定
 //!   **写端**变体（wfd lookup None）；本文件补**读端**变体（§2）与无取消的正向
 //!   轮换回归（§3：重复读同变体 + Close 正常）。
+//!   **修复（迭代 3-fix）**：executor.rs 新增 `TakeHandleGuard`——take 后进入
+//!   取消窗口（await）前套 RAII 守卫，取消/错误路径 Drop 自动 put_back（轮换
+//!   语义不变）。§2 翻转：取消后句柄可寻址/可继续（写后读回 + Close 正常）；
+//!   写端变体（adversarial_r7.rs §4）同步翻转。
 //! - **R7-B [Timeout{Fork{MutexLock}} 孤儿分支占坑永久泄漏]**：`run_fork_parallel`
 //!   只在**两分支均完成后**才合并 registry/undo 回父；宽限耗尽丢弃 inner 时，
 //!   已完成分支（已持锁）的释放 undo 随被丢弃的局部状态一并消失 → arbiter 占坑
@@ -15,10 +19,15 @@
 //!   快速返回 → 合并 → rollback_from 执行释放 undo）锁立即可重入（RFC-09 主场景
 //!   在 executor.rs `mutex_claim_released_on_timeout_cancel` 为**线性**路径；本
 //!   文件补 **Fork 并行**路径两变体，§4）。
+//!   **修复（迭代 3-fix）**：runtime.rs 新增 `ForkJoinMerge`——轮询两分支
+//!   JoinHandle，分支完成即合并（合并顺序保持 [left, right]），Fork future 被
+//!   丢弃（宽限耗尽）时 Drop 把已完成分支合并回父。§4 耗尽变体翻转：宽限耗尽
+//!   后锁可立即重入（Replace 后亦可）。残余登记：阻塞 IO 分支**自身已持锁**时
+//!   （MutexLock → 阻塞 Read 同分支）释放 undo 随脱离任务不可达。
 //!
-//! 判定（与交付报告一致）：**R7-A/B 未核销（仍开放）**——§2/§4 耗尽变体为缺陷
-//! 行为锁定（断言当前行为，src/ 冻结不修，CTO 派发修复轮）；§3/§4 join 变体为
-//! 正向回归（当前行为符合文档承诺）。
+//! 判定（与交付报告一致）：**R7-A 核销；R7-B 核销（join 路径 + 已完成分支
+//! 合并路径闭合；耗尽路径残余登记）**——§2/§4 耗尽变体为修复后行为验证（断言
+//! 翻转），§3/§4 join 变体为正向回归（行为符合文档承诺）。
 //!
 //! 时域门控：取消/宽限测试依赖真实墙钟计时（宽限 500ms、超时 30ms），
 //! `virtual-clock` 构建下 Timeout 走 `run_virtual_timeout` post-check 语义（效果
@@ -136,18 +145,21 @@ fn udp_bind(rt: &mut Runtime) -> u64 {
 // §2 R7-A 缺陷锁定：Timeout 取消**飞行中管道读**（take 后 put_back 前）
 // ══════════════════════════════════════════════════════════════════════
 
-/// R7-A 读端变体（写端变体 = adversarial_r7.rs §4 F-R7-2）：
+/// R7-A 读端变体（写端变体 = adversarial_r7.rs §4 F-R7-2，同修复）：
 /// 无数据管道 → 读端 `Read` 阻塞于 `take_pipe_reader → rh.read().await`
 /// 窗口 → Timeout(30ms) 触发 → 取消广播不打断 executor 内 await → 宽限
-/// （CANCEL_JOIN_GRACE=500ms）耗尽 → inner future 被丢弃 → **put_back 永不
-/// 执行**。当前行为锁定（缺陷，R7-A 未核销）：
-/// - 注册表句柄泄漏：`lookup(rfd) == None`（条目已取走、未放回）；
-/// - 执行器 `pipe_reader_fds` 映射残留陈旧项 → 后续同 fd Read / Close 均
-///   NotFound（句柄不可寻址）；
-/// - undo 栈干净（阻塞读未入栈）、线性标记无残留（Read 不消费标记）。
+/// （CANCEL_JOIN_GRACE=500ms）耗尽 → inner future 被丢弃。**R7-A 修复
+/// （迭代 3-fix）翻转**：已取句柄由 RAII 守卫（`TakeHandleGuard`）在取消
+/// 路径自动归还——取消后句柄可寻址/可继续（写后读回数据 + Close 正常）；
+/// 修复前行为（缺陷锁定）：注册表条目丢失、`pipe_reader_fds` 映射残留陈旧
+/// 项 → 同 fd Read / Close 均 NotFound。
+/// - undo 栈干净（阻塞读未入栈）、线性标记无残留（Read 不消费标记）不变；
+/// - 注：轮换语义下注册表键是每次 put_back 新分配的 fd（逻辑 fd rfd 经执行
+///   器 `pipe_reader_fds` 映射寻址），故 `lookup(rfd) == None` 属正常（见
+///   §3 正向测试注释）；可寻址性由「写后读回 + Close 正常」证明。
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
-fn r7a_timeout_cancels_inflight_pipe_read_leak_locked() {
+fn r7a_timeout_cancels_inflight_pipe_read_restores_handle() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let (rfd, wfd) = {
         let v = rt
@@ -190,33 +202,30 @@ fn r7a_timeout_cancels_inflight_pipe_read_leak_locked() {
         "取消后 Read 声明应通过 A4（线性标记已回滚）"
     );
 
-    // R7-A 缺陷锁定（读端变体）：
-    assert!(
-        rt.registry().lookup(rfd).is_none(),
-        "R7-A 行为锁定：取消飞行中管道读 → 注册表读端句柄泄漏（take 未 put_back）"
-    );
-
-    // 执行器映射残留陈旧项 → 同逻辑 fd 不可寻址。
+    // R7-A 修复翻转（原缺陷锁定）：取消后读端句柄已归还（RAII 守卫在
+    // 宽限耗尽丢弃 future 时自动 put_back）——经 wfd 写入后 rfd 可读回
+    // （可寻址/可继续）；泄漏行为下此处 Read/Close 一律 NotFound。
+    rt.run_blocking(syscall(
+        DataOp::Write { fd: wfd, data: b"abc".to_vec() },
+        vec![wr(wfd)],
+        Action::Pure,
+    ))
+    .unwrap();
     let r = rt.run_blocking(syscall(
-        DataOp::Read { fd: rfd, len: 1 },
+        DataOp::Read { fd: rfd, len: 3 },
         vec![rd(rfd)],
         Action::Pure,
     ));
-    assert_eq!(
-        r.unwrap_err(),
-        SysError::NotFound,
-        "R7-A 行为锁定：泄漏后同 fd 重复读应 NotFound（映射陈旧、注册表无条目）"
-    );
-    let r = rt.run_blocking(syscall(
+    match r.unwrap() {
+        Value::Bytes(b) => assert_eq!(b, b"abc", "取消后句柄可寻址/可继续：写后读回数据"),
+        other => panic!("期望 Bytes，得到 {other:?}"),
+    }
+    rt.run_blocking(syscall(
         DataOp::Close { fd: rfd },
         vec![ow(rfd)],
         Action::Pure,
-    ));
-    assert_eq!(
-        r.unwrap_err(),
-        SysError::NotFound,
-        "R7-A 行为锁定：泄漏后同 fd Close 应 NotFound（句柄不可寻址）"
-    );
+    ))
+    .unwrap();
 
     // 写端不受牵连：Close 正常（写端从未被 take）。
     rt.run_blocking(syscall(
@@ -359,20 +368,20 @@ fn r7b_timeout_fork_lock_join_path_lock_reentrant() {
     );
 }
 
-/// R7-B 宽限耗尽路径（缺陷锁定）：Timeout{Fork{MutexLock(id) → Pure,
-/// UdpRecvFrom(阻塞、不可取消)}}，30ms 超时 → 取消广播 → MutexLock 分支（已
-/// 完成、持锁入槽）的结果因 `run_fork_parallel` 只 await 完 UdpRecvFrom 分支
-/// 才合并而滞留于被丢弃的 inner 局部 → 释放 undo 随任务结果丢弃、**从不并入
-/// 父** → arbiter 占坑 + 物理锁永久残留。当前行为锁定（缺陷，R7-B 未核销）：
-/// - 同 id 后续 MutexLock → WouldBlock（有限重试后，A7 不挂死）；
-/// - Replace（recover + reg.clear）后仍 WouldBlock（父 undo 栈无孤儿分支的
-///   undo → recover 够不到；reg.clear 不清 executor 的 arbiter/held_locks）——
-///   RFC-09「recover 可恢复」对宽限耗尽孤儿分支不成立（登记原文）；
-/// - 显式 MutexUnlock 是唯一逃逸通道（经共享 held_locks 停车位取走 guard +
-///   幂等 release）→ 之后同 id 可重入（非绝对死锁，但默认蓝图路径永久饥饿）。
+/// R7-B 宽限耗尽路径（修复翻转）：Timeout{Fork{MutexLock(id) → Pure,
+/// UdpRecvFrom(阻塞、不可取消)}}，30ms 超时 → 取消广播 → UdpRecvFrom 分支
+/// 阻塞于不可取消 IO → 宽限耗尽 → inner future 被丢弃。**R7-B 修复（迭代
+/// 3-fix）**：`run_fork_parallel` 改为轮询两个分支 JoinHandle（`ForkJoinMerge`）
+/// ——宽限耗尽前 MutexLock 分支已完成并**立即合并**回父（旧行为：两分支都
+/// await 完才合并，已完成持锁分支的释放 undo 随被丢弃的局部状态消失，
+/// 永不并入父 → arbiter 占坑 + 物理锁永久残留）。合并后的 undo 由 Timeout
+/// 回滚（`rollback_from`）执行释放 → 同 id 立即可重入；Replace/recover 后
+/// 仍可重入。未完成分支（UdpRecvFrom）保持取消语义（JoinHandle 丢弃脱离），
+/// 不持锁无占坑。残余（登记 resource-notes R7-B）：**阻塞 IO 分支自身已持锁**
+/// 时（MutexLock → 阻塞 Read 同分支），其释放 undo 随脱离任务不可达。
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
-fn r7b_timeout_fork_lock_grace_exhausted_orphan_leak_locked() {
+fn r7b_timeout_fork_lock_grace_exhausted_reentrant() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
     let id = 91u64;
     // 父级 UDP 绑定（&self 型句柄，分支内 lookup 直用无共享冲突），
@@ -402,31 +411,32 @@ fn r7b_timeout_fork_lock_grace_exhausted_orphan_leak_locked() {
         "宽限耗尽：须耗尽 500ms 宽限（elapsed={elapsed:?}）"
     );
 
-    // 缺陷锁定：孤儿分支持锁占坑 → 同 id WouldBlock（有限重试，非挂死）。
-    let r = rt.run_blocking(mutex_lock(id));
+    // R7-B 修复翻转（原缺陷锁定）：宽限耗尽前 MutexLock 分支已完成并立即
+    // 合并回父 → 取消回滚（rollback_from）执行其释放 undo → 同 id 锁立即可
+    // 重入（不再 WouldBlock；泄漏行为下这里 WouldBlock 且 Replace/recover
+    // 也够不到，仅显式 MutexUnlock 可逃逸）。
     assert_eq!(
-        r.unwrap_err(),
-        SysError::WouldBlock,
-        "R7-B 行为锁定：宽限耗尽孤儿分支占坑残留 → 同 id Lock WouldBlock"
+        rt.run_blocking(mutex_lock(id)).unwrap(),
+        Value::Unit,
+        "宽限耗尽后：已完成分支的释放 undo 已并入父并回滚 → 同 id 可立即重入"
     );
 
-    // Replace（recover + reg.clear）也无法释放（父 undo 栈为空，孤儿 undo 未合并）。
+    // Replace（recover + reg.clear）后仍可重入（撤销栈已清、锁未持有）。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    let r = rt.run_blocking(mutex_lock(id));
     assert_eq!(
-        r.unwrap_err(),
-        SysError::WouldBlock,
-        "R7-B 行为锁定：Replace/recover 后同 id 仍 WouldBlock（孤儿占坑够不到）"
+        rt.run_blocking(mutex_lock(id)).unwrap(),
+        Value::Unit,
+        "Replace 后同 id 仍可重入"
     );
 
-    // 唯一逃逸通道：显式 MutexUnlock（经共享 held_locks 停车位）→ 之后可重入。
+    // 显式 MutexUnlock 幂等（未持锁时 no-op）；之后仍可重入（原逃逸通道面）。
     rt.run_blocking(mutex_unlock(id)).unwrap();
     assert_eq!(
         rt.run_blocking(mutex_lock(id)).unwrap(),
         Value::Unit,
-        "显式 MutexUnlock 释放孤儿占坑后同 id 可重入（逃逸通道存在）"
+        "显式 MutexUnlock（幂等）后同 id 可重入"
     );
 }

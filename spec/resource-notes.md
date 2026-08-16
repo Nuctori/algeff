@@ -631,25 +631,33 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   永不执行：注册表条目已取走、arc 唯一强引用 → 物理资源被关闭（TCP 连接断/管道对端
   EOF/Child 无人 wait）；执行器映射表残留陈旧项（`reg.clear()` 也不清 executor 表）；
   后续同逻辑 fd 一律 NotFound。修复方向：仿 ArbiterClaimGuard 加「已取句柄 RAII 守卫」。
-  **状态（迭代 3-A3 核销轮）：未核销（仍开放）**——写端变体已锁定于
-  `adversarial_r7.rs::rfc0809_timeout_cancels_inflight_write_linear_rollback`（F-R7-2，
-  wfd lookup None）；本迭代补**读端**变体 `adversarial_r7ab.rs::
-  r7a_timeout_cancels_inflight_pipe_read_leak_locked`：取消飞行中管道读 → 注册表条目
-  丢失 + 映射陈旧 → 同 fd 重复 Read / Close 均 NotFound（测试锁定当前行为，未修，
-  CTO 派发修复轮）。无取消正向回归 `r7a_pipe_rotation_repeated_reads_close_normal`
-  （重复读同变体 + Close 正常）全绿，证明轮换机制本身无回归。
+  **状态（迭代 3-fix 修复轮）：已修复（核销）**——executor.rs 新增 `TakeHandleGuard`
+  （take 后进入取消窗口前套守卫，`Drop` 自动 `put_back`，取消/错误路径均归还，轮换
+  语义不变；覆盖 op_read 管道读、op_write 管道写/TCP 写、op_tcp_read/write、op_send_file
+  输出侧全部 take→await→put_back 路径）。测试翻转：读端变体
+  `adversarial_r7ab.rs::r7a_timeout_cancels_inflight_pipe_read_restores_handle`（取消后
+  写→读回数据 + Close 正常，可寻址/可继续）；写端变体
+  `adversarial_r7.rs::rfc0809_timeout_cancels_inflight_write_linear_rollback`（排空残留后
+  小写→读回成功）。无取消正向回归 `r7a_pipe_rotation_repeated_reads_close_normal` 保持
+  全绿（轮换机制本身无回归）。注：轮换语义下注册表键是每次 put_back 新分配的 fd，
+  逻辑 fd 经执行器映射寻址——「句柄存在」由后续 IO 成功证明，`lookup(逻辑fd)` 为 None
+  属正常。
 - **R7-B [MEDIUM] Timeout{Fork{MutexLock}} 孤儿分支占坑永久泄漏**：Timeout 丢弃 Fork future
   → spawn_blocking 分支成为孤儿继续执行 → 分支私有 undo（含锁释放）随任务结果丢弃 →
   arbiter 占坑永久残留，同 id 后续 Lock 永久 WouldBlock，**Replace/recover 也无法释放**
   （RFC-09「recover 可恢复」对孤儿分支不成立）。
-  **状态（迭代 3-A3 核销轮）：未核销（仍开放）**——宽限耗尽变体锁定于
-  `adversarial_r7ab.rs::r7b_timeout_fork_lock_grace_exhausted_orphan_leak_locked`：
-  Timeout{Fork{MutexLock, UdpRecvFrom(阻塞)}} 宽限耗尽 → 孤儿分支已持锁 → 同 id
-  Lock WouldBlock（有限重试，A7 不挂死）；Replace（recover+reg.clear）后仍 WouldBlock
-  （孤儿 undo 从不并入父）；显式 MutexUnlock 是唯一逃逸通道（测试锁定当前行为，未修，
-  CTO 派发修复轮）。宽限内 join 变体 `r7b_timeout_fork_lock_join_path_lock_reentrant`
-  **通过**：分支可取消快速返回 → 合并 → rollback_from 执行释放 undo → 同 id 立即可
-  重入（RFC-09 目标在 Fork 并行路径成立，补齐 executor.rs 线性路径主场景之外的面）。
+  **状态（迭代 3-fix 修复轮）：已修复（核销，部分修复面）**——runtime.rs 新增
+  `ForkJoinMerge`：`run_fork_parallel` 改为轮询两分支 JoinHandle、**分支完成即合并**
+  （合并顺序保持 [left, right]；右分支先完成时暂存待按序合并），Fork future 被丢弃
+  （宽限耗尽 / VC 墙钟通道超时）时 `Drop` 把已完成分支的 registry/undo/ctx 合并回父。
+  翻转测试 `adversarial_r7ab.rs::r7b_timeout_fork_lock_grace_exhausted_reentrant`：
+  Timeout{Fork{MutexLock, UdpRecvFrom(阻塞)}} 宽限耗尽 → 已完成持锁分支的释放 undo
+  已并入父并被 `rollback_from` 执行 → 同 id 立即可重入、Replace 后仍可重入（原锁定行为
+  为 WouldBlock → Replace 仍 WouldBlock → 仅显式 MutexUnlock 可逃逸）。宽限内 join 变体
+  `r7b_timeout_fork_lock_join_path_lock_reentrant` 保持通过。**登记残余**：阻塞 IO 分支
+  **自身已持锁**时（如分支内 MutexLock → 阻塞 Read 同分支），该分支随宽限耗尽脱离
+  运行，其释放 undo 经 spawn_blocking 任务结果丢弃不可达 → 占坑仍残留（join 路径闭、
+  耗尽路径登记；彻底修复需分支任务自行感知脱离并归还，超出本轮冻结面）。
 - **R7-C [LOW] set_dependency 双份等价 undo footgun（coeffects）**：栈副本 + handed 副本
   「只执行其中一份」依赖微妙前提（间隔无中间 set），无测试覆盖。
 - **R7-D [LOW] fork_conflict 静态收集漏 `Invoke.captures`**（闭包盲区之外的另一盲区）。
@@ -676,6 +684,29 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   锁定宽限耗尽 → 孤儿分支持锁占坑永久残留（WouldBlock → Replace/recover 仍 WouldBlock
   → 仅显式 MutexUnlock 可逃逸）；`r7b_timeout_fork_lock_join_path_lock_reentrant` 验证
   宽限内 join 路径锁立即可重入（RFC-09 目标在 Fork 并行路径成立）。
+
+### R7-A/B 修复核销（迭代 3-fix，2026-08-17，测试驱动）
+
+**结论：R7-A 核销；R7-B 核销（部分修复面：join 路径 + 已完成分支合并路径闭合，
+耗尽路径残余登记）**。修复实现：
+
+- **R7-A**：`executor.rs` 新增 `TakeHandleGuard`（已取句柄 RAII 守卫）——take 后进入
+  取消窗口（IO await）前套守卫，`Drop` 自动 `put_back`（分配新注册表 fd + 更新逻辑
+  映射，轮换语义不变），取消/错误路径均归还、未取时无操作；覆盖全部 7 处轮换型
+  take→await→put_back 路径（op_read 管道读、op_write 管道写/TCP 写、op_tcp_read/write、
+  op_send_file 输出侧 TCP/管道）。测试翻转：`r7a_timeout_cancels_inflight_pipe_read_restores_handle`
+  （读端：取消后写→读回 + Close 正常）与 `rfc0809_timeout_cancels_inflight_write_linear_rollback`
+  （写端：排空残留后小写→读回）。
+- **R7-B**：`runtime.rs` 新增 `ForkJoinMerge`——`run_fork_parallel` 轮询两分支
+  JoinHandle，**分支完成即合并**（合并顺序保持 [left, right]；右分支先完成时暂存），
+  Fork future 被丢弃（宽限耗尽 / VC 墙钟通道超时）时 `Drop` 把已完成分支的隔离状态
+  合并回父。测试翻转：`r7b_timeout_fork_lock_grace_exhausted_reentrant`（宽限耗尽后
+  同 id 立即可重入、Replace 后仍可重入）。
+
+测试载体：`crates/algeff-std/tests/adversarial_r7ab.rs`（4 测试全绿）+ `adversarial_r7.rs`
+（§4 写端翻转）；`cargo test --workspace` 全绿。残余（登记）：阻塞 IO 分支自身已持锁
+时（MutexLock → 阻塞 Read 同分支）释放 undo 随脱离任务不可达（占坑残留），需分支任务
+自行感知脱离并归还（超出冻结面，留待后续轮）。
 
 ## 12. R3 对账审计轮（5 轮串行循环第 3 轮，2026-08-16）——取消传播复核 + 文档对账
 
