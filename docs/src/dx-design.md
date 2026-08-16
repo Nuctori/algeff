@@ -1,8 +1,11 @@
-# DX 语法糖层设计（迭代 1→2）：`do_!` 宏 + `dx` 模块
+# DX 语法糖层设计（迭代 1→3-A5）：`do_!` 宏 + `dx` 模块
 
-> 范围：迭代 1 提供「顺序命令式」语法糖；迭代 2（本迭代）深化 DX 层——
+> 范围：迭代 1 提供「顺序命令式」语法糖；迭代 2 深化 DX 层——
 > 错误处理 `dx::catch`、DataOp → dx 包装全覆盖（munmap/send_file/dup2 补齐）、
-> 新示例测试。控制流（`plan!`/`fork!`/`scope!`/`choose!`）与错误处理
+> 新示例测试；迭代 3-A5（本迭代）——`plan!` continuation 闭包改 `move`
+> （do_! 块可直接内嵌）+ usage builder（`dx::usage`/`dx::fd_usage`/
+> `dx::path_usage`/`dx::pid_usage`/`dx::signal_usage`）。控制流
+> （`plan!`/`fork!`/`scope!`/`choose!`）与错误处理
 > （`Action::Catch`）沿用既有机制；**不引入任何新 Action 节点**。冻结面
 > （algeff-core 的 `action.rs`/`error.rs`/`syscall.rs`/`lib.rs`、
 > `contracts.md`、`pdr.md`）零改动——本设计全部落在 A5 域纯增量层
@@ -21,7 +24,10 @@
 4. **错误处理命令式化**（迭代 2）：`do_!` 内用 `dx::catch(action, |e| …)`
    捕获链内错误——`Action::Catch` 的 dx 级便捷包装，运行时语义零改动；
 5. **DataOp 全覆盖**（迭代 2）：每个 `DataOp` 都有 `dx` 预包装操作
-   （迭代 2 补齐 munmap/send_file/dup2）。
+   （迭代 2 补齐 munmap/send_file/dup2）；
+6. **组合免预构建 + 显式覆盖免样板**（迭代 3-A5）：`plan!` continuation 闭包
+   为 `move`（do_! 块可直接内嵌）；`dx::usage*` 便捷构造 `ResourceUsage`
+   （`syscall_with` 配套，见 §3.5）。
 
 ### 1.2 三条不变量（哲学底线，与 pdr.md §八/§13 对齐）
 
@@ -98,6 +104,7 @@ do_! {                         手写等价（局部 CPS）
 
 - **覆盖优先级**：`syscall_with(op, resources)` > `infer_usage` > 空集。
   调用方也可完全手写 `Action::Syscall`，或使用 `adapters` 的类型状态包装；
+  显式声明用迭代 3-A5 的 usage builder 便捷构造（§3.5）；
 - **价值**：消灭「每个 op 重复声明资源」的样板，且缺省安全
   （`close`/`unlink`/`wait` 默认 Own 终结，不会误声明成 Read 泄漏线性标记）；
 - **可审计**：推导表是纯函数 `&DataOp → ResourceSet`，逐条可测
@@ -139,6 +146,36 @@ let blueprint = do_! {
   需整体回滚时用 `Replace` 包裹，二者职责不变；
 - handler 需 `+ Send + 'static`：捕获的外部数据 clone 后 `move` 进闭包；
   替代 Action 可为 `do_!`/`plan!`/`dx::unit()` 等任意返回 `Action` 的表达式。
+
+### 3.5 显式覆盖的样板消解：usage builder（迭代 3-A5 新增）
+
+`syscall_with` 的 `ResourceSet` 手写 `ResourceUsage { resource, mode }`（或
+adapters 风格 `TypedResource::new_*.into_usage()`）样板由便捷构造消解：
+
+```rust
+use algeff_core::{AccessMode, Resource};
+use algeff_std::dx;
+
+// 通用构造：dx::usage(Resource, AccessMode)
+let _ = dx::usage(Resource::Fd(3), AccessMode::Read);
+// 按资源类型便捷：fd/path/pid/signal + mode 组合
+let _ = dx::fd_usage(3, AccessMode::Read);
+let _ = dx::path_usage("/var/log/app", AccessMode::Write);
+let _ = dx::pid_usage(42, AccessMode::Own);
+let _ = dx::signal_usage(AccessMode::Write);
+```
+
+与 `syscall_with` 组合（显式覆盖自动推导）：
+
+```rust
+let a = dx::syscall_with(
+    DataOp::Open { path: "/x".into(), flags },
+    vec![dx::path_usage("/custom", AccessMode::Read)], // 覆盖 Write(path) 默认推导
+);
+```
+
+设计要点：纯构造函数（无新类型/无状态），与 `infer_usage` 同表同模式；
+`path_usage` 接受 `impl AsRef<Path>`（`&str`/`PathBuf` 直传）。
 **MutexLock/MutexUnlock/SendSignal 同样空集，但理由不同**：
 - 锁 id 的互斥语义由 executor 层 arbiter 动态仲裁（D16/R-1，占坑⟺持锁）；
   A4 线性域（Write 每资源至多消费一次）与之正交——若声明 `Write(Fd(id))`，
@@ -174,12 +211,17 @@ let blueprint = do_! {
    `e;` 都表示丢弃，语法上照顾普通 Rust 习惯。
 4. **为什么命名为 `do_`**：`do` 是 Rust 保留关键字（loop 语法），
    下划线后缀沿用社区惯例。
-5. **为什么 `plan!` 内嵌 `do_!` 需预构建 Action 值**：`plan!` 的 continuation
-   闭包非 `move`，直接内嵌 `do_! { dx::open(&local, …) }` 会对外部路径借用
-   要求 `'static`。预构建（`let act = do_!{…}; plan!{ act; … }`）后 `plan!`
-   只做值组合——这也是「蓝图即值、再组合」的自然形态，示例测试
-   `plan_wraps_do_blocks` 即按此写法。如后续需要自由捕获，可给 `plan!`
-   增加 `move` 变体（属宏语义变更，需独立决策）。
+5. **为什么 `plan!` 内嵌 `do_!` 无需预构建（迭代 3-A5 变更）**：`plan!` 的
+   continuation 闭包已改 `move`（与 `do_!`/`choose!` 一致）——`do_!` 块（含
+   `move` 闭包捕获外部路径/fd）可**直接内嵌** plan! 任意位置：首元素借用于
+   构造期（`current` 求值即释放），后续元素体内引用的外部变量被 **move 闭包
+   移入链**（被消费，如需保留先 clone）。修复前 continuation 闭包非 `move`，
+   非首元素内的 `&外部路径` 被借用捕获 → `Box<dyn FnOnce + Send>` 要求
+   `'static` → E0597（`path does not live long enough`），被迫预构建
+   `let act = do_!{…}; plan!{ act; … }`。变更安全性：任何修复前能编译的
+   程序行为不变（元素值本就 move 进 `current`，仅「借引用非 'static 局部」
+   的失败用例改为「move 消费」成功），既有测试全绿为门槛（§6）。
+   预构建写法仍然成立（值组合形态，见 `plan_move_keeps_value_composition_working`）。
 
 ## 6. 验证证据（tests/dx_examples.rs，15 项全绿）
 
@@ -206,6 +248,14 @@ let blueprint = do_! {
 | `do_plan_fork_mix` | do_! 内嵌 plan!（声明式子步骤）+ fork!（并发分叉写不同文件），真实执行双文件落盘 |
 | `remaining_op_wrappers_construct_syscall_nodes` | munmap/send_file/dup2 包装构造 + infer_usage 自动推导资源断言 |
 
+迭代 3-A5 新增：
+
+| 测试 | 验证的承诺 |
+| --- | --- |
+| `plan_embeds_do_blocks_directly` | plan! continuation 闭包改 move 后，两个 do_! 块（第二个引用外部路径——修复前 E0597）直接内嵌 plan!，真实执行落盘 |
+| `plan_move_keeps_value_composition_working` | 预构建 Action 值作为 plan! 元素的旧形态不受影响（回归保障） |
+| `usage_builder_constructs_usage` | `dx::usage`/`dx::fd_usage`/`dx::path_usage`/`dx::pid_usage`/`dx::signal_usage` 便捷构造 + 与 `syscall_with` 组合显式覆盖 |
+
 ## 7. 已知限制与后续迭代
 
 - `let` 不支持解构模式（标识符/通配之外报编译期错误）；
@@ -215,15 +265,20 @@ let blueprint = do_! {
 - **do_! 链内外部路径引用的捕获规则**：引用出现在闭包体内即被 `move` 闭包捕获，
   需 `'static`——链内多处使用的路径请 clone 后 move（示例见
   `file_ops_comprehensive_roundtrip` 的 `fc`）；
-- **plan!/fork! 内嵌 do_! 需预构建 Action 值**（plan! continuation 闭包非 move、
-  do_! 展开闭包要求 'static），与 `plan_wraps_do_blocks` 同模式；
+- **plan!/fork! 内嵌 do_! 直接书写可用**（迭代 3-A5：plan! continuation 闭包为
+  move，do_! 块可直接内嵌任意位置，外部捕获被移入链——如需保留先 clone）；
+  预构建 Action 值写法仍成立（值组合形态，二者等价）；
 - **plan! 元素值被忽略**：plan! 链收敛为 `Pure(Unit)`，需值传递时用 do_! 作外层
   （见 `do_plan_fork_mix`）；
 - **TCP accept 真实执行需并发客户端**：骨架测试只构造 + bind 执行；完整 echo
   链路见 `tests/e2e.rs`；
 - **操作保持函数形态（方案 D 重申，迭代 2 未引入 `open!` 等操作宏）**：`write!`
   与 `std::write!` 名冲突是硬伤，函数调用已足够接近普通 Rust；
-- 空集推导的操作（TcpBind/Spawn 等）其新句柄声明留给用户责任域，文档已注明。
+- 空集推导的操作（TcpBind/Spawn 等）其新句柄声明留给用户责任域，文档已注明；
+- **显式覆盖的样板由 usage builder 消解（迭代 3-A5）**：`dx::syscall_with` 的
+  `ResourceSet` 用 `dx::usage`/`dx::fd_usage`/`dx::path_usage`/`dx::pid_usage`/
+  `dx::signal_usage` 便捷构造，无需手写 `ResourceUsage { resource, mode }` 或
+  `TypedResource::new_*.into_usage()`。
 
 ## 文档入口
 

@@ -1,5 +1,7 @@
-//! DX 语法糖层（迭代 1→2）：命令式 `do_!` 宏的运行时支撑 + 资源自动推导 +
-//! 错误处理（`dx::catch`）。
+//! DX 语法糖层（迭代 1→3-A5）：命令式 `do_!` 宏的运行时支撑 + 资源自动推导 +
+//! 错误处理（`dx::catch`）+ usage builder（`dx::usage`/`dx::fd_usage`/
+//! `dx::path_usage`/`dx::pid_usage`/`dx::signal_usage`，迭代 3-A5：
+//! `syscall_with` 显式覆盖的样板消解）。
 //!
 //! 本模块是 **A5 域纯增量层**：冻结面（algeff-core 的 action/error/syscall/
 //! lib、contracts.md、pdr.md）零改动。哲学底线不变：
@@ -59,20 +61,45 @@ pub use crate::adapters::{and_then, seq, then};
 
 // ── 资源自动推导（DataOp → ResourceSet 默认表）─────────────────────────
 
-fn usage(resource: Resource, mode: AccessMode) -> ResourceUsage {
+/// `ResourceUsage` 便捷构造（迭代 3-A5：显式覆盖入口 `syscall_with` 的配套）。
+///
+/// 消除手写 `ResourceUsage { resource, mode }`（或 adapters 风格
+/// `TypedResource::new_read(..).into_usage()`）的样板：
+///
+/// ```
+/// use algeff_core::{AccessMode, Resource};
+/// use algeff_std::dx;
+/// let u = dx::usage(Resource::Fd(3), AccessMode::Read);
+/// assert_eq!(u.resource, Resource::Fd(3));
+/// assert_eq!(u.mode, AccessMode::Read);
+/// ```
+///
+/// 按资源类型的便捷构造见 [`dx::fd_usage`]/[`dx::path_usage`]/[`dx::pid_usage`]/[`dx::signal_usage`]。
+pub fn usage(resource: Resource, mode: AccessMode) -> ResourceUsage {
     ResourceUsage { resource, mode }
 }
 
-fn path_usage(p: &Path, mode: AccessMode) -> ResourceUsage {
-    usage(Resource::Path(p.to_string_lossy().into_owned()), mode)
+/// 便捷：路径资源 usage（`impl AsRef<Path>` 直接传入，免去 `Resource::Path(...)` 样板）。
+pub fn path_usage(p: impl AsRef<Path>, mode: AccessMode) -> ResourceUsage {
+    usage(
+        Resource::Path(p.as_ref().to_string_lossy().into_owned()),
+        mode,
+    )
 }
 
-fn fd_usage(fd: Fd, mode: AccessMode) -> ResourceUsage {
+/// 便捷：fd 资源 usage。
+pub fn fd_usage(fd: Fd, mode: AccessMode) -> ResourceUsage {
     usage(Resource::Fd(fd), mode)
 }
 
-fn pid_usage(pid: Pid, mode: AccessMode) -> ResourceUsage {
+/// 便捷：pid 资源 usage。
+pub fn pid_usage(pid: Pid, mode: AccessMode) -> ResourceUsage {
     usage(Resource::Pid(pid), mode)
+}
+
+/// 便捷：信号资源 usage（Signal 为全局单资源，无需携带编号）。
+pub fn signal_usage(mode: AccessMode) -> ResourceUsage {
+    usage(Resource::Signal, mode)
 }
 
 /// 按操作推导默认资源声明（pdr.md §9 冲突矩阵 / §3 类型状态声明的自动化）。
@@ -182,6 +209,9 @@ pub fn syscall(op: DataOp) -> Action {
 }
 
 /// 显式指定资源声明构造 Syscall 节点——**覆盖**自动推导（手动覆盖入口）。
+///
+/// `resources` 用 [`dx::usage`]/[`dx::path_usage`]/[`dx::fd_usage`]/[`dx::pid_usage`]/
+/// [`dx::signal_usage`] 便捷构造（迭代 3-A5），示例见 `tests/dx_examples.rs`。
 pub fn syscall_with(op: DataOp, resources: ResourceSet) -> Action {
     Action::Syscall {
         op,
