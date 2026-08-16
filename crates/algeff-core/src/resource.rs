@@ -785,6 +785,35 @@ mod tests {
     }
 
     #[test]
+    fn clear_then_merge_keeps_base_anchor() {
+        // 审查验证点（D-096 × merge 交互）：分支内 Replace（clear → fork_region
+        // 保留根基线 (base,0)）后 merge 回父——父必须吸收该根基线（锚点吸收
+        // RFC-06），后续 offset_next_fd 仍锚定根基线；且未再分配的收敛判定
+        // （next_fd == base + 0）正确触发。
+        let mut parent = ResourceRegistry::new();
+        let mut branch = parent.clone();
+        // 分支偏移 k1=1 → 分配 1 个 fd → Replace（clear 保留根基线 0）。
+        branch.offset_next_fd(1 << 48);
+        let _ = branch.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        branch.clear();
+        // Replace 后未再分配：next_fd == base（0 + 1？不——allocate 后 next_fd
+        // = 1<<48+1；clear 不动 next_fd → next_fd = 1<<48+1 > base=0，收敛判定假，
+        // other_next = next_fd —— fd 已逃逸，游标不降。
+        // 锚点吸收：父无 fork_region → 吸收分支根基线 (0, 0)。
+        parent.merge(branch);
+        // 后续父级偏移 k2=2：锚定根基线 0 → 区间 [2<<48, 3<<48)。
+        parent.offset_next_fd(2 << 48);
+        let nfd = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert_eq!(
+            nfd,
+            2 << 48,
+            "clear→merge 后父偏移仍锚定根基线（锚点吸收 + 保留基线）"
+        );
+        // 父 next_fd 未被分支高位 fd 永久抬高后再次累加（线性增长语义）。
+        assert!(parent.next_fd < (3 << 48), "父 next_fd 保持线性量级");
+    }
+
+    #[test]
     fn merge_preserves_fd_identity() {
         // D13 合并（RFC-A3-2）：子注册表句柄以**原 fd** 直接并入父，fd 身份保留
         // （区别于 take+allocate 值迁移的 fd 重分配 workaround）。
