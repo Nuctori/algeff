@@ -788,17 +788,17 @@ mod tests {
     fn clear_then_merge_keeps_base_anchor() {
         // 审查验证点（D-096 × merge 交互）：分支内 Replace（clear → fork_region
         // 保留根基线 (base,0)）后 merge 回父——父必须吸收该根基线（锚点吸收
-        // RFC-06），后续 offset_next_fd 仍锚定根基线；且未再分配的收敛判定
-        // （next_fd == base + 0）正确触发。
+        // RFC-06），后续 offset_next_fd 仍锚定根基线。分支在 clear 前已分配过
+        // fd → merge 收敛判定为假（next_fd=1<<48+1 ≠ base+0）→ other_next 取
+        // next_fd（游标不降、D1 保持）——本测试覆盖的是「已分配」路径。
         let mut parent = ResourceRegistry::new();
         let mut branch = parent.clone();
-        // 分支偏移 k1=1 → 分配 1 个 fd → Replace（clear 保留根基线 0）。
+        // 分支偏移 k1=1 → 分配 1 个 fd（next_fd = 1<<48+1）→ Replace（clear 保留
+        // 根基线 0；next_fd 不动）。
         branch.offset_next_fd(1 << 48);
         let _ = branch.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
         branch.clear();
-        // Replace 后未再分配：next_fd == base（0 + 1？不——allocate 后 next_fd
-        // = 1<<48+1；clear 不动 next_fd → next_fd = 1<<48+1 > base=0，收敛判定假，
-        // other_next = next_fd —— fd 已逃逸，游标不降。
+        // merge：收敛判定假（next_fd=1<<48+1 > base=0）→ other_next = next_fd；
         // 锚点吸收：父无 fork_region → 吸收分支根基线 (0, 0)。
         parent.merge(branch);
         // 后续父级偏移 k2=2：锚定根基线 0 → 区间 [2<<48, 3<<48)。
