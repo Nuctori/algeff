@@ -668,10 +668,13 @@ fn timeout_nested_outer_cancel_interrupts_inner_wait() {
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
     // inner 慢 syscall（600ms，慢于一切 deadline）→ 内层 200ms 未超时；外层 30ms 触发。
-    // 走有界宽限 join（CANCEL_JOIN_GRACE=500ms，等待飞行副作用合并）→ 总耗时特征 =
-    // 外层触发 + 宽限耗尽 ≈ 530ms；修复前（无 OR 臂）内层 wait 自然到 200ms 自身超时 →
-    // 总 ≈ 230ms。断言窗口 [400ms, 700ms] 锁定修复后宽限路径、排除修复前（230ms）
-    // 与 op 完整执行（600ms+宽限 > 1s）。
+    // R3-B 可观察区分（审计推导：外层宽限 530ms 是总闸，黑盒耗时两态恒等）：
+    // - 修复前（无 OR 臂）：内层 wait 继续至 200ms 自身超时 → 内层宽限 join 等 Close
+    //   （600ms）→ 外层宽限 530ms 先耗尽 → drop 内层 future → **内层 on_timeout 未执行**；
+    // - 修复后（OR 臂）：外层取消 30ms 打断内层 wait → 内层宽限 530ms 耗尽 → 内层自主
+    //   收尾（回滚 + **on_timeout(1) 执行**）→ 外层 join 后 on_timeout(2)。
+    // 断言：内层 on_timeout 的 GetTime 副作用出现在 ops（修复后语义：取消及时穿透、
+    // 内层在宽限内自主收尾）；耗时上界防卡死（< 2s）。
     ex.delay = Duration::from_millis(600);
 
     let t0 = std::time::Instant::now();
@@ -679,17 +682,23 @@ fn timeout_nested_outer_cancel_interrupts_inner_wait() {
         action: Box::new(Action::Timeout {
             action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
             duration: Duration::from_millis(200),
-            on_timeout: Box::new(Action::Pure(Value::U64(1))),
+            // 可观察副作用：内层 on_timeout 是否执行（修复前被外层 drop → 不执行）
+            on_timeout: Box::new(syscall_step(DataOp::GetTime, vec![])),
         }),
         duration: Duration::from_millis(30),
         on_timeout: Box::new(Action::Pure(Value::U64(2))),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
     assert_eq!(v, Ok(Value::U64(2)), "外层超时优先（on_timeout 结果）");
-    let elapsed = t0.elapsed();
+    assert_eq!(
+        ex.ops(),
+        vec!["Close { fd: 999 }", "GetTime"],
+        "R3-B：外层取消应打断内层 wait 使内层在宽限内自主收尾（on_timeout 执行）——修复前内层被外层 drop、GetTime 不出现"
+    );
     assert!(
-        elapsed > Duration::from_millis(400) && elapsed < Duration::from_millis(700),
-        "外层取消应打断内层 wait 并走宽限路径（实测 {elapsed:?}，修复前 ≈230ms / 修复后 ≈530ms）",
+        t0.elapsed() < Duration::from_millis(2000),
+        "防卡死上界（实测 {:?}）",
+        t0.elapsed()
     );
 }
 
