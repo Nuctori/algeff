@@ -119,9 +119,12 @@ OK：tag v0.1.0 尚不存在。
 OK：工作区干净。
 ==> 本地发布面检查（cargo package --list）        # 三 crate 文件清单正常
 ==> cargo publish --dry-run（仅打包校验，不实际发布；需要网络）
-    algeff-core: PASS
+    algeff-core: PASS   （仅 manifest 元数据警告：无 repository/homepage，即清单 R2）
     algeff-std:  FAIL（预期：no matching package named `algeff-core`，cargo 固有行为）
     algeff-macro: PASS
+
+scripts/release.sh --allow-unpublished-deps：
+    algeff-core: PASS / algeff-std: PASS（patch.crates-io.algeff-core 代偿）/ algeff-macro: PASS
 ```
 
 ## 6. 发布前最终检查清单（勾选状态）
