@@ -112,7 +112,7 @@ let cmd = {
 #[cfg(not(windows))]
 let cmd = {
     let mut c = std::process::Command::new("sh");
-    c.args(["-c", "sleep 60"]);
+    c.args(["-c", "exec sleep 60"]);
     c
 };
 let pid = rt.run_blocking(dx::spawn(cmd)).unwrap();

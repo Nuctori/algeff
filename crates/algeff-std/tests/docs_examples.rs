@@ -11,6 +11,7 @@
 //! - `docs_lock_reentrant`            ⇔ example.md「锁：同 id 可重入」
 //! - `docs_signal_repeatable`         ⇔ example.md「信号：可重复发送」
 //! - `docs_tcp_echo_do`               ⇔ example.md「TCP echo do_! 版」
+//! - `docs_first_program_pure`        ⇔ getting-started.md「最小蓝图（plan!）」
 
 use std::net::Shutdown;
 use std::time::Duration;
