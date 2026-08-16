@@ -1,8 +1,10 @@
-# DX 语法糖层设计（迭代 1）：`do_!` 宏 + `dx` 模块
+# DX 语法糖层设计（迭代 1→2）：`do_!` 宏 + `dx` 模块
 
-> 范围：迭代 1 只提供「顺序命令式」语法糖。控制流（`plan!`/`fork!`/`scope!`/
-> `choose!`）与错误处理（`Action::Catch`）沿用既有机制；**不引入任何新 Action
-> 节点**。冻结面（algeff-core 的 `action.rs`/`error.rs`/`syscall.rs`/`lib.rs`、
+> 范围：迭代 1 提供「顺序命令式」语法糖；迭代 2（本迭代）深化 DX 层——
+> 错误处理 `dx::catch`、DataOp → dx 包装全覆盖（munmap/send_file/dup2 补齐）、
+> 新示例测试。控制流（`plan!`/`fork!`/`scope!`/`choose!`）与错误处理
+> （`Action::Catch`）沿用既有机制；**不引入任何新 Action 节点**。冻结面
+> （algeff-core 的 `action.rs`/`error.rs`/`syscall.rs`/`lib.rs`、
 > `contracts.md`、`pdr.md`）零改动——本设计全部落在 A5 域纯增量层
 > （`algeff-macro` 新宏 + `algeff-std::dx` 新模块 + 示例测试）。
 
@@ -15,7 +17,11 @@
    无手动 `Box::new`/闭包嵌套/资源声明样板；
 2. **资源 usage 自动推导**：op → usage 模式表（`infer_usage`），
    显式声明可覆盖（`syscall_with`）；
-3. **不碰冻结面**：核心零改动，宏为纯 AST 构造。
+3. **不碰冻结面**：核心零改动，宏为纯 AST 构造；
+4. **错误处理命令式化**（迭代 2）：`do_!` 内用 `dx::catch(action, |e| …)`
+   捕获链内错误——`Action::Catch` 的 dx 级便捷包装，运行时语义零改动；
+5. **DataOp 全覆盖**（迭代 2）：每个 `DataOp` 都有 `dx` 预包装操作
+   （迭代 2 补齐 munmap/send_file/dup2）。
 
 ### 1.2 三条不变量（哲学底线，与 pdr.md §八/§13 对齐）
 
@@ -102,6 +108,36 @@ do_! {                         手写等价（局部 CPS）
 空集意味着「新句柄不参与冲突检测」，与 `adapters` 既有行为一致，
 不改变契约语义。
 
+### 3.4 错误处理语法：`dx::catch`（迭代 2 新增）
+
+`do_!` 内的错误路径经 `dx::catch(action, handler)` 表达——`Action::Catch`
+的 dx 级便捷包装（纯构造，无新节点、运行时零改动）：
+
+```rust
+let blueprint = do_! {
+    let fd = dx::catch(
+        dx::open(&missing, flags),
+        move |e| {
+            // handler: SysError → 替代 Action
+            assert!(matches!(e, SysError::NotFound));
+            dx::open(fb.clone(), create_flags)
+        },
+    );
+    dx::write(&fd, b"recovered".to_vec());
+    // …
+};
+```
+
+语义（与手写 `Action::Catch { action, handler }` 完全一致，见 runtime.rs）：
+
+- `action` 失败时，运行时把 `SysError` 交给 `handler`（`FnOnce(SysError) -> Action`），
+  handler 返回的 Action 继续执行，其值成为 catch 表达式的结果值；
+- `action` 成功时值**原样贯穿**，`handler` 不执行；
+- Catch **仅处理错误值**，不触碰撤销栈（recover 语义仍在 Replace/recover 路径）——
+  需整体回滚时用 `Replace` 包裹，二者职责不变；
+- handler 需 `+ Send + 'static`：捕获的外部数据 clone 后 `move` 进闭包；
+  替代 Action 可为 `do_!`/`plan!`/`dx::unit()` 等任意返回 `Action` 的表达式。
+
 ## 4. 方案对比
 
 | 方案 | 描述 | 优点 | 缺点 | 结论 |
@@ -111,6 +147,7 @@ do_! {                         手写等价（局部 CPS）
 | C：自定义 DSL + 新 Action 节点 | 引入 While/For/Try 等节点 | 表达力更强 | 破坏冻结面；冲突检测/撤销/推导全表需重设计 | 拒绝（需 RFC 另立） |
 | D：op 级操作宏 `open!`/`write!`/`read!`/`close!` | 运算符风格调用 | 更短 | `write!` 与 `std::write!` 名冲突是硬伤（同块内 shadowing 破坏 fmt 宏）；函数调用已足够接近普通 Rust | 拒绝（迭代 1；如未来需要可改名 `dx_write!` 等再议） |
 | E：async/await 式 EDSL | `let fd = dx::open(p).await?` | 最像普通 Rust | 引入非确定性/隐式运行时依赖；与「蓝图 = 数据、可静态分析」承诺冲突 | 拒绝 |
+| F：`catch!` 宏 vs `dx::catch` 函数（迭代 2） | `catch(action, \|e\| handler)` → `Action::Catch`（函数包装） | 与 ops-as-functions 决策一致（方案 D）；无宏解析器负担；do_! 内天然可读、可嵌套 | 比宏多一层函数名 | **采用 `dx::catch`**（`catch!` 宏同理被方案 D 理由拒绝：宏职责最小化，函数调用已足够接近普通 Rust） |
 
 ## 5. 选型理由
 
@@ -133,7 +170,7 @@ do_! {                         手写等价（局部 CPS）
    `plan_wraps_do_blocks` 即按此写法。如后续需要自由捕获，可给 `plan!`
    增加 `move` 变体（属宏语义变更，需独立决策）。
 
-## 6. 验证证据（tests/dx_examples.rs，9 项全绿）
+## 6. 验证证据（tests/dx_examples.rs，15 项全绿）
 
 | 测试 | 验证的承诺 |
 | --- | --- |
@@ -147,17 +184,39 @@ do_! {                         手写等价（局部 CPS）
 | `explicit_override_wins_over_inference` | `syscall_with` 显式声明覆盖自动推导 |
 | `empty_block_and_discard_statement` | 空块 → `Pure(Unit)`；`let _ = e;` 丢弃语句 |
 
+迭代 2 新增：
+
+| 测试 | 验证的承诺 |
+| --- | --- |
+| `file_ops_comprehensive_roundtrip` | 一个 do_! 覆盖 Mkdir/Open/Write/Seek/Read/Stat/Close/Unlink，尾值组合 List，真实执行 + stat 断言 + unlink 生效 |
+| `tcp_bind_accept_skeleton` | bind → accept → close 骨架：结构断言（TcpBind 空集资源、accept 值流贯穿）+ bind 真实执行（accept 需并发客户端，不跑） |
+| `catch_handles_error_and_continues` | Open 缺失文件失败 → handler 收 NotFound → 替代 Action 继续，值贯通（真实落盘） |
+| `catch_success_passthrough_skips_handler` | 成功路径 handler 不执行、值原样贯穿（误执行会因 expect_fd panic 而测试失败） |
+| `do_plan_fork_mix` | do_! 内嵌 plan!（声明式子步骤）+ fork!（并发分叉写不同文件），真实执行双文件落盘 |
+| `remaining_op_wrappers_construct_syscall_nodes` | munmap/send_file/dup2 包装构造 + infer_usage 自动推导资源断言 |
+
 ## 7. 已知限制与后续迭代
 
 - `let` 不支持解构模式（标识符/通配之外报编译期错误）；
 - 分支/循环体多条语句需嵌套 `do_!` 块（或未来 While/For 节点——需 RFC）；
-- `Action::Catch` 尚无 `dx` 级便捷包装：错误路径当前经 `run*` 返回
-  `SysError` 上抛（测试已验证），`dx::catch` 可作为后续迭代；
+- **错误处理现经 `dx::catch`（§3.4）**：recover（撤销栈）语义仍在 Replace/recover
+  路径，Catch 只处理错误值——职责边界以 runtime.rs 为准；
+- **do_! 链内外部路径引用的捕获规则**：引用出现在闭包体内即被 `move` 闭包捕获，
+  需 `'static`——链内多处使用的路径请 clone 后 move（示例见
+  `file_ops_comprehensive_roundtrip` 的 `fc`）；
+- **plan!/fork! 内嵌 do_! 需预构建 Action 值**（plan! continuation 闭包非 move、
+  do_! 展开闭包要求 'static），与 `plan_wraps_do_blocks` 同模式；
+- **plan! 元素值被忽略**：plan! 链收敛为 `Pure(Unit)`，需值传递时用 do_! 作外层
+  （见 `do_plan_fork_mix`）；
+- **TCP accept 真实执行需并发客户端**：骨架测试只构造 + bind 执行；完整 echo
+  链路见 `tests/e2e.rs`；
+- **操作保持函数形态（方案 D 重申，迭代 2 未引入 `open!` 等操作宏）**：`write!`
+  与 `std::write!` 名冲突是硬伤，函数调用已足够接近普通 Rust；
 - 空集推导的操作（TcpBind/Spawn 等）其新句柄声明留给用户责任域，文档已注明。
 
 ## 文档入口
 
 - 本设计：`docs/src/dx-design.md`
-- 运行时支撑与推导表：`crates/algeff-std/src/dx.rs`（rustdoc）
+- 运行时支撑与推导表：`crates/algeff-std/src/dx.rs`（rustdoc，含 `dx::catch` 用法）
 - 宏展开语义：`crates/algeff-macro/src/lib.rs`（`do_!` rustdoc）
 - 示例测试：`crates/algeff-std/tests/dx_examples.rs`
