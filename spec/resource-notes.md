@@ -700,3 +700,18 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   检查处立即返回 CANCELLED_ERR（零次执行）。文档化语义陷阱 + 补鉴别 API。
 - **R3-G [LOW] 线性快照全量克隆**：每个墙钟 Timeout 臂入口克隆 consumed/owned_consumed
   （嵌套 O(depth×|marks|)，未超时臂克隆即弃）。修复方向：延迟克隆/COW。
+- **R3-H [LOW] op_write Full-undo 写前读无上限**（R2 res.md #2 半修项补登）：op_mmap 已修
+  （R3-① 同批），op_write 的 Full 撤销路径 `vec![0u8; data.len()]` 无 MAX_IO_LEN 检查
+  （data 由用户持有、写前读复制为 2× 峰值内存；仅在 data.len() < FULL_UNDO_MAX_BYTES(1MB)
+  时触发——实际上限已受 1MB 门槛约束，属文档化残余）。修复方向：登记即豁免（已有 1MB
+  门槛）。
+
+### R3-B 已修复（终轮，测试驱动）
+
+**嵌套 Timeout 复合外层取消令牌**（r3ab.md 设计二实施）：`wait_timeout` 增外层取消 OR 臂
+（`outer: Option<&watch::Receiver<bool>>`）——外层广播经两跳（外层 fire → 本层 OR 臂 →
+自身通道广播）打断嵌套 wait，取消穿透结构化嵌套；无外层时臂恒 pending。TDD 测试：
+`interpreter.rs::timeout_nested_outer_cancel_interrupts_inner_wait`（修复前外层 on_timeout
+推迟至内层 deadline/宽限；修复后亚毫秒打断，实测 0.04s）。语义裁决（r3ab.md）：嵌套
+on_timeout 仍处取消域内（首个 action 即 CANCELLED_ERR）——保留取消域抑制语义（快速中止
+保证），可诊断性由 R3-F 负责。

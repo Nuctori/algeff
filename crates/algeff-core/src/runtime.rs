@@ -486,16 +486,7 @@ fn run_virtual_timeout<'a>(
             Ok(r) => {
                 let elapsed = ctx.virtual_clock_mut().map(|vc| vc.now()).unwrap_or(t0);
                 if elapsed >= deadline {
-                    run_sub_impl(
-                        on_timeout,
-                        ctx,
-                        undo,
-                        reg,
-                        access.reborrow(),
-                        depth,
-                        cancel,
-                    )
-                    .await
+                    run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth, cancel).await
                 } else {
                     r
                 }
@@ -559,23 +550,51 @@ async fn cancellable_sleep(duration: Duration, token: &mut CancelToken) {
 /// 宽限后返回 `CANCELLED_ERR`（近似同旧语义，但取消标志粘性使该分支在
 /// IO 完成后于下一 op 边界中止）。
 ///
+/// `outer`（审计 R3-B 修复）：嵌套 Timeout 的外层取消接收端——外层广播
+/// 经本 OR 臂打断本层 wait（事件驱动、两跳亚毫秒），取消穿透结构化嵌套；
+/// 无外层（顶层 Timeout）时该臂恒 pending。
+///
 /// **提取为独立 async fn 的原因**同 `cancellable_sleep`：隔离 `select!`
 /// 轮询栈帧，保护 RFC-11 深度守卫的栈预算。
 async fn wait_timeout<'a>(
     mut inner: LocalBoxFuture<'a, Result<Value, SysError>>,
     duration: Duration,
     cancel_tx: &tokio::sync::watch::Sender<bool>,
+    outer: Option<&tokio::sync::watch::Receiver<bool>>,
 ) -> (bool, Result<Value, SysError>) {
     let sleep = tokio::time::sleep(duration);
     tokio::pin!(sleep);
-    // 单次 select：两臂均直接返回（clippy never_loop 提示下不包 loop——
-    // 语义等价：inner 先完成 → 未超时；sleep 先到 → 广播取消后宽限等待）。
+    // 外层取消 OR 臂：有外层令牌时等其 changed()（粘性：已广播则立即 Ready）。
+    // changed() 需 &mut self——克隆接收端（Clone：独立 seen 状态，互不干扰）。
+    let cancel_outer = async {
+        match outer {
+            Some(o) => {
+                let mut o = o.clone();
+                let _ = o.changed().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(cancel_outer);
+    // 单次 select：各臂均直接返回（clippy never_loop 提示下不包 loop——
+    // 语义等价：inner 先完成 → 未超时；sleep/外层取消先到 → 广播后宽限等待）。
     tokio::select! {
         r = &mut inner => (false, r),
         _ = &mut sleep => {
             // 广播取消：并行 Fork 分支检查后快速返回（join 见下）。
             let _ = cancel_tx.send(true);
             // 有界宽限：等待并行分支把部分状态/undo 合并回父。
+            let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
+            tokio::pin!(grace);
+            tokio::select! {
+                r = &mut inner => (true, r),
+                _ = &mut grace => (true, Err(CANCELLED_ERR)),
+            }
+        }
+        _ = &mut cancel_outer => {
+            // 外层取消（R3-B）：嵌套 Timeout 被外层广播打断——同超时路径：
+            // 广播自身取消 + 有界宽限 join。
+            let _ = cancel_tx.send(true);
             let grace = tokio::time::sleep(CANCEL_JOIN_GRACE);
             tokio::pin!(grace);
             tokio::select! {
@@ -632,7 +651,11 @@ async fn run_wall_timeout<'a>(
         depth,
         Some(&mut token),
     );
-    let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx).await;
+    // 审计 R3-B 修复：外层取消接收端透传给 wait_timeout（嵌套 Timeout 的
+    // wait 被外层广播打断——取消穿透结构化嵌套）。外层 token 的 rx 与
+    // 本层 token 同源类型（watch::Receiver），直接取 `cancel.rx` 引用。
+    let outer_rx = cancel.as_deref().map(|c| &c.rx);
+    let (timed_out, inner_result) = wait_timeout(inner_fut, duration, &cancel_tx, outer_rx).await;
     if !timed_out {
         // 超时前完成：inner 效果全部保留（原语义）。
         return inner_result;

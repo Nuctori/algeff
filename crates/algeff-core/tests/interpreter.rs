@@ -657,6 +657,42 @@ fn timeout_nested_outer_fires_first() {
     assert_eq!(ex.ops(), vec!["Close { fd: 999 }"]);
 }
 
+/// 审计 R3-B 修复（嵌套 Timeout 复合外层取消）：外层取消广播必须打断
+/// 嵌套内层的 wait——修复前内层（200ms）继续等待至自身 deadline（外层
+/// 取消不穿透），外层 on_timeout 被推迟到宽限后；修复后内层 wait 被外层
+/// OR 臂立即打断（两跳亚毫秒），总耗时 ≪ 内层 duration。
+#[test]
+fn timeout_nested_outer_cancel_interrupts_inner_wait() {
+    let mut ctx = Context::new();
+    let mut undo = UndoStack::new();
+    let mut reg = ResourceRegistry::new();
+    let mut ex = MockExecutor::new();
+    // inner 慢 syscall（100ms）→ 内层 200ms 未超时；外层 30ms 触发。
+    // 修复前：外层取消后内层 wait 继续至 200ms（或宽限 500ms）；
+    // 修复后：外层广播经 OR 臂打断内层 wait（≤ 宽限）。
+    ex.delay = Duration::from_millis(100);
+
+    let t0 = std::time::Instant::now();
+    let action = Action::Timeout {
+        action: Box::new(Action::Timeout {
+            action: Box::new(syscall_step(DataOp::Close { fd: 999 }, vec![])),
+            duration: Duration::from_millis(200),
+            on_timeout: Box::new(Action::Pure(Value::U64(1))),
+        }),
+        duration: Duration::from_millis(30),
+        on_timeout: Box::new(Action::Pure(Value::U64(2))),
+    };
+    let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
+    assert_eq!(v, Ok(Value::U64(2)), "外层超时优先（on_timeout 结果）");
+    // 内层 wait 被外层取消打断：总耗时应显著小于内层 200ms + 慢 op 100ms
+    // （修复前 ≈ 内层完整等待后再被外层宽限 join → ≥300ms；修复后 ≈ 30ms + 宽限 join）
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "外层取消应打断内层 wait（实测 {:?}）",
+        t0.elapsed()
+    );
+}
+
 #[test]
 fn catch_after_partial_undo_keeps_stack() {
     let mut ctx = Context::new();

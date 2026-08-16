@@ -2051,28 +2051,19 @@ mod tests {
                 ..Default::default()
             },
         };
-        let (v, _) = ex
-            .execute(&op, &mut reg)
-            .await
-            .expect("父侧 Open");
+        let (v, _) = ex.execute(&op, &mut reg).await.expect("父侧 Open");
         let fd = match v {
             Value::Fd(f) => f,
             other => panic!("期望 Fd，得到 {other:?}"),
         };
         // 快照侧同 fd 读（共享 files 表与 per-fd 锁）。
         let op = DataOp::Read { fd, len: 5 };
-        let (v, _) = snap
-            .execute(&op, &mut reg)
-            .await
-            .expect("快照共享 fd 读取");
+        let (v, _) = snap.execute(&op, &mut reg).await.expect("快照共享 fd 读取");
         assert_eq!(v, Value::Bytes(b"hello".to_vec()));
         // 父侧再读：同 fd 游标已推进 → EOF（快照与父共享 per-fd 锁/游标，
         // 游标语义串行不变）。
         let op = DataOp::Read { fd, len: 5 };
-        let (v2, _) = ex
-            .execute(&op, &mut reg)
-            .await
-            .expect("父共享 fd 读取");
+        let (v2, _) = ex.execute(&op, &mut reg).await.expect("父共享 fd 读取");
         assert_eq!(v2, Value::Bytes(vec![]), "同 fd 游标共享：快照读后父读 EOF");
     }
 }

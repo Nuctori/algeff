@@ -695,18 +695,20 @@ fn remaining_op_wrappers_construct_syscall_nodes() {
     );
 }
 
-/// 审计 R4-F1 修复：TcpShutdown 推导为 Own（终结语义）——write→shutdown
-/// 半关闭链不再被 A4 误拒（Write 声明会与 tcp_write 的 Write 消费冲突）。
+/// 审计 R4-F1 + R7 修复：TcpShutdown 推导为**空集**——(a) Write 声明与
+/// tcp_write 消费冲突（A4 至多一次）→ 误拒 write→shutdown 合法链；(b) Own
+/// 声明是终结语义 → 拒绝后续 close（shutdown→close 标准链被误拒，R7 审计）。
+/// shutdown 为半关闭、不终结 fd，无 A4 消费语义——空声明，物理层执行。
 #[test]
-fn tcp_shutdown_declares_own_not_write() {
+fn tcp_shutdown_declares_empty_not_own() {
     let a = dx::tcp_shutdown(&Value::Fd(9), std::net::Shutdown::Write);
     let Action::Syscall { resources, .. } = &a else {
         panic!("tcp_shutdown 应构造 Syscall 节点");
     };
     assert_eq!(
         resources,
-        &vec![usage(f(9), AccessMode::Own)],
-        "TcpShutdown 应声明 Own（对齐 e2e ow(sfd) 先例）"
+        &vec![],
+        "TcpShutdown 应声明空集（非 Own 非 Write——半关闭不终结 fd）"
     );
 }
 
@@ -724,7 +726,11 @@ fn mutex_lock_cycle_reentrant_via_dx() {
         }),
     };
     let v = r.run_blocking(blueprint).unwrap();
-    assert_eq!(v, Value::Unit, "锁循环可重入（修复前第二次 lock InvalidInput）");
+    assert_eq!(
+        v,
+        Value::Unit,
+        "锁循环可重入（修复前第二次 lock InvalidInput）"
+    );
     // 清理：解锁 + 无残留
     r.run_blocking(Action::Sequential {
         current: Box::new(dx::mutex_unlock(5)),

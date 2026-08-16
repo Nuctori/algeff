@@ -126,10 +126,12 @@ pub fn infer_usage(op: &DataOp) -> ResourceSet {
         DataOp::TcpAccept { listener } => vec![fd_usage(*listener, AccessMode::Read)],
         DataOp::TcpRead { fd, .. } => vec![fd_usage(*fd, AccessMode::Read)],
         DataOp::TcpWrite { fd, .. } => vec![fd_usage(*fd, AccessMode::Write)],
-        // 审计 R4-F1 修复：TcpShutdown 声明 Own（终结语义）而非 Write——
-        // write→shutdown 是标准半关闭链，Write 声明会与 tcp_write 的 Write
-        // 消费冲突（A4 至多一次）→ 误拒合法蓝图（对齐 e2e.rs 的 ow(sfd) 先例）。
-        DataOp::TcpShutdown { fd, .. } => vec![fd_usage(*fd, AccessMode::Own)],
+        // 审计 R4-F1 + R7 修复：TcpShutdown 声明**空集**——(a) Write 声明会与
+        // tcp_write 的 Write 消费冲突（A4 至多一次）→ 误拒 write→shutdown 合法链；
+        // (b) Own 声明是终结语义，会拒绝后续 close（shutdown→close 标准链被 A4
+        // 误拒）。shutdown 为半关闭、不终结 fd，无 A4 消费语义——空声明，物理层
+        // 执行；显式声明场景用 syscall_with 覆盖（对齐 e2e.rs 的 ow(sfd) 先例）。
+        DataOp::TcpShutdown { .. } => vec![],
         // 网络 UDP
         DataOp::UdpBind { .. } => vec![],
         DataOp::UdpRecvFrom { fd, .. } => vec![fd_usage(*fd, AccessMode::Read)],
