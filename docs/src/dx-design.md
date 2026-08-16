@@ -82,6 +82,7 @@ do_! {                         手写等价（局部 CPS）
 | `Rename` | Write(from) + Write(to) |
 | `TcpRead` / `UdpRecvFrom` | Read(fd) |
 | `TcpWrite` / `UdpSendTo` / `Dup` | Write(fd) |
+| `TcpShutdown` | 空集（半关闭不终结 fd，A4 不消费；显式声明用 `syscall_with` 覆盖） |
 | `TcpAccept` | Read(listener) |
 | `Kill` | Write(pid) |
 | `SendSignal` | 空集（Signal 全局资源无仲裁层；二次发送允许——SIGTERM→SIGKILL 优雅停机模式，A4 不消费，成败由物理层决定） |
