@@ -661,6 +661,7 @@ fn timeout_nested_outer_fires_first() {
 /// 嵌套内层的 wait——修复前内层（200ms）继续等待至自身 deadline（外层
 /// 取消不穿透），外层 on_timeout 被推迟到宽限后；修复后内层 wait 被外层
 /// OR 臂立即打断（两跳亚毫秒），总耗时 ≪ 内层 duration。
+#[test]
 fn timeout_nested_outer_cancel_interrupts_inner_wait() {
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();
