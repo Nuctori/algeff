@@ -1027,67 +1027,46 @@ fn err_dup_io_error_10_consecutive_ops() {
         .unwrap();
     let rfd2 = fd_of(&v);
 
-    // 连续 10 次：读被 Dup 共享的读端 → InvalidInput（非 NotFound），
-    // 每次错误后 put_back 恢复注册表条目与内部映射
+    // 未 Dup 的写端不受影响：一次写 10 字节（A4 线性：同一 fd Write 至多一次）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: wfd,
+            data: b"abcdefghij".to_vec(),
+        },
+        vec![wr(wfd)],
+        Action::Pure,
+    ))
+    .unwrap();
+
+    // 连续 10 次 IO 循环（RFC-07 修复翻转：原锁定为 10 次错误循环
+    // InvalidInput——修复后 Dup 共享同一 Arc<Mutex<ReadHalf>>，lock 下
+    // IO 合法）：原 fd 与 dup fd 交替读同一缓冲区，字节序完整。
     for i in 0..10 {
-        let e = rt
+        let fd = if i % 2 == 0 { rfd } else { rfd2 };
+        let v = rt
             .run_blocking(syscall(
-                DataOp::Read { fd: rfd, len: 1 },
-                vec![rd(rfd)],
+                DataOp::Read { fd, len: 1 },
+                vec![rd(fd)],
                 Action::Pure,
             ))
-            .unwrap_err();
+            .unwrap();
         assert_eq!(
-            e,
-            SysError::InvalidInput,
-            "第 {i} 次：Dup 共享读应 InvalidInput（句柄可寻址）而非 NotFound"
+            v,
+            Value::Bytes(vec![b'a' + i as u8]),
+            "第 {i} 次：Dup 共享读端交替可 IO（句柄可寻址可读写）而非 NotFound"
         );
     }
 
-    // 未 Dup 的写端不受影响：一次写成功（A4 线性：同一 fd Write 至多一次）
-    let v = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd: wfd,
-                data: b"ping".to_vec(),
-            },
-            vec![wr(wfd)],
-            Action::Pure,
-        ))
-        .unwrap();
-    assert_eq!(v, Value::Unit, "写端写成功");
-
-    // dup 端同样稳定可寻址
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Read { fd: rfd2, len: 1 },
-            vec![rd(rfd2)],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(e, SysError::InvalidInput);
-
-    // 关闭 dup 释放共享 → 原 fd 恢复真实可读（10 次 put_back 轮换后映射仍正确）
+    // 关闭 dup 释放共享 → 原 fd 仍可寻址（映射未被 IO 路径吞掉）
     rt.run_blocking(syscall(
         DataOp::Close { fd: rfd2 },
         vec![ow(rfd2)],
         Action::Pure,
     ))
     .unwrap();
-    let v = rt
-        .run_blocking(syscall(
-            DataOp::Read {
-                fd: rfd,
-                len: "ping".len(),
-            },
-            vec![rd(rfd)],
-            Action::Pure,
-        ))
-        .unwrap();
-    assert_eq!(
-        v,
-        Value::Bytes(b"ping".to_vec()),
-        "原 fd 经 10 次错误循环后仍可读"
+    assert!(
+        rt.registry().lookup(rfd).is_some(),
+        "原 fd 经 10 次 IO 循环与 dup 关闭后仍可寻址"
     );
 
     // 全部 fd 正常 Close（映射未被错误路径吞掉）

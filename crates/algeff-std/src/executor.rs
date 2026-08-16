@@ -281,6 +281,14 @@ impl<H> Drop for TakeHandleGuard<'_, H> {
 /// 上串行（游标语义不变），互斥锁/仲裁器/句柄映射跨分支一致（与 D17 共享执行器
 /// 等价）。映射锁全部为同步短临界区（clone Arc / 查表 / 插入），绝不在持锁期间
 /// await（与 arbiter 的 A5 批 9 同理由）；`expect`：临界区无 panic 源，中毒不可达。
+/// 管道半端工作对象表类型（RFC-07 文件式双表）：key = 逻辑 fd（不轮换），
+/// value = 共享 `Arc<Mutex<半端>>`（registry 句柄与工作表存同一 Arc，Dup/Fork
+/// 共享下 lock 可用）。
+type PipeReaderMap =
+    HashMap<u64, Arc<tokio::sync::Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>>>;
+type PipeWriterMap =
+    HashMap<u64, Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>>;
+
 #[derive(Debug)]
 pub struct TokioExecutor {
     /// 子进程 pid → 注册表 fd（Wait/Kill 经此定位；注册表 fd 随 take/allocate 轮换）。
@@ -302,11 +310,9 @@ pub struct TokioExecutor {
     /// fd）；registry 句柄 `PipeReader` 存同一 `Arc<Mutex<ReadHalf>>`。Dup/Fork
     /// （D13 registry Clone）共享该 Arc 时 lock 可用 —— 修复前依赖
     /// `Arc::get_mut` 独占（take/put_back 轮换），共享下必然 InvalidInput。
-    pipe_readers:
-        Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>>>>>,
+    pipe_readers: Arc<std::sync::Mutex<PipeReaderMap>>,
     /// 管道写端工作对象（RFC-07 文件式双表，同 `pipe_readers`）。
-    pipe_writers:
-        Arc<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>>>>,
+    pipe_writers: Arc<std::sync::Mutex<PipeWriterMap>>,
 }
 
 impl Default for TokioExecutor {
@@ -1606,22 +1612,18 @@ impl TokioExecutor {
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .remove(&fd)
             .is_some()
-        {
-            reg.remove(fd);
-        } else if self
-            .pipe_readers
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&fd)
-            .is_some()
-        {
-            reg.remove(fd);
-        } else if self
-            .pipe_writers
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .remove(&fd)
-            .is_some()
+            || self
+                .pipe_readers
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&fd)
+                .is_some()
+            || self
+                .pipe_writers
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .remove(&fd)
+                .is_some()
         {
             reg.remove(fd);
         } else if reg.take(fd).is_some() {

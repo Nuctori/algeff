@@ -8,8 +8,8 @@
   - spec/proof-obligations.md
 
 事实集合（canonical = 实测 + main 33704cc 统一口径，supervisor 已裁决）：
-  1. 测试计数：418 个测试函数（约 405 二进制 + 13 doc-test），50 个测试二进制 + 3 个 doc-test 运行
-  2. 对抗 E2E：186 个（R1-R6=167、R7=15、R7AB=4；旧口径 120/125/157/162/164/182 均不得出现）
+  1. 测试计数：435 个测试函数（约 422 二进制 + 13 doc-test），51 个测试二进制 + 3 个 doc-test 运行
+  2. 对抗 E2E：203 个（R1-R6=167、R7=15、R7AB=4、R8=17；旧口径 120/125/157/162/164/182 均不得出现）
   3. RFC-10 状态：已修复
   4. RFC-11 状态：已修复（深度守卫阈值 96 → 迭代 1 复测裁决 64）
   5. CI 三平台：ubuntu / windows / macos
@@ -70,13 +70,13 @@ def main():
             check_absent(p, t, "测试计数", stale)
         # 新口径应存在（至少一处）
         if any(s in t for s in ("测试函数", "测试全绿", "测试二进制")):
-            if "418 个测试函数" not in t and "418 测试全绿" not in t:
-                issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「410」")
+            if "435 个测试函数" not in t and "435 测试全绿" not in t:
+                issues.append(f"[{p}] 提及测试计数但缺少 canonical 口径「435」")
 
         # E2E 正向门禁：提及 E2E 计数即须含 canonical 164
         if any(s in t for s in ("个 E2E", "E2E 测试", "对抗 E2E")):
-            if "186" not in t:
-                issues.append(f"[{p}] 提及对抗 E2E 但缺少 canonical 口径「186」")
+            if "203" not in t:
+                issues.append(f"[{p}] 提及对抗 E2E 但缺少 canonical 口径「203」")
 
     # ---- 2. RFC-10 状态：提及即须体现已修复 ----
     for p in FILES:
@@ -156,7 +156,7 @@ def main():
         for i in issues:
             print(" -", i)
         return 1
-    print("=== 核对通过：四处文档在 7 组事实集合上一致（418/50+3 口径）===")
+    print("=== 核对通过：四处文档在 7 组事实集合上一致（435/51+3 口径）===")
     return 0
 
 
