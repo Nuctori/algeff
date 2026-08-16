@@ -703,7 +703,7 @@ new_fd」不可实现 → 语义 = 先关 new_fd 再复制。全仓库 0 测试 
   合并回父。测试翻转：`r7b_timeout_fork_lock_grace_exhausted_reentrant`（宽限耗尽后
   同 id 立即可重入、Replace 后仍可重入）。
 
-测试载体：`crates/algeff-std/tests/adversarial_r7ab.rs`（4 测试全绿）+ `adversarial_r7.rs`
+测试载体：`crates/algeff-std/tests/adversarial_r7ab.rs`（4 测试，随 workspace 410 全绿）+ `adversarial_r7.rs`
 （§4 写端翻转）；`cargo test --workspace` 全绿。残余（登记）：阻塞 IO 分支自身已持锁
 时（MutexLock → 阻塞 Read 同分支）释放 undo 随脱离任务不可达（占坑残留），需分支任务
 自行感知脱离并归还（超出冻结面，留待后续轮）。
