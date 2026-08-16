@@ -1,4 +1,5 @@
-//! DX 语法糖层（迭代 1）：命令式 `do_!` 宏的运行时支撑 + 资源自动推导。
+//! DX 语法糖层（迭代 1→2）：命令式 `do_!` 宏的运行时支撑 + 资源自动推导 +
+//! 错误处理（`dx::catch`）。
 //!
 //! 本模块是 **A5 域纯增量层**：冻结面（algeff-core 的 action/error/syscall/
 //! lib、contracts.md、pdr.md）零改动。哲学底线不变：
@@ -40,9 +41,10 @@
 //! ```
 //!
 //! `do_!` 块内 **任何返回 `Action` 的表达式** 都可用作语句
-//! （含 `plan!`/`scope!`/`choose!`/嵌套 `do_!`），不限于本模块的操作；
+//! （含 `plan!`/`scope!`/`choose!`/嵌套 `do_!`/`dx::catch(...)`），不限于本模块的操作；
 //! 本模块提供的是「按 `DataOp` 自动推导资源」的预包装操作 + `&Value`
 //! 句柄传参（do_! 的 `let` 绑定的是原始 `Value`）。
+//! 迭代 2：补齐 DataOp 全覆盖（munmap/send_file/dup2）+ `dx::catch` 错误处理。
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -50,7 +52,7 @@ use std::time::Duration;
 
 use algeff_core::{
     AccessMode, Action, Bytes, DataOp, Fd, MmapProt, OpenFlags, Pid, PipeFlags, Resource,
-    ResourceSet, ResourceUsage, Signal, Value,
+    ResourceSet, ResourceUsage, Signal, SysError, Value,
 };
 
 pub use crate::adapters::{and_then, seq, then};
@@ -348,9 +350,33 @@ pub fn mmap(path: impl AsRef<Path>, len: usize, prot: MmapProt) -> Action {
     })
 }
 
+/// 解除内存映射（no-op 语义，资源空集）。
+pub fn munmap(addr: usize, len: usize) -> Action {
+    syscall(DataOp::Munmap { addr, len })
+}
+
 /// 复制 fd（共享同一句柄）。
 pub fn dup(fd: &Value) -> Action {
     syscall(DataOp::Dup { fd: expect_fd(fd) })
+}
+
+/// 把 `old_fd` 复制到 `new_fd`（决策 D1 降级语义：fd 单调分配永不复用，
+/// 结果 fd 恒 ≠ new_fd——「先关 new_fd，再复制到新 fd」，见 tests/executor.rs a2）。
+pub fn dup2(old_fd: &Value, new_fd: Fd) -> Action {
+    syscall(DataOp::Dup2 {
+        old_fd: expect_fd(old_fd),
+        new_fd,
+    })
+}
+
+/// 零拷贝：从 input fd 向 out fd 复制 offset 起 len 字节（返回 Unit）。
+pub fn send_file(out: &Value, input: &Value, offset: usize, len: usize) -> Action {
+    syscall(DataOp::SendFile {
+        out: expect_fd(out),
+        input: expect_fd(input),
+        offset,
+        len,
+    })
 }
 
 // 目录
@@ -507,5 +533,48 @@ pub fn sleep(duration: Duration) -> Action {
     Action::Sleep {
         duration,
         next: Box::new(Action::Pure),
+    }
+}
+
+// ── 错误处理（Action::Catch 的 dx 级便捷包装）─────────────────────────
+
+/// 捕获链内错误：`action` 失败时把 `SysError` 交给 `handler` 生成替代 Action
+/// 继续，成功时值原样贯穿（handler 不执行）。
+///
+/// 语义与手写 `Action::Catch { action, handler }` 完全一致（纯构造包装，
+/// 无新节点、运行时零改动）：Catch **仅处理错误值**，不触碰撤销栈
+/// （recover 语义仍在 Replace/recover 路径，见 runtime.rs）。
+///
+/// 用法（do_! 内）：
+/// ```rust
+/// # use algeff_core::prelude::*;
+/// # use algeff_core::OpenFlags;
+/// # use algeff_macro::do_;
+/// # use algeff_std::dx;
+/// let path = std::path::PathBuf::from("missing.txt");
+/// let fallback = std::path::PathBuf::from("fallback.txt");
+/// let blueprint: Action = do_! {
+///     let fd = dx::catch(
+///         dx::open(&path, OpenFlags { read: true, ..Default::default() }),
+///         move |_e| dx::open(fallback.clone(), OpenFlags {
+///             read: true,
+///             write: true,
+///             create: true,
+///             ..Default::default()
+///         }),
+///     );
+///     dx::close(&fd);
+///     Value::Unit
+/// };
+/// assert!(matches!(blueprint, Action::Sequential { .. }));
+/// ```
+///
+/// handler 需 `FnOnce(SysError) -> Action + Send + 'static`（捕获的外部数据
+/// 请 clone 后 `move` 进闭包）；替代 Action 可为 `do_!`/`plan!`/`dx::unit()`
+/// 等任意返回 `Action` 的表达式。
+pub fn catch(action: Action, handler: impl FnOnce(SysError) -> Action + Send + 'static) -> Action {
+    Action::Catch {
+        action: Box::new(action),
+        handler: Box::new(handler),
     }
 }
