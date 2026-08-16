@@ -755,7 +755,7 @@ fn rfc0809_cancel_join_grace_exhausted_path() {
     let elapsed = t0.elapsed();
     assert!(
         elapsed >= Duration::from_millis(450) && elapsed < Duration::from_millis(1400),
-        "超宽限丢弃：UDP recv_from 为裸 await 不可取消 IO → 分支阻塞至宽限耗尽（≈530ms；elapsed={elapsed:?}）。对比态：r7ab Sleep/管道 IO 可取消 → 快速 join（两态可分离，D-085）"
+        "超宽限丢弃：UDP recv_from 为裸 await 不可取消 IO → 分支阻塞至宽限耗尽（≈530ms；elapsed={elapsed:?}）。对比态：r7ab Sleep 可取消 → 快速 join；管道读同 UDP 不可取消 → 同样耗尽（两态可分离，D-085）"
     );
     assert!(rt.undo_stack().is_empty(), "取消路径不产生 undo");
 
