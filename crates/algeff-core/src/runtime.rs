@@ -794,6 +794,11 @@ fn collect_syscall_resources(action: &Action, out: &mut ResourceSet) {
         }
         Action::Catch { action, .. } => collect_syscall_resources(action, out),
         Action::Sequential { current, .. } => collect_syscall_resources(current, out),
+        // 审计 R7-D 修复：Invoke.captures 声明资源纳入静态冲突收集——此前
+        // 落 `_ => {}` 被静默丢弃，Fork 分支含 Invoke 且 captures 与兄弟分支
+        // 冲突时 can_parallel 误判 true → 真并行（captures 不经 check_linear，
+        // 影响限于 executor 侧物理效果冲突不可静态判定）。
+        Action::Invoke { captures, .. } => out.extend(captures.iter().cloned()),
         _ => {}
     }
 }
@@ -836,13 +841,23 @@ static FORK_FD_REGION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 取下一个全局唯一 fd 区间偏移（`k << 48`，k 全局唯一递增）。见
 /// [`FORK_FD_REGION_SEQ`] 的注释（上限 2^16 区间，超出即 u64 溢出）。
-fn fork_fd_region_offset() -> u64 {
+///
+/// 审计（收敛轮）：耗尽从 assert panic（进程级 abort、Catch 不可捕获，与
+/// RFC-11 修复前同类拒绝服务面）改为**可捕获错误** `Other(28)`（ENOSPC
+/// 「fd 区间空间耗尽」语义近似；`SysError` 冻结 14+Other，无专用哨兵）——
+/// 不受信任蓝图批量构造 Fork 不再能崩溃宿主进程。
+///
+/// 纯函数（测试直接构造 k 验证边界，不消耗全局 static 预算）。
+fn fork_region_offset_for(k: u64) -> Result<u64, SysError> {
+    if k >= (1 << 16) {
+        return Err(SysError::Other(28));
+    }
+    Ok(k << 48)
+}
+
+fn fork_fd_region_offset() -> Result<u64, SysError> {
     let k = FORK_FD_REGION_SEQ.fetch_add(1, Ordering::Relaxed);
-    assert!(
-        k < (1 << 16),
-        "Fork 全局 fd 区间序号耗尽（>2^16-1 个右分支）—— 静态计数上限"
-    );
-    k << 48
+    fork_region_offset_for(k)
 }
 
 /// R-6：分支执行器访问通道（锁内短临界区取快照）。
@@ -1103,7 +1118,7 @@ fn run_fork_parallel<'a>(
         let mut r_reg = reg.clone();
         // F1 修复：spawn 前取全局唯一 fd 区间 —— 右分支偏移 `k<<48`（k 全局唯一，
         // 见 `FORK_FD_REGION_SEQ` 注释），任意嵌套深度下并发分支区间互斥。
-        r_reg.offset_next_fd(fork_fd_region_offset());
+        r_reg.offset_next_fd(fork_fd_region_offset()?);
         let mut l_undo = UndoStack::new();
         let mut r_undo = UndoStack::new();
         let l_shared = shared.clone();
@@ -1327,7 +1342,7 @@ async fn interpret_impl(
                     // 成功/失败均合并（同并行路径「子任务错误仍合并」）。
                     let mut l_reg = reg.clone();
                     let mut r_reg = reg.clone();
-                    r_reg.offset_next_fd(fork_fd_region_offset());
+                    r_reg.offset_next_fd(fork_fd_region_offset()?);
                     let lv = run_sub_impl(
                         *left,
                         ctx,
@@ -1598,6 +1613,11 @@ pub type _BoxFutureAlias<'a, T> = BoxFuture<'a, T>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::{AccessMode, Resource};
+
+    fn usage(r: Resource, m: AccessMode) -> crate::resource::ResourceUsage {
+        crate::resource::ResourceUsage { resource: r, mode: m }
+    }
 
     /// R3-B 单元级防护（终审 Note-3）：直接构造**已广播**的外层取消接收端，
     /// 验证 `wait_timeout` 的 OR 臂打断嵌套 wait——行为回归（OR 臂被删/失效）
@@ -1626,5 +1646,64 @@ mod tests {
         );
         // 本层取消已广播：子树将响应。
         assert!(*tx.borrow(), "OR 臂触发后本层通道应已广播取消");
+    }
+
+    /// 收敛轮：fork 区间序号耗尽从 assert panic 改为可捕获错误（Other(28)，
+    /// ENOSPC 语义近似）——不受信任蓝图批量构造 Fork 不再能崩溃宿主进程。
+    /// 纯函数直接构造 k 验证边界（不消耗全局 static 预算，避免与并行
+    /// 运行的 Fork 测试竞争）。
+    #[test]
+    fn fork_region_seq_exhaustion_returns_error_not_panic() {
+        // 正常路径：k < 2^16 → 对齐区间偏移。
+        for k in [1u64, 5, (1 << 16) - 1] {
+            let off = fork_region_offset_for(k).expect("未耗尽前应 Ok");
+            assert_eq!(off, k << 48, "区间偏移对齐 k<<48");
+        }
+        // 耗尽边界：k ≥ 2^16 → 可捕获错误（而非 assert panic）。
+        for k in [1u64 << 16, (1u64 << 16) + 1, u64::MAX] {
+            assert_eq!(
+                fork_region_offset_for(k),
+                Err(SysError::Other(28)),
+                "k={k} 应返回可捕获错误（ENOSPC 语义）"
+            );
+        }
+    }
+
+    /// 审计 R7-D 修复：Invoke.captures 声明资源纳入 fork_conflict 静态收集——
+    /// 修复前落 `_ => {}` 被静默丢弃，captures 与兄弟分支资源冲突时 can_parallel
+    /// 误判 true（真并行执行器侧物理冲突）。
+    #[test]
+    fn fork_conflict_detects_invoke_captures() {
+        let reg = ResourceRegistry::new();
+        let inv = Action::Invoke {
+            foreign_id: 1,
+            captures: ResourceSet::from_iter([usage(Resource::Fd(7), AccessMode::Read)]),
+            yields: Default::default(),
+            deterministic: true,
+            next: Box::new(|_| Action::Pure(Value::Unit)),
+        };
+        let write_fd7 = Action::Syscall {
+            op: DataOp::Write {
+                fd: 7,
+                data: vec![],
+            },
+            resources: vec![usage(Resource::Fd(7), AccessMode::Write)],
+            next: Box::new(|_| Action::Pure(Value::Unit)),
+        };
+        // 左分支 Invoke 声明 Fd(7) captures，右分支 Write Fd(7) → 冲突（修复前误判可并行）。
+        assert!(
+            fork_conflict(&reg, &inv, &write_fd7),
+            "Invoke.captures 与兄弟分支冲突应静态检测（修复前误判并行）"
+        );
+        // 对照组：不同 fd 不冲突。
+        let write_fd8 = Action::Syscall {
+            op: DataOp::Write {
+                fd: 8,
+                data: vec![],
+            },
+            resources: vec![usage(Resource::Fd(8), AccessMode::Write)],
+            next: Box::new(|_| Action::Pure(Value::Unit)),
+        };
+        assert!(!fork_conflict(&reg, &inv, &write_fd8));
     }
 }

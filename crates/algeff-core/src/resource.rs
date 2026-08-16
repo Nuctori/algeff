@@ -287,6 +287,12 @@ impl ResourceRegistry {
         self.handles.clear();
         self.consumed.clear();
         self.owned_consumed.clear();
+        // 审计 R3-E 修复：fork_region 锚点一并复位——Replace（D10）后本
+        // registry 不再属于任何分支树，后续 `offset_next_fd` 应以当前
+        // `next_fd` 为基线重新锚定；否则 {Fork→Replace→Fork} 序列沿用
+        // Replace 前的陈旧基线，安全性完全依赖全局单调序号 k（2^16 上限
+        // assert）——序号耗尽或策略变更即碰撞源。
+        self.fork_region = None;
     }
 
     /// Fork 分支 fd 区间预分割（F1 审查修复 + S6/A2 嵌套修复）：把 `next_fd`
@@ -750,6 +756,25 @@ mod tests {
             .check_linear(&usage(r.clone(), AccessMode::Write))
             .is_ok());
         assert!(reg.check_linear(&usage(r.clone(), AccessMode::Own)).is_ok());
+    }
+
+    #[test]
+    fn clear_resets_fork_region_anchor() {
+        // 审计 R3-E：{Fork→Replace→Fork} 序列——clear() 复位 fork_region 后，
+        // 后续 offset_next_fd 以**当前 next_fd** 为基线重新锚定（而非 Replace
+        // 前的陈旧基线）。修复前：Replace 后再次 Fork 右分支沿用旧基线，安全性
+        // 完全依赖全局单调序号 k。
+        let mut reg = ResourceRegistry::new();
+        // 模拟右分支：偏移后实际分配 fd（merge 锚点吸收场景）
+        reg.offset_next_fd(1 << 48);
+        let _fd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        // 替换（D10：recover + clear）——修复后 fork_region 复位
+        reg.clear();
+        // 再次偏移：基线应为当前 next_fd（而非旧基线）
+        reg.offset_next_fd(2 << 48);
+        // 分配不落回旧区间（修复前陈旧基线可能使新分配与 Replace 前句柄区间重叠）
+        let nfd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert!(nfd >= (1 << 48), "clear 后新锚定从当前 next_fd 起（nfd={nfd}）");
     }
 
     #[test]
