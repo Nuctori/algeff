@@ -1590,9 +1590,12 @@ fn time_sleep_zero_immediate() {
         })
         .unwrap();
     assert_eq!(v, Value::U64(1));
+    // 收紧断言（独立审查 MEDIUM-2）：修复前 Windows tick 15.6ms 下 Sleep(0)
+    // 吃满一个 tick（实测 ~15.6ms）——<100ms 可分离 tick 与 µs 级实现且抗 CI
+    // 抖动（修复后实测 ~µs）；原 <1s 断言修复前后都过、无回归捕获力。
     assert!(
-        t0.elapsed() < Duration::from_secs(1),
-        "Sleep(0) 应立即完成，实测 {:?}",
+        t0.elapsed() < Duration::from_millis(100),
+        "Sleep(0) 应立即完成（修复前 ~15.6ms/tick；修复后 µs 级），实测 {:?}",
         t0.elapsed()
     );
 }

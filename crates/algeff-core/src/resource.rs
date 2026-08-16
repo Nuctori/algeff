@@ -287,12 +287,15 @@ impl ResourceRegistry {
         self.handles.clear();
         self.consumed.clear();
         self.owned_consumed.clear();
-        // 审计 R3-E 修复：fork_region 锚点一并复位——Replace（D10）后本
-        // registry 不再属于任何分支树，后续 `offset_next_fd` 应以当前
-        // `next_fd` 为基线重新锚定；否则 {Fork→Replace→Fork} 序列沿用
-        // Replace 前的陈旧基线，安全性完全依赖全局单调序号 k（2^16 上限
-        // assert）——序号耗尽或策略变更即碰撞源。
-        self.fork_region = None;
+        // 审计 R3-E 修复（独立审查修正版）：fork_region 保留**树根基线**（offset
+        // 归零）而非置 None——置 None 会让下一次 `offset_next_fd` 以当前 next_fd
+        // （已含此前 k<<48 偏移）为基线 → 沿路径累加复活（{Fork k1 → Replace →
+        // Fork k2} 新区间 = (k1+k2)<<48，与并发兄弟分支 k=k1+k2 撞区间，merge
+        // 时 HashMap::extend 静默覆盖句柄）。保留 base 后新区间仍 = 根基线 +
+        // 全局唯一 k，互斥不变量保持（Replace 后 registry 不再属于原分支树，
+        // 但根基线继续作为锚点，消除对「当前游标」的依赖）。
+        let base = self.fork_region.map(|(b, _)| b).unwrap_or(self.next_fd);
+        self.fork_region = Some((base, 0));
     }
 
     /// Fork 分支 fd 区间预分割（F1 审查修复 + S6/A2 嵌套修复）：把 `next_fd`
@@ -760,23 +763,24 @@ mod tests {
 
     #[test]
     fn clear_resets_fork_region_anchor() {
-        // 审计 R3-E：{Fork→Replace→Fork} 序列——clear() 复位 fork_region 后，
-        // 后续 offset_next_fd 以**当前 next_fd** 为基线重新锚定（而非 Replace
-        // 前的陈旧基线）。修复前：Replace 后再次 Fork 右分支沿用旧基线，安全性
-        // 完全依赖全局单调序号 k。
+        // 审计 R3-E（审查修正版）：{Fork→Replace→Fork} 序列——clear() 保留树
+        // 根基线（offset 归零），后续 offset_next_fd 仍锚定**根基线 + 全局唯一 k**
+        // （区间 = base + k<<48），不沿路径累加。
+        // 修复前（置 None）：第二次偏移以当前 next_fd（含前次 k<<48）为基线 →
+        // 区间 = (k1+k2)<<48 + 1，与并发兄弟分支 k=k1+k2 撞区间（D14/F1 缺陷类）。
         let mut reg = ResourceRegistry::new();
-        // 模拟右分支：偏移后实际分配 fd（merge 锚点吸收场景）
+        // 第一次右分支偏移 k1=1：区间 [1<<48, 2<<48)，实际分配 1 个 fd。
         reg.offset_next_fd(1 << 48);
         let _fd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
-        // 替换（D10：recover + clear）——修复后 fork_region 复位
+        // Replace（D10：recover + clear）——保留根基线（0），offset 归零。
         reg.clear();
-        // 再次偏移：基线应为当前 next_fd（而非旧基线）
+        // 第二次右分支偏移 k2=2：必须锚定根基线 0 → 区间 [2<<48, 3<<48)。
         reg.offset_next_fd(2 << 48);
-        // 分配不落回旧区间（修复前陈旧基线可能使新分配与 Replace 前句柄区间重叠）
         let nfd = reg.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
-        assert!(
-            nfd >= (1 << 48),
-            "clear 后新锚定从当前 next_fd 起（nfd={nfd}）"
+        assert_eq!(
+            nfd,
+            2 << 48,
+            "clear 后新偏移锚定根基线（修复前累加复活 → 3<<48+1，与 k=3 兄弟分支碰撞）"
         );
     }
 

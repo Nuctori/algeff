@@ -786,9 +786,10 @@ on_timeout 仍处取消域内（首个 action 即 CANCELLED_ERR）——保留�
 
 `Action::Sleep { duration: ZERO }` 在 Windows 下实测吃满定时器 tick（15.6ms/次：
 顺序 10×Sleep(0) = 158ms；并行分支各摊 1 tick）——语义本应立即完成。修复：Sleep 臂
-`duration.is_zero()` 短路直接执行 next（零时长无取消/虚拟时钟效果）。TDD 回归：
-`time_sleep_zero_immediate`（r2，断言从 <1s 收紧至 <5ms 量级）。**影响面**：所有用
-Sleep(0) 做「让出/并发窗口」的蓝图（bench/测试构造）在 Windows 上快 150 倍。
+`duration.is_zero()` 短路直接执行 next（零时长无取消/虚拟时钟效果）。回归测试：
+`time_sleep_zero_immediate`（r2，断言收紧至 <100ms——修复前 ~15.6ms/tick 与修复后
+µs 级可分离，原 <1s 断言无捕获力）。**影响面**：所有用 Sleep(0) 做「让出/并发窗口」
+的蓝图（bench/测试构造）在 Windows 上快 150 倍。
 
 ### 实测画像（分解 bench，临时文件已清理）
 
@@ -807,6 +808,23 @@ ReadAt，契约变更）。**优化方向登记**（阶段 3+）：a) Open/Close
 微优化（预期 ~1-2ms/10 文件）；b) ReadAt 原语（shared ~100% 目标）；c) 官方 bench
 口径统一（原生臂与 algeff 臂同含 Open/Close 后再对比，当前对比略偏向 algeff 仍
 慢——诚实口径下 parallel 实际优于 264%）。
+
+### Open 逐项 profile（闭环验证，临时计时已移除）
+
+单次 `op_open` 构成（executor 测试环境实测）：`tokio::fs::open` = **445µs（74%，物理
+成本，与原生同）**、`try_clone` = 105µs（17%）、registry 分配 = 37µs、映射表 = 15µs。
+
+**闭环结论**：try_clone 的 105µs 是**契约必需**——r6b 测试锁定 registry 句柄必须是
+真实 `File` 类型（类型完整性断言 `matches!(lookup, Some(ResourceHandle::File(_)))`），
+无法替换为占位 token；tokio open 445µs 与原生同源（两边同一 tokio fs 路径），无差异
+可优化。**Open/Close 路径无可落地的低风险优化**（物理成本 + 契约必需 + µs 级簿记）；
+剩余提升空间集中在 b) ReadAt（shared 场景，契约变更）与 c) 口径统一（测量精度，非
+运行成本）。
+
+**已知限制登记（独立审查 LOW-3）**：fork 区间序号（`FORK_FD_REGION_SEQ`，2^16 上限）
+为进程级**永久**计数器——耗尽后所有 Fork 永久返回 Other(28)，且 Catch 可静默掩盖
+（长驻高频 Fork 进程的运营风险；bench 实测 ~31k 次 Fork 即耗尽）。改进方向：区间
+尺寸权衡（如 2^40 → 2^24 次）或计数回收。
 
 ### 性能节更新（迭代 3，2026-08-16）
 
