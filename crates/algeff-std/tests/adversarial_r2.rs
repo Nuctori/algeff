@@ -1780,7 +1780,11 @@ fn rfc07_pipe_io_inside_conflict_fork_sequential() {
                         Action::Pure,
                     )),
                     combine: Box::new(move |_, _| {
-                        syscall(DataOp::Read { fd: rfd, len: 2 }, vec![rd(rfd)], Action::Pure)
+                        syscall(
+                            DataOp::Read { fd: rfd, len: 2 },
+                            vec![rd(rfd)],
+                            Action::Pure,
+                        )
                     }),
                 }
             },
@@ -1901,17 +1905,26 @@ fn rfc07_branch_local_pipe_open_io_merge_readback() {
     let (lr, lw) = pairs[0];
     let (rr, rw) = pairs[1];
     assert_ne!(
-        (lr, lw), (rr, rw),
+        (lr, lw),
+        (rr, rw),
         "两分支管道 fd 不相撞（右分支 k<<48 区间预分割）"
     );
     // 分支内写入的数据经 merge 后由父读回：共享执行器管道表按逻辑 fd 寻址，
     // 父级 Read 直接命中（RFC-07 修复）。
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd: lr, len: 2 }, vec![rd(lr)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd: lr, len: 2 },
+            vec![rd(lr)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"LL".to_vec()), "左分支管道数据读回");
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd: rr, len: 2 }, vec![rd(rr)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd: rr, len: 2 },
+            vec![rd(rr)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"RR".to_vec()), "右分支管道数据读回");
     // Close 不回归：父级可关分支管道（写端关闭 → 读端后续 EOF）。
@@ -1921,7 +1934,11 @@ fn rfc07_branch_local_pipe_open_io_merge_readback() {
     }
     // 写端全关后读端返回 EOF（空 Bytes），语义不回归。
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd: lr, len: 2 }, vec![rd(lr)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd: lr, len: 2 },
+            vec![rd(lr)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(v, Value::Bytes(Vec::new()), "写端关闭后读端 EOF");
 }
@@ -1942,26 +1959,19 @@ fn rfc07_pipe_dup_inside_fork_shared_write_succeeds() {
             move |v| {
                 let (rfd, wfd) = pair_of(&v);
                 Action::Fork {
-                    left: Box::new(syscall(
-                        DataOp::Dup { fd: wfd },
-                        vec![],
-                        move |v| {
-                            let dup = fd_of(&v);
-                            syscall(
-                                DataOp::Write {
-                                    fd: dup,
-                                    data: b"dup".to_vec(),
-                                },
-                                vec![wr(dup)],
-                                move |_| {
-                                    Action::Pure(Value::List(vec![
-                                        Value::Fd(rfd),
-                                        Value::Fd(dup),
-                                    ]))
-                                },
-                            )
-                        },
-                    )),
+                    left: Box::new(syscall(DataOp::Dup { fd: wfd }, vec![], move |v| {
+                        let dup = fd_of(&v);
+                        syscall(
+                            DataOp::Write {
+                                fd: dup,
+                                data: b"dup".to_vec(),
+                            },
+                            vec![wr(dup)],
+                            move |_| {
+                                Action::Pure(Value::List(vec![Value::Fd(rfd), Value::Fd(dup)]))
+                            },
+                        )
+                    })),
                     right: Box::new(Action::Pure(Value::Unit)),
                     combine: Box::new(|l, _| Action::Pure(l)),
                 }
@@ -1974,7 +1984,11 @@ fn rfc07_pipe_dup_inside_fork_shared_write_succeeds() {
     };
     // 父级经原读端读回分支经 dup 写入的数据（Fork Clone + Dup 双重共享下 IO 成功）。
     let v = rt
-        .run_blocking(syscall(DataOp::Read { fd: rfd, len: 3 }, vec![rd(rfd)], Action::Pure))
+        .run_blocking(syscall(
+            DataOp::Read { fd: rfd, len: 3 },
+            vec![rd(rfd)],
+            Action::Pure,
+        ))
         .unwrap();
     assert_eq!(
         v,
@@ -1982,8 +1996,16 @@ fn rfc07_pipe_dup_inside_fork_shared_write_succeeds() {
         "分支内 dup 写端 lock 写成功，数据可达父读端（RFC-07 修复）"
     );
     // Close 不回归：父级可关 dup 与读端（双表条目与注册表一致）。
-    rt.run_blocking(syscall(DataOp::Close { fd: dup }, vec![ow(dup)], Action::Pure))
-        .unwrap();
-    rt.run_blocking(syscall(DataOp::Close { fd: rfd }, vec![ow(rfd)], Action::Pure))
-        .unwrap();
+    rt.run_blocking(syscall(
+        DataOp::Close { fd: dup },
+        vec![ow(dup)],
+        Action::Pure,
+    ))
+    .unwrap();
+    rt.run_blocking(syscall(
+        DataOp::Close { fd: rfd },
+        vec![ow(rfd)],
+        Action::Pure,
+    ))
+    .unwrap();
 }

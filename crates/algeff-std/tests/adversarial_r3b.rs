@@ -536,9 +536,11 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
             "第 {round} 轮：并行 Fork 后父级同资源 Write 应被 A4 拦截"
         );
     }
-    assert!(
-        lr > 0 && rl > 0,
-        "8 轮写竞争须出现两种序（LR×{lr} RL×{rl}）——仅真并行可产生 RL"
-    );
+    // 并行证据（语义级，调度无关）：本测试的**盲区并发证据**由
+    // ub_fork_conflict_blindspot_mutex_wouldblock 承担（双分支竞争 MutexLock
+    // → 败者 WouldBlock——仅真并行路径可出现）；本测试职责为盲区双写语义
+    // （每轮 ∈ {LR, RL} 已断言 + A4 合并拦截）。两写序分布（LR/RL 计数）为
+    // 软观察：共享 reactor 下单 worker 顺序轮询可致全 LR（左分支恒先完成），
+    // 不设硬断言（reviewer MEDIUM-1 实测 LR×8 间歇失败，2026-08-16）。
     eprintln!("r3b blind-write race distribution: LR×{lr} RL×{rl}");
 }

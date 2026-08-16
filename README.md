@@ -421,7 +421,7 @@ fn main() {
 | 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 64（D-052 初版 96 → 迭代 1 取消传播帧膨胀复测裁决 64） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
 | 7   | 验证分层    | 435 个测试函数（约 422 二进制 + 13 doc-test），51 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
-| 8   | 对抗审计 ×6+R7 | 203 个 E2E 测试（R1-R6=167 + R7=15 + R7AB=4 + R8=17，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
+| 8   | 对抗审计 ×8 | 203 个 E2E 测试（R1-R6=171 + R7=15 + R7AB=4 + R8=13，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
 | 9   | 数学审计 ×8 | P1/P2/P3/P5「有效（附声明前提）」，P4「有效（附范围声明）」——R7-A 已核销（TakeHandleGuard）、R7-B 部分核销（ForkJoinMerge，耗尽路径残余登记）；P3 物理层 make_mut 阶段 3 登记                                                    | `spec/proof-obligations.md`    |
 | 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
 | 11  | 性能推导    | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制                                                               | `perf/baseline-2026-08-15.txt` |

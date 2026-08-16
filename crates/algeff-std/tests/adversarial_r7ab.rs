@@ -273,11 +273,7 @@ fn r7a_pipe_rotation_repeated_reads_close_normal() {
             other => panic!("期望 Bytes，得到 {other:?}"),
         }
     };
-    assert_eq!(
-        read3(&mut rt),
-        b"aaa",
-        "第一次双表读（lock 顺序消费）"
-    );
+    assert_eq!(read3(&mut rt), b"aaa", "第一次双表读（lock 顺序消费）");
     assert_eq!(
         read3(&mut rt),
         b"bbb",
