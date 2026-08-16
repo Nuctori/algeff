@@ -83,10 +83,11 @@ do_! {                         手写等价（局部 CPS）
 | `TcpRead` / `UdpRecvFrom` | Read(fd) |
 | `TcpWrite` / `UdpSendTo` / `TcpShutdown` / `Dup` | Write(fd) |
 | `TcpAccept` | Read(listener) |
-| `Kill` / `SendSignal` | Write(pid)（+ Write(Signal)） |
+| `Kill` | Write(pid) |
+| `SendSignal` | 空集（Signal 全局资源无仲裁层；二次发送允许——SIGTERM→SIGKILL 优雅停机模式，A4 不消费，成败由物理层决定） |
 | `Wait` | Own(pid) |
-| `MutexLock` | Write(Fd(id)) |
-| `MutexUnlock` | Read(Fd(id))（对齐 adversarial_r2 攻击面 2a：Write 会被 A4 每资源至多消费一次，unlock 必须降为 Read） |
+| `MutexLock` | 空集（锁 id 仲裁在 executor 层经 arbiter（D16/R-1），与 A4 线性域正交；声明 Write(Fd(id)) 会被 A4 至多消费一次导致 lock→unlock→再 lock 二次必拒——空声明对齐 adversarial_r2 攻击面 2b，重入由 arbiter 占坑释放保证） |
+| `MutexUnlock` | 空集（同上；executor 层释放 arbiter 占坑，幂等） |
 | `Mmap` | prot.write → Write(path) : Read(path) |
 | `SendFile` | Write(out) + Read(input) |
 | `Dup2` | Write(new_fd) + Read(old_fd) |
@@ -108,6 +109,7 @@ do_! {                         手写等价（局部 CPS）
 空集意味着「新句柄不参与冲突检测」，与 `adapters` 既有行为一致，
 不改变契约语义。
 
+<<<<<<< ours
 ### 3.4 错误处理语法：`dx::catch`（迭代 2 新增）
 
 `do_!` 内的错误路径经 `dx::catch(action, handler)` 表达——`Action::Catch`
@@ -137,6 +139,17 @@ let blueprint = do_! {
   需整体回滚时用 `Replace` 包裹，二者职责不变；
 - handler 需 `+ Send + 'static`：捕获的外部数据 clone 后 `move` 进闭包；
   替代 Action 可为 `do_!`/`plan!`/`dx::unit()` 等任意返回 `Action` 的表达式。
+=======
+**MutexLock/MutexUnlock/SendSignal 同样空集，但理由不同**：
+- 锁 id 的互斥语义由 executor 层 arbiter 动态仲裁（D16/R-1，占坑⟺持锁）；
+  A4 线性域（Write 每资源至多消费一次）与之正交——若声明 `Write(Fd(id))`，
+  lock→unlock→再 lock 第二次必被 A4 拒（R7 发现：arbiter release 只清占坑
+  不清 A4 consumed）。空声明后同 id 并行争用仍由 arbiter 序列化
+  （败者 WouldBlock，adversarial_r2 攻击面 2b），显式声明场景（攻击面 2a）
+  不受影响（`syscall_with` 覆盖入口保留）；
+- `SendSignal` 的 Signal 全局资源无仲裁层且语义上可重复（SIGTERM→SIGKILL
+  优雅停机），A4 不应拒绝二次发送——空声明，成败由物理层决定。
+>>>>>>> theirs
 
 ## 4. 方案对比
 
