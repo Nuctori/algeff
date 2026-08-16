@@ -826,7 +826,8 @@ mod tests {
         branch.clear();
         parent.merge(branch);
         assert_eq!(
-            parent.next_fd, 1 << 48,
+            parent.next_fd,
+            1 << 48,
             "clear 后未分配：merge 不误降游标（保持偏移位）"
         );
         parent.offset_next_fd(2 << 48);
