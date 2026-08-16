@@ -55,9 +55,9 @@ jobs:
         run: cargo test -p algeff-core --features coeffects,virtual-clock
 
       # 文档一致性门禁：四处文档（README/derivation/resource-notes/proof-
-      # obligations）的 7 组事实（测试计数 352/46+3、对抗 E2E 164、RFC-10/11
-      # 状态、CI 三平台、性能 canonical 103.1/366.2/570.9/39.1、深度守卫 96/
-      # 105/97）不得漂移；GitHub runner 预装 Python，直接调用。
+      # obligations/dx-design）的事实组（测试计数 410/48+3、对抗 E2E 182、
+      # RFC-10/11 状态、CI 三平台、性能 canonical、深度守卫 64/105/65）不得
+      # 漂移；GitHub runner 预装 Python，直接调用。
       - name: python3 scripts/check-doc-consistency.py
         run: python3 scripts/check-doc-consistency.py
 

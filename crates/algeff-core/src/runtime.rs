@@ -1415,3 +1415,40 @@ pub async fn interpret(
 
 // 供外部使用的类型别名
 pub type _BoxFutureAlias<'a, T> = BoxFuture<'a, T>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R3-B 单元级防护（终审 Note-3）：直接构造**已广播**的外层取消接收端，
+    /// 验证 `wait_timeout` 的 OR 臂打断嵌套 wait——行为回归（OR 臂被删/失效）
+    /// 时本测试红（集成层 `timeout_nested_outer_cancel_interrupts_inner_wait`
+    /// 为黑盒断言，对「外层取消到达内层」的路径无区分度）。
+    #[tokio::test]
+    async fn wait_timeout_outer_cancel_interrupts() {
+        // 内层：长 sleep（10s）——若 OR 臂失效，本测试会等到宽限/超时。
+        let inner: LocalBoxFuture<'_, Result<Value, SysError>> =
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(Value::Unit)
+            });
+        // 本层通道（未被广播）与**外层已广播**通道。
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        let (_outer_tx, outer_rx) = tokio::sync::watch::channel(false);
+        let _ = _outer_tx.send(true); // 外层已取消（粘性：changed() 立即 Ready）
+
+        let t0 = std::time::Instant::now();
+        let (timed_out, _r) = wait_timeout(inner, Duration::from_secs(10), &tx, Some(&outer_rx)).await;
+        assert!(
+            timed_out,
+            "外层已广播 → OR 臂应触发（timed_out=true）"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "OR 臂应立即打断（不等到内层 10s/宽限），实测 {:?}",
+            t0.elapsed()
+        );
+        // 本层取消已广播：子树将响应。
+        assert!(*tx.borrow(), "OR 臂触发后本层通道应已广播取消");
+    }
+}
