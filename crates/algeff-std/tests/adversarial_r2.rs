@@ -13,12 +13,12 @@
 //!      （每轮 +k·2^48），~360 轮后 u64 溢出（debug panic / release 回绕）——
 //!      `ResourceRegistry::merge` 锚点吸收修复（分支 fork_region 根基线回灌父，
 //!      后续轮次偏移锚定根基线，父 next_fd 线性增长；见 spec §10 RFC-06）；
-//!    - **已知缺陷 RFC-07**：管道半端（PipeReader/PipeWriter）经 Fork registry
-//!      Clone（D13）共享 Arc，分支内对管道 IO 时 executor 的 `Arc::get_mut`
-//!      失败 → InvalidInput（文件工作对象是 Arc<Mutex<File>>，不受影响）。
-//!      修复需 executor 双表结构改造（文件式 Arc<Mutex> 覆盖管道 / 或 make_mut
-//!      代际标记，见 spec/resource-notes.md §9），冻结面外，阶段 3+；测试以
-//!      文件为分支冲突负载绕开该缺陷，保留 fd 分配属性覆盖。
+//!    - **RFC-07（已修复，迭代 3-A2；攻击面 7 验证）**：管道半端经 Fork registry
+//!      Clone（D13）共享 Arc，修复前分支内对管道 IO 时 executor 的 `Arc::get_mut`
+//!      失败 → InvalidInput（文件工作对象是 Arc<Mutex<File>>，不受影响）。修复：
+//!      executor 管道工作表文件式双表（registry 句柄与工作表存同一
+//!      `Arc<Mutex<半端>>`，lock 下 IO 合法、管道不轮换），见
+//!      spec/resource-notes.md §10 RFC-07 段与攻击面 7 测试。
 //! 2. **arbiter-MutexLock 接入**（A5 批 7 / D16）：
 //!    - 声明 Resource::Fd(id) → 静态冲突 → 顺序化 → 两分支都成功；
 //!    - 未声明（pdr §18 用户责任边界）→ 真并行 → 竞争失败方 WouldBlock 而非死锁；
@@ -314,10 +314,9 @@ fn fd_multi_round_fork_50_rounds_monotonic_no_blowup() {
 // 攻击面 1c：连续 1000 个顺序冲突 Fork → 区间序号单调消耗（无溢出/回绕）、
 // fd 不碰撞、next_fd 不爆涨（归一化：右分支未分配 → 区间收敛回基线）。
 // 每轮：父级 PipeOpen（2 fd）+ Open 文件（1 fd）→ 冲突 Fork（同文件 fd
-// 双写，顺序路径）。分支冲突负载用**文件**而非管道：管道半端经 Fork registry
-// Clone 共享 Arc，分支内管道 IO 的 `Arc::get_mut` 会失败返回 InvalidInput
-// （RFC-07 已知缺陷，见文件头注释）；文件工作对象是 Arc<Mutex<File>>，
-// 共享下 lock 可用，不受影响。
+// 双写，顺序路径）。分支冲突负载仍用文件（RFC-07 修复前为绕开管道半端共享
+// Arc 的 `Arc::get_mut` 失败而改用；修复后管道亦可作负载，本测试保持文件
+// 以保留既有 fd 记账断言；管道分支内 IO 由攻击面 7 覆盖）。
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -490,10 +489,9 @@ fn fd_region_seq_no_overflow_or_reuse_400_rounds() {
                 vec![],
                 move |v| {
                     let (rfd, wfd) = pair_of(&v);
-                    // 左分支与右分支同 PipeOpen（同 quadratic 测试：分支内
-                    // 不触碰父管道半端，避开 RFC-07；两分支都实际分配 → 右
-                    // 分支 k<<48 区间分配后，merge 锚点吸收保证下轮偏移锚定
-                    // 根基线，父 next_fd 线性增长）。
+                    // 左分支与右分支同 PipeOpen（分支内新建管道不与父管道半端
+                    // 共享；两分支都实际分配 → 右分支 k<<48 区间分配后，merge
+                    // 锚点吸收保证下轮偏移锚定根基线，父 next_fd 线性增长）。
                     Action::Fork {
                         left: Box::new(syscall(
                             DataOp::PipeOpen {
@@ -1735,4 +1733,257 @@ fn mem_mmap_bounds_through_runtime() {
         .run_blocking(syscall(DataOp::GetTime, vec![], Action::Pure))
         .unwrap();
     assert!(matches!(v, Value::U64(_)));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 攻击面 7：RFC-07 修复 —— 管道半端文件式双表（Arc<Mutex>），D13 Fork 分支
+// 隔离/Dup 共享下分支内管道 IO 成功。
+// 修复前：registry 经 D13 Clone 做分支隔离时 PipeReader/PipeWriter 的 Arc 被
+// 共享（strong_count > 1），executor 管道路径依赖 Arc::get_mut（take/put_back
+// 轮换）→ 共享下必然失败 → InvalidInput。修复后：registry 句柄与 executor
+// 工作表存同一 Arc<tokio::sync::Mutex<半端>>，lock 下 IO 合法；管道不轮换，
+// 避免共享执行器 + 分支隔离 registry 下轮换映射互相污染（右分支按原 fd
+// 取句柄）。
+// ══════════════════════════════════════════════════════════════════════
+
+/// RFC-07 冲突（顺序）路径：父级 PipeOpen 后，Fork 左/右分支对同一写端 wfd
+/// 双写（Write∥Write 静态冲突 → 顺序路径）。修复前两分支对父管道半端 IO 时
+/// Arc::get_mut 因 D13 registry Clone 共享而失败 → InvalidInput；修复后两分支
+/// 写均成功，combine 读回 "LR"（顺序路径观察序）。
+#[test]
+fn rfc07_pipe_io_inside_conflict_fork_sequential() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            vec![],
+            move |v| {
+                let (rfd, wfd) = pair_of(&v);
+                // 同 wfd 双写 → Write∥Write 冲突 → 顺序路径（left 写 L、right 写 R）。
+                Action::Fork {
+                    left: Box::new(syscall(
+                        DataOp::Write {
+                            fd: wfd,
+                            data: b"L".to_vec(),
+                        },
+                        vec![wr(wfd)],
+                        Action::Pure,
+                    )),
+                    right: Box::new(syscall(
+                        DataOp::Write {
+                            fd: wfd,
+                            data: b"R".to_vec(),
+                        },
+                        vec![wr(wfd)],
+                        Action::Pure,
+                    )),
+                    combine: Box::new(move |_, _| {
+                        syscall(DataOp::Read { fd: rfd, len: 2 }, vec![rd(rfd)], Action::Pure)
+                    }),
+                }
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        v,
+        Value::Bytes(b"LR".to_vec()),
+        "顺序路径两分支写均成功且数据有序（RFC-07 修复）"
+    );
+}
+
+/// RFC-07 并行路径：父级 PipeOpen 后，Fork 左分支读读端、右分支写写端（不同 fd
+/// → 无冲突 → 真并行）。修复前共享 Arc 下分支内管道 IO 必然 InvalidInput；修复
+/// 后并行两分支各自 lock（读端与写端各自独立 Arc<Mutex>）成功，数据跨分支流动。
+#[test]
+fn rfc07_pipe_io_inside_parallel_fork() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            vec![],
+            move |v| {
+                let (rfd, wfd) = pair_of(&v);
+                Action::Fork {
+                    left: Box::new(syscall(
+                        DataOp::Read { fd: rfd, len: 4 },
+                        vec![rd(rfd)],
+                        Action::Pure,
+                    )),
+                    right: Box::new(syscall(
+                        DataOp::Write {
+                            fd: wfd,
+                            data: b"ping".to_vec(),
+                        },
+                        vec![wr(wfd)],
+                        Action::Pure,
+                    )),
+                    combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
+                }
+            },
+        ))
+        .unwrap();
+    let (lv, rv) = match v {
+        Value::List(l) if l.len() == 2 => (l[0].clone(), l[1].clone()),
+        other => panic!("期望 List([Bytes, Unit])，得到 {other:?}"),
+    };
+    assert_eq!(
+        lv,
+        Value::Bytes(b"ping".to_vec()),
+        "并行左分支读端 lock 读成功（数据跨分支到达，RFC-07 修复）"
+    );
+    assert_eq!(rv, Value::Unit, "并行右分支写端 lock 写成功");
+}
+
+/// RFC-07 分支本地管道：两并行分支各自 PipeOpen + 写入（fd 区间预分割不相撞），
+/// merge 后父级经共享执行器管道表按逻辑 fd 读回分支数据；Close 分支管道不回归。
+#[test]
+fn rfc07_branch_local_pipe_open_io_merge_readback() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt
+        .run_blocking(Action::Fork {
+            left: Box::new(syscall(
+                DataOp::PipeOpen {
+                    flags: PipeFlags::default(),
+                },
+                vec![],
+                move |v| {
+                    let (rfd, wfd) = pair_of(&v);
+                    // 分支本地管道：Open → Write → 返回 (rfd, wfd) 供 combine。
+                    syscall(
+                        DataOp::Write {
+                            fd: wfd,
+                            data: b"LL".to_vec(),
+                        },
+                        vec![wr(wfd)],
+                        move |_| Action::Pure(Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)])),
+                    )
+                },
+            )),
+            right: Box::new(syscall(
+                DataOp::PipeOpen {
+                    flags: PipeFlags::default(),
+                },
+                vec![],
+                move |v| {
+                    let (rfd, wfd) = pair_of(&v);
+                    syscall(
+                        DataOp::Write {
+                            fd: wfd,
+                            data: b"RR".to_vec(),
+                        },
+                        vec![wr(wfd)],
+                        move |_| Action::Pure(Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)])),
+                    )
+                },
+            )),
+            combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
+        })
+        .unwrap();
+    // v = List([List([Fd(lr), Fd(lw)]), List([Fd(rr), Fd(rw)])]).
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    match v {
+        Value::List(outer) if outer.len() == 2 => {
+            for inner in outer {
+                match inner {
+                    Value::List(p) if p.len() == 2 => {
+                        pairs.push((fd_of(&p[0]), fd_of(&p[1])));
+                    }
+                    other => panic!("期望 List([Fd, Fd])，得到 {other:?}"),
+                }
+            }
+        }
+        other => panic!("期望 List([List, List])，得到 {other:?}"),
+    }
+    let (lr, lw) = pairs[0];
+    let (rr, rw) = pairs[1];
+    assert_ne!(
+        (lr, lw), (rr, rw),
+        "两分支管道 fd 不相撞（右分支 k<<48 区间预分割）"
+    );
+    // 分支内写入的数据经 merge 后由父读回：共享执行器管道表按逻辑 fd 寻址，
+    // 父级 Read 直接命中（RFC-07 修复）。
+    let v = rt
+        .run_blocking(syscall(DataOp::Read { fd: lr, len: 2 }, vec![rd(lr)], Action::Pure))
+        .unwrap();
+    assert_eq!(v, Value::Bytes(b"LL".to_vec()), "左分支管道数据读回");
+    let v = rt
+        .run_blocking(syscall(DataOp::Read { fd: rr, len: 2 }, vec![rd(rr)], Action::Pure))
+        .unwrap();
+    assert_eq!(v, Value::Bytes(b"RR".to_vec()), "右分支管道数据读回");
+    // Close 不回归：父级可关分支管道（写端关闭 → 读端后续 EOF）。
+    for fd in [lw, rw] {
+        rt.run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
+            .unwrap();
+    }
+    // 写端全关后读端返回 EOF（空 Bytes），语义不回归。
+    let v = rt
+        .run_blocking(syscall(DataOp::Read { fd: lr, len: 2 }, vec![rd(lr)], Action::Pure))
+        .unwrap();
+    assert_eq!(v, Value::Bytes(Vec::new()), "写端关闭后读端 EOF");
+}
+
+/// RFC-07 Dup 独占场景（Fork 内）：父级 PipeOpen 后，分支内 Dup 写端（registry
+/// Clone + Dup 双重共享 Arc<Mutex<WriteHalf>>），经 dup fd 写入 → 父级经原读端
+/// 读回。修复前 get_mut 独占下任何共享（Dup 或 Fork Clone）都 InvalidInput；
+/// 修复后 lock 下 IO 合法，dup 与原 fd 共享同一工作对象（文件式双表）。
+#[test]
+fn rfc07_pipe_dup_inside_fork_shared_write_succeeds() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt
+        .run_blocking(syscall(
+            DataOp::PipeOpen {
+                flags: PipeFlags::default(),
+            },
+            vec![],
+            move |v| {
+                let (rfd, wfd) = pair_of(&v);
+                Action::Fork {
+                    left: Box::new(syscall(
+                        DataOp::Dup { fd: wfd },
+                        vec![],
+                        move |v| {
+                            let dup = fd_of(&v);
+                            syscall(
+                                DataOp::Write {
+                                    fd: dup,
+                                    data: b"dup".to_vec(),
+                                },
+                                vec![wr(dup)],
+                                move |_| {
+                                    Action::Pure(Value::List(vec![
+                                        Value::Fd(rfd),
+                                        Value::Fd(dup),
+                                    ]))
+                                },
+                            )
+                        },
+                    )),
+                    right: Box::new(Action::Pure(Value::Unit)),
+                    combine: Box::new(|l, _| Action::Pure(l)),
+                }
+            },
+        ))
+        .unwrap();
+    let (rfd, dup) = match v {
+        Value::List(l) if l.len() == 2 => (fd_of(&l[0]), fd_of(&l[1])),
+        other => panic!("期望 List([Fd, Fd])，得到 {other:?}"),
+    };
+    // 父级经原读端读回分支经 dup 写入的数据（Fork Clone + Dup 双重共享下 IO 成功）。
+    let v = rt
+        .run_blocking(syscall(DataOp::Read { fd: rfd, len: 3 }, vec![rd(rfd)], Action::Pure))
+        .unwrap();
+    assert_eq!(
+        v,
+        Value::Bytes(b"dup".to_vec()),
+        "分支内 dup 写端 lock 写成功，数据可达父读端（RFC-07 修复）"
+    );
+    // Close 不回归：父级可关 dup 与读端（双表条目与注册表一致）。
+    rt.run_blocking(syscall(DataOp::Close { fd: dup }, vec![ow(dup)], Action::Pure))
+        .unwrap();
+    rt.run_blocking(syscall(DataOp::Close { fd: rfd }, vec![ow(rfd)], Action::Pure))
+        .unwrap();
 }

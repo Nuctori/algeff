@@ -6,15 +6,18 @@
 //! **当前行为**。审计发现见交付报告 findings（本文件仅做行为锁定，src/ 冻结
 //! 不修，CTO 派发修复轮）：
 //!
-//! - **F-R7-1 [真实缺陷] RFC-07 管道双表修复未合入基线**：迭代 1 声称「未
-//!   Dup 管道在 Fork 分支内 IO 成功」，但 `iter1/it1-rfc07` 的 executor 文件式
-//!   双表改造（aa0c2bf）从未合入本基线——当前 executor.rs 管道路径仍为
+//! - **F-R7-1 [真实缺陷，迭代 3-A2 已修复] RFC-07 管道双表修复未合入基线**：迭代
+//!   1 声称「未 Dup 管道在 Fork 分支内 IO 成功」，但 `iter1/it1-rfc07` 的 executor
+//!   文件式双表改造（aa0c2bf）从未合入基线——旧 executor.rs 管道路径仍为
 //!   take/put_back 轮换 + `Arc::get_mut`（RFC-07 登记 §9.3.1 描述的原缺陷
-//!   形态）。实测：父级 PipeOpen 的管道（未 Dup），Fork 并行/顺序分支内
-//!   Read/Write 均 `Err(InvalidInput)`（registry Clone 使 Arc strong_count>1 →
-//!   get_mut 失败）。且分支内失败路径的 put_back 把共享 `pipe_reader_fds`/
-//!   `pipe_writer_fds` 映射重定向到分支新 fd → 父级同一管道随后 IO 持续
-//!   InvalidInput（映射毒化）。§3 两测试锁定该行为。
+//!   形态）：父级 PipeOpen 的管道（未 Dup），Fork 并行/顺序分支内 Read/Write
+//!   均 `Err(InvalidInput)`（registry Clone 使 Arc strong_count>1 → get_mut 失败），
+//!   且分支内失败路径的 put_back 把共享映射重定向到分支新 fd → 父级同一管道
+//!   随后 IO 持续 InvalidInput（映射毒化）。
+//!   **修复（迭代 3-A2）**：executor 管道工作表改为文件式双表（registry 句柄与
+//!   executor 工作表存同一 `Arc<tokio::sync::Mutex<半端>>`，lock 下 IO 合法、
+//!   管道不轮换；take/put_back 仅剩 TcpStream 独占场景），见 spec/resource-notes.md
+//!   §10 RFC-07 段。§3 两测试已翻转：并行/顺序分支内管道读成功。
 //! - **F-R7-2 [已登记 R7-A，迭代 3-fix 修复]** Timeout 取消飞行中管道 Write：
 //!   轮换型句柄 take→await→put_back 窗口内 future 被取消丢弃 → 注册表条目
 //!   丢失（实测 wfd lookup → None）、管道写端被物理关闭。线性标记本身已由
@@ -304,16 +307,16 @@ fn rfc06_parallel_200_rounds_right_branch_alloc_linear() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// §3 RFC-07 管道：缺陷锁定（F-R7-1）+ 非分支回归
+// §3 RFC-07 管道：修复翻转（F-R7-1 已修）+ 非分支回归
 // ══════════════════════════════════════════════════════════════════════
 
 /// 父级已建管道（**未 Dup**）在**并行** Fork 分支内 Read：
-/// 当前行为 = `Err(InvalidInput)`（RFC-07 登记 §9.3.1 的原缺陷形态——分支
-/// registry Clone 使管道半端 Arc strong_count>1，`Arc::get_mut` 失败）。
-/// 迭代 1 声称的「未 Dup 管道在 Fork 分支内 IO 成功」修复（executor 文件式
-/// 双表）**未合入本基线**（F-R7-1）。
+/// **RFC-07 修复翻转（原 F-R7-1 缺陷锁定）**——registry 句柄与 executor
+/// 工作表存同一 `Arc<Mutex<ReadHalf>>`（文件式双表），D13 registry Clone 使
+/// 半端 Arc 共享时 executor 经 lock 做 IO，不再依赖 `Arc::get_mut` 独占 →
+/// 分支内管道读成功（修复前：strong_count>1 → get_mut 失败 → InvalidInput）。
 #[test]
-fn rfc07_pipe_read_in_parallel_fork_locked_invalid_input() {
+fn rfc07_pipe_read_in_parallel_fork_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let pb = dir.path().join("p-b.txt");
     std::fs::write(&pb, b"BBB").unwrap();
@@ -359,7 +362,7 @@ fn rfc07_pipe_read_in_parallel_fork_locked_invalid_input() {
     let _ = wfd;
 
     // 并行 Fork：左分支读管道 rfd（与右分支 Read(fdb) 不同资源、无冲突 →
-    // 真并行 + 快照通道）。F-R7-1：左分支管道读 → InvalidInput（缺陷锁定）。
+    // 真并行 + 快照通道）。RFC-07 修复：左分支管道读成功（lock 共享可用）。
     let r = rt.run_blocking(Action::Fork {
         left: Box::new(syscall(
             DataOp::Read { fd: rfd, len: 4 },
@@ -371,18 +374,26 @@ fn rfc07_pipe_read_in_parallel_fork_locked_invalid_input() {
             vec![rd(fdb)],
             Action::Pure,
         )),
-        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+        combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
     });
-    match r {
-        Err(SysError::InvalidInput) => {}
-        other => panic!("F-R7-1 行为锁定：并行分支内管道 IO 应 InvalidInput，得到 {other:?}"),
-    }
+    let v = r.unwrap();
+    let (lv, rv) = match v {
+        Value::List(l) if l.len() == 2 => (l[0].clone(), l[1].clone()),
+        other => panic!("期望 List([Bytes, Bytes])，得到 {other:?}"),
+    };
+    assert_eq!(
+        lv,
+        Value::Bytes(b"PIPE".to_vec()),
+        "并行分支内管道读成功（RFC-07 修复，原 F-R7-1 锁定 InvalidInput）"
+    );
+    assert_eq!(rv, Value::Bytes(b"BBB".to_vec()), "右分支文件读不受影响");
 }
 
 /// 父级已建管道（未 Dup）在**顺序**（冲突）Fork 分支内 Read：
-/// 同样 `Err(InvalidInput)`（F-R7-1；顺序路径分支 registry 同样 Clone）。
+/// 同样应成功（RFC-07 修复；顺序路径分支 registry 同样 Clone，共享下 lock
+/// 可用——修复前 Arc::get_mut 失败 → InvalidInput）。
 #[test]
-fn rfc07_pipe_read_in_sequential_fork_locked_invalid_input() {
+fn rfc07_pipe_read_in_sequential_fork_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let pa = dir.path().join("s-a.txt");
     std::fs::write(&pa, b"AAA").unwrap();
@@ -414,18 +425,15 @@ fn rfc07_pipe_read_in_sequential_fork_locked_invalid_input() {
         .run_blocking(syscall(
             DataOp::Open {
                 path: pa.clone(),
-                flags: OpenFlags {
-                    read: true,
-                    ..Default::default()
-                },
+                flags: rw_flags(),
             },
-            vec![rd_path(pa.clone())],
+            vec![wr_path(pa.clone())],
             Action::Pure,
         ))
         .unwrap();
     let fda = fd_of(&v);
     // 冲突 Fork：左分支声明 wr(fda)（与右分支 Write(fda) 同资源冲突 → 顺序
-    // 路径），实际操作是读父管道 rfd → F-R7-1 缺陷触发。
+    // 路径），实际操作是读父管道 rfd → 顺序路径分支内管道读成功（RFC-07 修复）。
     let r = rt.run_blocking(Action::Fork {
         left: Box::new(syscall(
             DataOp::Read { fd: rfd, len: 4 },
@@ -440,12 +448,19 @@ fn rfc07_pipe_read_in_sequential_fork_locked_invalid_input() {
             vec![wr(fda)],
             Action::Pure,
         )),
-        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+        combine: Box::new(|l, r| Action::Pure(Value::List(vec![l, r]))),
     });
-    match r {
-        Err(SysError::InvalidInput) => {}
-        other => panic!("F-R7-1 行为锁定：顺序分支内管道 IO 应 InvalidInput，得到 {other:?}"),
-    }
+    let v = r.unwrap();
+    let (lv, rv) = match v {
+        Value::List(l) if l.len() == 2 => (l[0].clone(), l[1].clone()),
+        other => panic!("期望 List([Bytes, Unit])，得到 {other:?}"),
+    };
+    assert_eq!(
+        lv,
+        Value::Bytes(b"S".to_vec()),
+        "顺序分支内管道读成功（RFC-07 修复，原 F-R7-1 锁定 InvalidInput）"
+    );
+    assert_eq!(rv, Value::Unit, "右分支文件写不受影响");
     let _ = wfd;
 }
 
@@ -527,12 +542,13 @@ fn rfc07_pipe_roundtrip_close_no_regression() {
 ///   同 fd 的 Write 声明通过 A4（`check_linear` Ok）——「同路径可重试」的
 ///   A4 面恢复（resource-notes §12 登记的残余缺口已修复）；
 /// - undo 栈无残留（阻塞写未入 undo）；
-/// - **R7-A 修复翻转（原 F-R7-2 缺陷锁定）**：take→await→put_back 窗口内
-///   future 被取消丢弃 → 已取句柄由 RAII 守卫（`TakeHandleGuard`）自动归还
-///   （分配新注册表 fd + 更新映射）——写端未被物理关闭：排空取消写残留的缓冲
-///   数据后，小写 → 读回成功（泄漏行为下此处 take 即 NotFound）。
-///   （注：轮换语义下注册表键是 put_back 新分配的 fd，`lookup(wfd)` 为 None
-///   属正常；可寻址性由下述写读回环证明。）
+/// - **RFC-07 修复后语义**：管道走文件式双表（Arc<Mutex<WriteHalf>>，lock
+///   下 IO），无 take→await→put_back 窗口——future 被取消丢弃时 MutexGuard
+///   自动释放、注册表条目与工作表条目原样保留，写端不会被物理关闭：排空取消
+///   写残留的缓冲数据后，小写 → 读回成功。原 F-R7-2 缺陷锁定（take 后泄漏
+///   → 句柄丢失 + 物理关闭）在修复前经 RAII 守卫（TakeHandleGuard）已闭环，
+///   本测试翻转后持续验证双表路径下取消不丢句柄。
+///   （注：双表路径下逻辑 fd 恒等注册表 fd，`lookup(wfd)` 为 Some 属正常。）
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn rfc0809_timeout_cancels_inflight_write_linear_rollback() {
@@ -579,10 +595,11 @@ fn rfc0809_timeout_cancels_inflight_write_linear_rollback() {
         "取消路径不产生 undo（阻塞写未入栈）"
     );
 
-    // R7-A 修复翻转（原 F-R7-2 锁定）：写端句柄已归还（RAII 守卫取消路径
-    // 自动 put_back）且物理未关闭——先排空取消写可能已灌入的缓冲数据
-    // （256KB 写满 64KB 缓冲区后阻塞被取消），再小写读回验证写端活性。
-    // 泄漏行为下：take_pipe_writer 因注册表条目丢失 + 映射陈旧 → NotFound。
+    // RFC-07 修复后：写端经 Arc<Mutex<WriteHalf>> 双表 lock，无 take/put_back
+    // ——取消丢弃 future 时 MutexGuard 释放、注册表与工作表条目原样保留、物理
+    // 未关闭——先排空取消写可能已灌入的缓冲数据（256KB 写满 64KB 缓冲区后
+    // 阻塞被取消），再小写读回验证写端活性。泄漏行为下：注册表条目丢失 →
+    // NotFound。
     let v = rt
         .run_blocking(syscall(
             DataOp::Read {
@@ -715,8 +732,9 @@ fn rfc0809_cancel_join_grace_join_path() {
 /// （500ms）后 inner 被丢弃（CANCELLED_ERR）→ on_timeout 生效；父级注册表
 /// 不受分支影响（分支注册表未合并）。
 /// 注：不可取消分支须选 &self 型操作（UDP lookup 直用）——轮换型句柄
-/// （TcpRead/管道）在分支 registry Clone 下 Arc 共享 → get_mut 失败提前
-/// InvalidInput（F-R7-1 同族），构造不出阻塞窗口。
+/// （TcpRead）在分支 registry Clone 下 Arc 共享 → get_mut 失败提前 InvalidInput
+/// （F-R7-3 同族），构造不出阻塞窗口（管道已改文件式双表，分支内会阻塞而非
+/// 失败，可作阻塞窗口候选）。
 #[cfg(not(feature = "virtual-clock"))]
 #[test]
 fn rfc0809_cancel_join_grace_exhausted_path() {
