@@ -814,6 +814,27 @@ mod tests {
     }
 
     #[test]
+    fn clear_keeps_cursor_when_unallocated() {
+        // 审查 Note 补测（D-096 边界）：分支偏移后**未分配**即 Replace——clear
+        // 保留根基线 (base,0) 且**不动 next_fd**（= base+offset = 1<<48，未逃逸
+        // 但也不回落）；merge 时收敛判定（next_fd == base+0）为假 → other_next
+        // = next_fd，父游标保持偏移位、不被误降。锚点吸收 (0,0) 后父继续偏移
+        // 仍锚定根基线。
+        let mut parent = ResourceRegistry::new();
+        let mut branch = parent.clone();
+        branch.offset_next_fd(1 << 48);
+        branch.clear();
+        parent.merge(branch);
+        assert_eq!(
+            parent.next_fd, 1 << 48,
+            "clear 后未分配：merge 不误降游标（保持偏移位）"
+        );
+        parent.offset_next_fd(2 << 48);
+        let nfd = parent.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
+        assert_eq!(nfd, 2 << 48, "父偏移仍锚定根基线（锚点吸收）");
+    }
+
+    #[test]
     fn merge_preserves_fd_identity() {
         // D13 合并（RFC-A3-2）：子注册表句柄以**原 fd** 直接并入父，fd 身份保留
         // （区别于 take+allocate 值迁移的 fd 重分配 workaround）。
