@@ -420,8 +420,8 @@ fn main() {
 | 4   | 契约冻结    | D1–D19 决策表 = 正确性承诺边界                                                                                  | `contracts.md`                 |
 | 5   | 关键决策    | Fd=u64 单调（D1）；Fork=静态冲突判定（D14/D17）；Replace=recover+clear（D10）；深度阈值 64（D-052 初版 96 → 迭代 1 取消传播帧膨胀复测裁决 64） | 决策链 + `spec/resource-notes.md` |
 | 6   | 实现      | 三层 crate：core 解释器（13 节点）/ std tokio 执行器 / macro 语法糖                                                   | `pdr.md` §15                   |
-| 7   | 验证分层    | 352 个测试函数（约 344 二进制 + 8 doc-test），46 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
-| 8   | 对抗审计 ×5+R6 | 164 个 E2E 测试（R1-R5=122 + R6=42，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
+| 7   | 验证分层    | 410 个测试函数（约 399 二进制 + 11 doc-test），48 个测试二进制 + 3 个 doc-test 运行                                                   | `spec/verification-plan.md`    |
+| 8   | 对抗审计 ×6+R7 | 182 个 E2E 测试（R1-R6=167 + R7=15，逐二进制 `--list` 实测），每轮独立发现（句柄活性/fd 区间/盲区/栈溢出/macOS errno/线性残留…）                                                               | `spec/proof-obligations.md`    |
 | 9   | 数学审计 ×5 | P1/P2/P3/P5 收敛为「有效（附声明前提）」，P4 部分（RFC-05，阶段 3+ 已裁决）                                                    | `spec/proof-obligations.md`    |
 | 10  | 缺陷库     | RFC-05~11 全部登记；RFC-11（栈溢出）与 RFC-10（Windows 错误码）已修复                                                    | `spec/resource-notes.md` §10   |
 | 11  | 性能推导    | echo 103.1%（顺序≈原生）；并行读受 executor 锁串行化限制                                                               | `perf/baseline-2026-08-15.txt` |
