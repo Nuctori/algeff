@@ -142,7 +142,7 @@ impl SyscallExecutor for MockExecutor {
                 UndoCapability::Invertible(Box::pin(async move {
                     undo_log.lock().unwrap().push(label);
                     Ok(())
-                    }))
+                }))
             } else {
                 UndoCapability::Identity
             };
@@ -1553,7 +1553,8 @@ fn fork_sequential_left_error_right_still_executes_and_merges() {
     // （fd 1/2/3 均允许重复；失败 Write 的标记回滚语义对 use 无影响）。
     for fd in [1u64, 2, 3] {
         assert!(
-            reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write)).is_ok(),
+            reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write))
+                .is_ok(),
             "分支 fd {fd} 的 Write 并入父后仍允许（use 语义）"
         );
     }

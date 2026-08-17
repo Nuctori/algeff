@@ -335,7 +335,11 @@ fn readme_painpoints_atomic_replay_undo_compose() {
                 data
             })
             .unwrap();
-        assert_eq!(v, Value::Bytes(format!("round {i}").into_bytes()), "痛点 2 第 {i} 次重放");
+        assert_eq!(
+            v,
+            Value::Bytes(format!("round {i}").into_bytes()),
+            "痛点 2 第 {i} 次重放"
+        );
     }
 
     // 痛点 3：Replace 一键撤销（独立 Runtime → 撤销栈只含本段副作用）

@@ -18,7 +18,7 @@ pub mod virtual_clock;
 pub use action::*;
 pub use error::SysError;
 pub use resource::*;
-pub use runtime::{Context, Runtime, UndoStack};
+pub use runtime::{Context, IdempotencyRegistry, IdempotencyStatus, Runtime, UndoStack};
 pub use syscall::{BoxFuture, SyscallExecutor, UndoCapability, UndoOp};
 
 /// 常用入口（pdr.md §14 示例风格）。
@@ -31,6 +31,6 @@ pub mod prelude {
         AccessMode, AppendOnly, Owned, ReadOnly, Resource, ResourceArbiter, ResourceHandle,
         ResourceInner, ResourceRegistry, ResourceSet, ResourceUsage, TypedResource, WriteOnly,
     };
-    pub use crate::runtime::{Context, Runtime, UndoStack};
+    pub use crate::runtime::{Context, IdempotencyRegistry, IdempotencyStatus, Runtime, UndoStack};
     pub use crate::syscall::{SyscallExecutor, UndoCapability, UndoOp};
 }

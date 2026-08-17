@@ -617,23 +617,23 @@ impl TokioExecutor {
                 .map_err(to_sys_err)?;
             let orig_len = file.metadata().await.map_err(to_sys_err)?.len();
             let is_append = self
-            .append_fds
-            .lock()
-            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
-            .contains(&fd);
-        let undo = if is_append {
-            // append 写：只追加到文件尾、不覆盖已有内容 → 逆 = 截断回原长度
-            // （无需写前读；Windows append 句柄 pos 不可靠，r4b (5) 场景）。
-            file.write_all(data).await.map_err(to_sys_err)?;
-            file.flush().await.map_err(to_sys_err)?;
-            let undo_file = m.clone();
-            let undo: UndoOp = Box::pin(async move {
-                let g = undo_file.lock().await;
-                let _ = g.set_len(orig_len).await;
-                Ok(())
-            });
-            UndoCapability::Invertible(undo)
-        } else if orig_len < FULL_UNDO_MAX_BYTES {
+                .append_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .contains(&fd);
+            let undo = if is_append {
+                // append 写：只追加到文件尾、不覆盖已有内容 → 逆 = 截断回原长度
+                // （无需写前读；Windows append 句柄 pos 不可靠，r4b (5) 场景）。
+                file.write_all(data).await.map_err(to_sys_err)?;
+                file.flush().await.map_err(to_sys_err)?;
+                let undo_file = m.clone();
+                let undo: UndoOp = Box::pin(async move {
+                    let g = undo_file.lock().await;
+                    let _ = g.set_len(orig_len).await;
+                    Ok(())
+                });
+                UndoCapability::Invertible(undo)
+            } else if orig_len < FULL_UNDO_MAX_BYTES {
                 // 写前读：读取将被覆盖区域（pos..pos+len），完整回滚（Full 策略）。
                 let mut orig = vec![0u8; data.len()];
                 let mut filled = 0usize;
@@ -995,7 +995,10 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, fd);
-        Ok((Value::List(vec![Value::Fd(fd), Value::Addr(peer)]), UndoCapability::Identity))
+        Ok((
+            Value::List(vec![Value::Fd(fd), Value::Addr(peer)]),
+            UndoCapability::Identity,
+        ))
     }
 
     async fn op_tcp_connect(
@@ -1146,7 +1149,7 @@ impl TokioExecutor {
         buf.truncate(n);
         Ok((
             Value::List(vec![Value::Bytes(buf), Value::Addr(addr)]),
-    UndoCapability::NonInvertible,
+            UndoCapability::NonInvertible,
         ))
     }
 
@@ -1197,7 +1200,10 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(wfd, w_arc);
-        Ok((Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]), UndoCapability::Identity))
+        Ok((
+            Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]),
+            UndoCapability::Identity,
+        ))
     }
 
     // ── 进程 ───────────────────────────────────────────────────────────
@@ -1588,7 +1594,9 @@ impl TokioExecutor {
                     }
                 }
             }
-            g.seek(std::io::SeekFrom::Start(pos)).await.map_err(to_sys_err)?;
+            g.seek(std::io::SeekFrom::Start(pos))
+                .await
+                .map_err(to_sys_err)?;
             if !readable {
                 // 无法构造逆（如只写句柄）→ 不静默降级。
                 return Err(SysError::PermissionDenied);

@@ -25,7 +25,8 @@ use std::path::PathBuf;
 
 use algeff_core::{
     Action, BoxFuture, DataOp, OpenFlags, Owned, ReadOnly, ResourceInner, ResourceRegistry,
-    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability, Value, WriteOnly,
+    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability, Value,
+    WriteOnly,
 };
 
 // ── 本地辅助（src/ 冻结不可改，测试内复制；与 R4b 相同约定）──────────────
@@ -77,7 +78,10 @@ impl SyscallExecutor for ScriptedExecutor {
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
     ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
-        let r = self.results.pop_front().unwrap_or(Ok((Value::Unit, UndoCapability::Identity)));
+        let r = self
+            .results
+            .pop_front()
+            .unwrap_or(Ok((Value::Unit, UndoCapability::Identity)));
         Box::pin(async move { r })
     }
 }
@@ -92,8 +96,8 @@ fn failed_open_write_rolls_back_path_marker_same_path_retry_ok() {
     // Write 标记 → 修复前残留 → 同路径 Write 模式重试被 A4 误拒 InvalidInput。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Err(SysError::AlreadyExists), // 首次 Open(w) 物理失败
-            Ok((Value::Fd(7), UndoCapability::Identity)),     // 重试 Open(rw) 成功
+            Err(SysError::AlreadyExists),                 // 首次 Open(w) 物理失败
+            Ok((Value::Fd(7), UndoCapability::Identity)), // 重试 Open(rw) 成功
         ]),
     }));
     let p = PathBuf::from("/same/path.txt");
@@ -142,9 +146,9 @@ fn failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept() {
     // 不因「失败-回滚-重试」而错乱）。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), UndoCapability::Identity)),        // Open(rw) P 成功 → fd 0
-            Err(SysError::PermissionDenied), // Write(fd 0) 物理失败（只读 fd 写）
-            Ok((Value::U64(4), UndoCapability::Identity)),       // 重试 Write(fd 0) 成功
+            Ok((Value::Fd(0), UndoCapability::Identity)), // Open(rw) P 成功 → fd 0
+            Err(SysError::PermissionDenied),              // Write(fd 0) 物理失败（只读 fd 写）
+            Ok((Value::U64(4), UndoCapability::Identity)), // 重试 Write(fd 0) 成功
         ]),
     }));
     let p = PathBuf::from("/p.txt");
@@ -207,8 +211,8 @@ fn failed_close_rolls_back_own_terminal_marker_fd_still_usable() {
     // owned_consumed 残留 → 任何 usage 都被拒 InvalidInput）。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), UndoCapability::Identity)),  // Open 成功 → fd 0
-            Err(SysError::BrokenPipe), // Close(fd 0) 物理失败
+            Ok((Value::Fd(0), UndoCapability::Identity)), // Open 成功 → fd 0
+            Err(SysError::BrokenPipe),                    // Close(fd 0) 物理失败
             Ok((Value::U64(4), UndoCapability::Identity)), // 随后 Write(fd 0) 成功
         ]),
     }));
@@ -250,7 +254,7 @@ fn rollback_only_touches_this_syscall_own_marker_success_path_axiom_kept() {
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
             Ok((Value::Fd(0), UndoCapability::Identity)), // Open(rw) P 成功
-            Err(SysError::PermissionDenied), // Write(fd 0) 物理失败
+            Err(SysError::PermissionDenied),              // Write(fd 0) 物理失败
         ]),
     }));
     let p = PathBuf::from("/keep.txt");

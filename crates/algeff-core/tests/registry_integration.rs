@@ -69,7 +69,8 @@ fn open_write_close_lifecycle() {
     );
     // 重复 Write 允许（use 语义，运行时维护独立 undo）
     assert!(
-        reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok(),
         "同一资源二次 Write 允许（use 语义）"
     );
 

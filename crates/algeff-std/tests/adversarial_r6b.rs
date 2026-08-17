@@ -1138,7 +1138,10 @@ fn r6b_catch_error_then_new_ops_work() {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert!(!target.exists(), "Replace 后新建文件被删除（create 逆生效）");
+    assert!(
+        !target.exists(),
+        "Replace 后新建文件被删除（create 逆生效）"
+    );
     assert!(rt.undo_stack().is_empty(), "Replace 清空 undo");
     assert!(rt.registry().lookup(fd).is_none(), "Replace 释放句柄");
 }

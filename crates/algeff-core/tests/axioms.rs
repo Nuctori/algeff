@@ -203,7 +203,10 @@ fn a4_write_use_semantics_repeatable() {
     let u = usage(Resource::Fd(1), AccessMode::Write);
     // use 语义（D-0xx A4 拆分）：Write 不限次数。
     assert!(reg.check_linear(&u).is_ok(), "首次 Write 应 Ok");
-    assert!(reg.check_linear(&u).is_ok(), "重复 Write 允许（use 可多次）");
+    assert!(
+        reg.check_linear(&u).is_ok(),
+        "重复 Write 允许（use 可多次）"
+    );
 }
 
 #[test]

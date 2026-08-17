@@ -338,7 +338,11 @@ fn undo_besteffort_2mb_write_persists_after_replace() {
     ))
     .unwrap();
     // 大文件（2MB）写 → 无 Full 撤销 → NonInvertible 标记 → Replace 拒绝。
-    assert_eq!(rt.undo_stack().len(), 0, "大文件写不产生 undo（NonInvertible）");
+    assert_eq!(
+        rt.undo_stack().len(),
+        0,
+        "大文件写不产生 undo（NonInvertible）"
+    );
 
     let e = rt
         .run_blocking(Action::Replace {

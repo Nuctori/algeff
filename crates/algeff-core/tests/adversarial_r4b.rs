@@ -70,8 +70,10 @@ struct ScriptExecutor {
 
 impl ScriptExecutor {
     fn with_values(vals: Vec<Value>, fallback: Value) -> Self {
-        let items: VecDeque<(Value, UndoCapability)> =
-            vals.into_iter().map(|v| (v, UndoCapability::Identity)).collect();
+        let items: VecDeque<(Value, UndoCapability)> = vals
+            .into_iter()
+            .map(|v| (v, UndoCapability::Identity))
+            .collect();
         Self {
             queue: Arc::new(Mutex::new(items)),
             fallback,

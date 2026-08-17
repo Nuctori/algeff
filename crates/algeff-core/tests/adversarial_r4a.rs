@@ -71,7 +71,8 @@ fn reg_external_allocate_take_clear_d1_monotonic() {
         .check_linear(&usage(r.clone(), AccessMode::Write))
         .is_ok());
     assert!(
-        reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(r.clone(), AccessMode::Write))
+            .is_ok(),
         "同一资源二次 Write 允许（use 语义）"
     );
 
@@ -211,7 +212,8 @@ fn reg_external_mixed_sequence_d1_d13_d10() {
     assert!(reg.lookup(a0).is_some(), "父原句柄保留");
     // 子路径 Write（use 语义）并入父：允许重复（运行时维护独立 undo）。
     assert!(
-        reg.check_linear(&usage(Resource::Fd(c1), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(Resource::Fd(c1), AccessMode::Write))
+            .is_ok(),
         "merge 后 Write 仍允许（use 语义，不消费）"
     );
 

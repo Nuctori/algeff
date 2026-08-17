@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use algeff_core::{
     AccessMode, Action, BoxFuture, DataOp, OpenFlags, PipeFlags, Resource, ResourceHandle,
-    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability,
-    Value,
+    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource,
+    UndoCapability, Value,
 };
 use algeff_std::adapters::{and_then, open_file};
 use algeff_std::TokioExecutor;

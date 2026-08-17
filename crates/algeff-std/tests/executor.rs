@@ -257,7 +257,7 @@ async fn rename_undo() {
         .unwrap();
     assert!(b.exists() && !a.exists());
 
-let UndoCapability::Invertible(undo) = undo else {
+    let UndoCapability::Invertible(undo) = undo else {
         panic!("Rename 应返回 undo")
     };
     undo.await.unwrap();
@@ -448,7 +448,7 @@ async fn mutex_lock_exclusion() {
     }
 
     // 释放第一把锁：执行 undo（等价解释器 recover 路径）→ 重新获取成功。
-if let UndoCapability::Invertible(u) = undo1 {
+    if let UndoCapability::Invertible(u) = undo1 {
         u.await.unwrap();
     }
     let (_v2, _undo2) = ex.lock().await.execute(&op, &mut reg).await.unwrap();
@@ -495,7 +495,7 @@ async fn mutex_lock_arbiter_contention() {
     // 独占不变量：至多一个同时持有（恰好一个 Ok）。
     assert!(a_ok ^ b_ok, "至多一个同时持有（A={a_ok} B={b_ok}）");
     // 释放成功方的锁（undo 已同时释放 arbiter 占坑）→ 重新获取成功。
-let UndoCapability::Invertible(undo) = undo_opt else {
+    let UndoCapability::Invertible(undo) = undo_opt else {
         panic!("MutexLock 应返回 undo")
     };
     undo.await.unwrap();
@@ -530,7 +530,7 @@ async fn mutex_unlock_releases_arbiter() {
         .unwrap();
     // undo1（recover 路径）此时全部 no-op：slot 已空 + release 幂等，
     // 不得破坏 lock#2 已释放的状态。
-let UndoCapability::Invertible(undo1) = undo1 else {
+    let UndoCapability::Invertible(undo1) = undo1 else {
         panic!("MutexLock 应返回 undo")
     };
     undo1.await.unwrap();

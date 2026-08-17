@@ -58,18 +58,20 @@ fn main() {
     for i in 0..3 {
         let p = replay_path.clone();
         let mut rt2 = Runtime::new(Box::new(TokioExecutor::new()));
-        let result = rt2.run_blocking(do_! {
-            let fd = dx::open(&p, OpenFlags {
-                read: true, write: true, create: true, truncate: true, ..Default::default()
-            });
-            dx::write(&fd, format!("round {i}").into_bytes());
-            dx::close(&fd);
+        let result = rt2
+            .run_blocking(do_! {
+                let fd = dx::open(&p, OpenFlags {
+                    read: true, write: true, create: true, truncate: true, ..Default::default()
+                });
+                dx::write(&fd, format!("round {i}").into_bytes());
+                dx::close(&fd);
 
-            let fd2 = dx::open(&p, OpenFlags { read: true, ..Default::default() });
-            let data = dx::read(&fd2, 64);
-            dx::close(&fd2);
-            data
-        }).unwrap();
+                let fd2 = dx::open(&p, OpenFlags { read: true, ..Default::default() });
+                let data = dx::read(&fd2, 64);
+                dx::close(&fd2);
+                data
+            })
+            .unwrap();
         println!("  第 {} 次: {:?}", i + 1, result);
     }
     println!();
@@ -90,7 +92,10 @@ fn main() {
 
     let undo_path = dir.join("undo.txt");
     std::fs::write(&undo_path, "original").unwrap();
-    println!("  撤销前: {:?}", std::fs::read_to_string(&undo_path).unwrap());
+    println!(
+        "  撤销前: {:?}",
+        std::fs::read_to_string(&undo_path).unwrap()
+    );
 
     let mut rt3 = Runtime::new(Box::new(TokioExecutor::new()));
     let p = undo_path.clone();
@@ -103,14 +108,22 @@ fn main() {
         dx::write(&fd, b"this will be undone".to_vec());
         dx::close(&fd);
         Value::Unit
-    }).unwrap();
-    println!("  做完副作用: {:?}", std::fs::read_to_string(&undo_path).unwrap());
+    })
+    .unwrap();
+    println!(
+        "  做完副作用: {:?}",
+        std::fs::read_to_string(&undo_path).unwrap()
+    );
 
     // 第二步：Replace 一键回滚（撤销步骤 1 的全部效果）
     rt3.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
-    }).unwrap();
-    println!("  撤销后: {:?}", std::fs::read_to_string(&undo_path).unwrap());
+    })
+    .unwrap();
+    println!(
+        "  撤销后: {:?}",
+        std::fs::read_to_string(&undo_path).unwrap()
+    );
     println!();
 
     // ================================================================
@@ -143,11 +156,9 @@ fn main() {
     // 顺序组合：step1 ; step2 ; step3 ; ...
     let combined = steps
         .into_iter()
-        .reduce(|acc, step| {
-            Action::Sequential {
-                current: Box::new(acc),
-                next: Box::new(move |_| step),
-            }
+        .reduce(|acc, step| Action::Sequential {
+            current: Box::new(acc),
+            next: Box::new(move |_| step),
         })
         .unwrap();
 

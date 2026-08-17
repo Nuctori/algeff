@@ -230,14 +230,20 @@ pub fn unit() -> Action {
     Action::Pure(Value::Unit)
 }
 
-/// 显式声明不可逆副作用（D-0xx P2）：包装一个操作，表明用户已知并接受
-/// 其不可逆性（unlink/udp/kill 等）——代码自文档化，Replace 闸门仍会拒绝
-/// 含不可逆副作用的执行段，但用户的选择是显式的而非执行中的意外。
+/// 幂等执行（D-0xx 幂等键状态机）：给一段副作用挂全局幂等键。
 ///
-/// 当前为文档标记（语义由 executor 的 UndoCapability 表达）；后续可升级为
-/// Action 包装节点以支持宏级静态检查。
-pub fn irreversible(action: Action) -> Action {
-    action
+/// - 键 COMMITTED 未 REVERTED（本 Runtime 生命周期内已成功执行且未撤销）
+///   → 重试时返回缓存结果，**不重新执行**（非幂等效应重试安全）；
+/// - 该段的副作用被 `Replace`/`Scope` 撤销后键置 REVERTED → 允许重新执行
+///   （恰好一次语义：生命周期内副作用只真正发生一次）。
+///
+/// 典型用法：消息队列消费、初始化/建表、注册——"执行一次"的效应。
+pub fn idempotent(key: impl Into<String>, inner: Action) -> Action {
+    Action::Idempotent {
+        key: key.into(),
+        inner: Box::new(inner),
+        next: Box::new(Action::Pure),
+    }
 }
 
 // ── 值提取（do_! 的 `let` 绑定的是原始 `Value`，使用处按类型提取）─────

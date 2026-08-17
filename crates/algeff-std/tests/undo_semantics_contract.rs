@@ -4,14 +4,14 @@
 //! 2. **undo 闭包失败上报**：mkdir 逆（remove_dir 非空失败）→ recover 返回 Err。
 //! 3. **A4 use/move 拆分（已反转）**：Write 是 use 语义可多次（独立 undo +
 //!    LIFO 撤销）；Own 是 move 语义终结一次。二写允许且撤销正确。
-//! 4. **open+create 不可逆显式化**：Open(create) 标 NonInvertible → Replace 闸门拒绝
-//!    （不再静默残留）。
+//! 4. **open+create 逆 = unlink（P1 已补）**：新建文件 Replace 后删除（真回归，
+//!    不再静默残留）。
 
 use std::path::PathBuf;
 
 use algeff_core::{
-    Action, DataOp, OpenFlags, ResourceInner, ResourceUsage, Runtime, SysError, TypedResource,
-    Value, WriteOnly,
+    Action, DataOp, IdempotencyStatus, OpenFlags, ResourceInner, ResourceUsage, Runtime, SysError,
+    TypedResource, Value, WriteOnly,
 };
 use algeff_macro::do_;
 use algeff_std::dx;
@@ -214,18 +214,10 @@ fn mutex_reentry_still_blocked_by_arbiter_after_a4_use_semantics() {
     // （A7 原子占坑）独立保证——同 id 二次 MutexLock 在仲裁层 WouldBlock，
     // 不依赖 Write 消费（blocker-3 独立验证）。
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
-    rt.run_blocking(syscall(
-        DataOp::MutexLock { id: 9 },
-        vec![],
-        Action::Pure,
-    ))
-    .unwrap();
+    rt.run_blocking(syscall(DataOp::MutexLock { id: 9 }, vec![], Action::Pure))
+        .unwrap();
     let e = rt
-        .run_blocking(syscall(
-            DataOp::MutexLock { id: 9 },
-            vec![],
-            Action::Pure,
-        ))
+        .run_blocking(syscall(DataOp::MutexLock { id: 9 }, vec![], Action::Pure))
         .unwrap_err();
     assert_eq!(
         e,
@@ -246,7 +238,11 @@ fn dataop_static_role_direct() {
         "Stat 无副作用 → Identity"
     );
     assert_eq!(
-        DataOp::Write { fd: 1, data: b"d".to_vec() }.role(),
+        DataOp::Write {
+            fd: 1,
+            data: b"d".to_vec()
+        }
+        .role(),
         UndoRole::Invertible,
         "Write 可逆 → Invertible（静态，运行时写前读决定）"
     );
@@ -256,13 +252,20 @@ fn dataop_static_role_direct() {
         "Unlink 删除不可逆 → NonInvertible"
     );
     assert_eq!(
-        DataOp::Open { path: p, flags: OpenFlags::default() }.role(),
+        DataOp::Open {
+            path: p,
+            flags: OpenFlags::default()
+        }
+        .role(),
         UndoRole::Invertible,
         "Open 静态可逆（运行时按 flags/existed 细分）"
     );
     assert!(!DataOp::GetTime.is_deterministic(), "GetTime 不确定（P3）");
     assert!(
-        DataOp::Stat { path: PathBuf::from("/y") }.is_deterministic(),
+        DataOp::Stat {
+            path: PathBuf::from("/y")
+        }
+        .is_deterministic(),
         "Stat 确定（P3）"
     );
 }
@@ -303,5 +306,262 @@ fn create_open_inverse_removes_new_file_on_replace() {
     assert!(
         !f.exists(),
         "Replace 后新建文件被删除（create 逆生效，真回归）"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// D-0xx 幂等键状态机：重试去重 + 恰好一次（COMMITTED → REVERTED → 可重执行）
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn idempotent_key_retry_returns_cached_result_without_reexecuting() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("idem.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let p1 = p.clone();
+
+    // 带幂等键的副作用段：写文件（非幂等效应——重复执行会重复覆盖）。
+    let make_effect = || {
+        dx::idempotent(
+            "charge:order-42",
+            do_! {
+                let fd = dx::open(
+                    &p1,
+                    OpenFlags {
+                        read: true,
+                        write: true,
+                        create: true,
+                        ..Default::default()
+                    },
+                );
+                dx::write(&fd, b"charged".to_vec());
+                dx::close(&fd);
+                Value::U64(42) // 效应结果（如扣款单号）
+            },
+        )
+    };
+
+    // 第一次执行：真正发生副作用，键 COMMITTED + 缓存结果。
+    let v1 = rt.run_blocking(make_effect()).unwrap();
+    assert_eq!(v1, Value::U64(42));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "charged");
+
+    // 第二次执行（重试）：键 COMMITTED → 返回缓存，不重新执行（undo 栈不长）。
+    let stack_len_before = rt.undo_stack().len();
+    let v2 = rt.run_blocking(make_effect()).unwrap();
+    assert_eq!(v2, Value::U64(42), "重试返回缓存结果");
+    assert_eq!(
+        rt.undo_stack().len(),
+        stack_len_before,
+        "重试不触发逆函数、不压新 undo（从未真正'新执行'）"
+    );
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "charged");
+}
+
+#[test]
+fn idempotent_key_exactly_once_across_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("init.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let p1 = p.clone();
+
+    let make_init = || {
+        dx::idempotent(
+            "init:db-schema",
+            do_! {
+                let fd = dx::open(
+                    &p1,
+                    OpenFlags {
+                        read: true,
+                        write: true,
+                        create: true,
+                        ..Default::default()
+                    },
+                );
+                dx::write(&fd, b"schema-v1".to_vec());
+                dx::close(&fd);
+                Value::Unit
+            },
+        )
+    };
+
+    // 第一次：副作用发生，键 COMMITTED。
+    rt.run_blocking(make_init()).unwrap();
+    assert_eq!(
+        rt.context()
+            .idempotency
+            .lock()
+            .unwrap()
+            .status_of("init:db-schema"),
+        Some(IdempotencyStatus::Committed),
+        "执行后键 COMMITTED"
+    );
+
+    // Replace：撤销该段副作用 → REVERT undo 执行 → 键 REVERTED。
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+    assert_eq!(
+        rt.context()
+            .idempotency
+            .lock()
+            .unwrap()
+            .status_of("init:db-schema"),
+        Some(IdempotencyStatus::Reverted),
+        "Replace 撤销后键 REVERTED（允许未来重执行——恰好一次语义）"
+    );
+    assert!(!p.exists(), "Replace 撤销副作用：create 逆删除新建文件");
+
+    // REVERTED → 重新执行：副作用再次真正发生（热重载语义：卸载后重载可重新初始化）。
+    rt.run_blocking(make_init()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "schema-v1",
+        "REVERTED 后重执行生效"
+    );
+    assert_eq!(
+        rt.context()
+            .idempotency
+            .lock()
+            .unwrap()
+            .status_of("init:db-schema"),
+        Some(IdempotencyStatus::Committed),
+        "重执行后再次 COMMITTED"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// D-103：fork_conflict 幂等键判定——同 key 两分支 → 冲突串行（恰好一次）
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn fork_conflict_same_idempotency_key_serialized() {
+    use algeff_core::runtime::fork_conflict;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p1 = dir.path().join("a.txt");
+    let p2 = dir.path().join("b.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    // 两分支各做一个同 key 的幂等段（资源不相交——纯幂等键冲突判定）。
+    let left = dx::idempotent(
+        "effect:once",
+        do_! {
+            let fd = dx::open(
+                &p1,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            );
+            dx::write(&fd, b"L".to_vec());
+            dx::close(&fd);
+            Value::Unit
+        },
+    );
+    let right = dx::idempotent(
+        "effect:once",
+        do_! {
+            let fd = dx::open(
+                &p2,
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                },
+            );
+            dx::write(&fd, b"R".to_vec());
+            dx::close(&fd);
+            Value::Unit
+        },
+    );
+
+    // 静态冲突判定：同幂等键 → can_parallel=false → 串行。
+    assert!(
+        fork_conflict(rt.registry(), &left, &right),
+        "同幂等键两分支 → 冲突（串行，防并行重复执行破坏恰好一次）"
+    );
+
+    // 执行：串行路径下第一个 COMMITTED，第二个命中缓存不重执行——
+    // 但注意：第二个是独立幂等段（同 key），串行执行时第二个查表 COMMITTED
+    // → 跳过 inner → 只第一个真实执行。
+    rt.run_blocking(Action::Fork {
+        left: Box::new(left),
+        right: Box::new(right),
+        combine: Box::new(|_, _| Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+    // 恰好一次：同 key 只一个真实执行（一个文件有内容）。
+    let l_ok = std::fs::read_to_string(&p1).unwrap_or_default() == "L";
+    let r_ok = std::fs::read_to_string(&p2).unwrap_or_default() == "R";
+    assert!(
+        l_ok ^ r_ok,
+        "同幂等键恰好一次：只有一个分支真实执行（串行 + 键去重）"
+    );
+}
+
+#[test]
+fn replace_rejected_then_reusable_same_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("reject-then-ok.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    // 段 1：管道写（NonInvertible，不可回滚）→ Replace 拒绝。
+    let (rfd, wfd) = {
+        let v = rt.run_blocking(dx::pipe_open()).unwrap();
+        match v {
+            Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),
+            other => panic!("期望 List([Fd, Fd])，得到 {other:?}"),
+        }
+    };
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: wfd,
+            data: b"x".to_vec(),
+        },
+        vec![wr(wfd)],
+        Action::Pure,
+    ))
+    .unwrap();
+    let e = rt
+        .run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::PermissionDenied,
+        "含管道写（NonInvertible）→ Replace 拒绝"
+    );
+
+    // 段 2：全新纯可逆段 → Replace 必须成功（MEDIUM-2 修复：拒绝后 flag 已重置，
+    // 不再永久楔死）。
+    std::fs::write(&p, "before").unwrap();
+    rt.run_blocking(do_! {
+        let fd = dx::open(
+            &p,
+            OpenFlags {
+                read: true,
+                write: true,
+                ..Default::default()
+            },
+        );
+        dx::write(&fd, b"temporary".to_vec());
+        dx::close(&fd);
+        Value::Unit
+    })
+    .unwrap();
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "before",
+        "拒绝后新段 Replace 成功（flag 已重置，可逆部分恢复）"
     );
 }

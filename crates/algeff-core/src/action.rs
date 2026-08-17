@@ -234,20 +234,45 @@ impl DataOp {
     pub const fn role(&self) -> UndoRole {
         use DataOp::*;
         match self {
-            // 无副作用：读/查询/时间
-            Read { .. } | Stat { .. } | ReadDir { .. } | GetTime | Mmap { .. } | Munmap { .. } => {
-                UndoRole::Identity
-            }
+            // 单位元（无外部可观察副作用）：读/查询/时间/资源生命周期
+            // （close/dup/bind/connect 的副作用随 reg.clear/drop 回归 → Identity）。
+            Read { .. }
+            | Stat { .. }
+            | ReadDir { .. }
+            | GetTime
+            | Mmap { .. }
+            | Munmap { .. }
+            | Close { .. }
+            | Dup { .. }
+            | Dup2 { .. }
+            | MutexUnlock { .. }
+            | PipeOpen { .. }
+            | TcpBind { .. }
+            | TcpAccept { .. }
+            | TcpConnect { .. }
+            | UdpBind { .. } => UndoRole::Identity,
             // 可逆：内容/游标/元数据变更（逆构造可能依赖运行时条件）
-            Write { .. } | Seek { .. } | Rename { .. } | Truncate { .. } | Mkdir { .. }
-            | Open { .. } | SendFile { .. } | Chmod { .. } | Chown { .. } | MutexLock { .. }
-            | MutexUnlock { .. } | Close { .. } | Dup { .. } | Dup2 { .. } | PipeOpen { .. }
-            | TcpBind { .. } | TcpAccept { .. } | TcpConnect { .. } | UdpBind { .. } => {
-                UndoRole::Invertible
-            }
+            Write { .. }
+            | Seek { .. }
+            | Rename { .. }
+            | Truncate { .. }
+            | Mkdir { .. }
+            | Open { .. }
+            | SendFile { .. }
+            | Chmod { .. }
+            | Chown { .. }
+            | MutexLock { .. } => UndoRole::Invertible,
             // 不可逆：投递/消费/删除/信号
-            Unlink { .. } | Rmdir { .. } | TcpRead { .. } | TcpWrite { .. } | TcpShutdown { .. }
-            | UdpRecvFrom { .. } | UdpSendTo { .. } | Spawn { .. } | Kill { .. } | Wait { .. }
+            Unlink { .. }
+            | Rmdir { .. }
+            | TcpRead { .. }
+            | TcpWrite { .. }
+            | TcpShutdown { .. }
+            | UdpRecvFrom { .. }
+            | UdpSendTo { .. }
+            | Spawn { .. }
+            | Kill { .. }
+            | Wait { .. }
             | SendSignal { .. } => UndoRole::NonInvertible,
         }
     }
@@ -256,9 +281,17 @@ impl DataOp {
     /// 结果不确定，virtual-clock feature 下不可重放。
     pub const fn is_deterministic(&self) -> bool {
         use DataOp::*;
+        // 墙钟时间/网络投递/外部进程/网络消费结果不确定（virtual-clock 下不可重放）。
         !matches!(
             self,
-            GetTime | UdpRecvFrom { .. } | UdpSendTo { .. } | Spawn { .. } | TcpAccept { .. }
+            GetTime
+                | UdpRecvFrom { .. }
+                | UdpSendTo { .. }
+                | TcpRead { .. }
+                | TcpWrite { .. }
+                | TcpAccept { .. }
+                | Spawn { .. }
+                | Wait { .. }
         )
     }
 }
@@ -320,6 +353,18 @@ pub enum Action {
     Catch {
         action: Box<Action>,
         handler: HandlerFn,
+    },
+    /// 幂等执行（D-0xx 幂等键状态机）：带全局幂等键的副作用段。
+    ///
+    /// 状态机：`PENDING → COMMITTED → REVERTED`。
+    /// - 执行时查键：COMMITTED 未 REVERTED → 返回缓存结果，**不执行 inner**；
+    /// - 未命中/REVERTED → 执行 inner（undo 压栈），成功后键置 COMMITTED 并缓存结果；
+    /// - 该段的 undo 被 recover 执行（Replace/Scope 退出）→ 键置 REVERTED，
+    ///   允许未来重新执行（恰好一次语义：生命周期内副作用只真正发生一次）。
+    Idempotent {
+        key: String,
+        inner: Box<Action>,
+        next: NextFn,
     },
 }
 

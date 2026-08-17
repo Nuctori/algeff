@@ -728,11 +728,7 @@ fn failed_exclusive_open_same_path_write_reopen_ok() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(
-        rt.undo_stack().len(),
-        2,
-        "二写各一个独立 undo（use 语义）"
-    );
+    assert_eq!(rt.undo_stack().len(), 2, "二写各一个独立 undo（use 语义）");
     assert!(
         std::fs::read(&p).unwrap().starts_with(b"patchedagain"),
         "两次写都真实生效（物理文件）"

@@ -115,7 +115,7 @@ impl SyscallExecutor for MockExecutor {
                 UndoCapability::Invertible(Box::pin(async move {
                     undo_log.lock().unwrap().push(label);
                     Ok(())
-                    }))
+                }))
             } else {
                 UndoCapability::Identity
             };

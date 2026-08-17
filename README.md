@@ -255,15 +255,18 @@ fn main() {
 **Algeff**：蓝图是不可变数据，同一份蓝图跑多少次结果一致（每轮 `truncate` 打开 + 写入 + 读回验证）：
 
 ```rust
+let path = std::path::PathBuf::from("replay.txt");
 for i in 0..3 {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    // do_! 生成 'static 闭包：块内引用 path 需每轮 clone owned 值
+    let p = path.clone();
     let v = rt.run_blocking(do_! {
-        let fd = dx::open(&path, OpenFlags {
+        let fd = dx::open(&p, OpenFlags {
             read: true, write: true, create: true, truncate: true, ..Default::default()
         });
         dx::write(&fd, format!("round {i}").into_bytes());
         dx::close(&fd);
-        let fd2 = dx::open(&path, OpenFlags { read: true, ..Default::default() });
+        let fd2 = dx::open(&p, OpenFlags { read: true, ..Default::default() });
         let data = dx::read(&fd2, 64);
         dx::close(&fd2);
         data

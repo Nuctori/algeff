@@ -795,7 +795,11 @@ fn catch_rfc10_io_error_is_caught_and_not_sticky() {
         .unwrap();
     assert!(rt.registry().lookup(fd).is_none(), "Close 释放句柄");
     // read 产生 1 个游标逆（A6 游标可观察）；Catch 失败路径无 undo。
-    assert_eq!(rt.undo_stack().len(), 1, "read 游标逆（Catch 失败路径无 undo）");
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "read 游标逆（Catch 失败路径无 undo）"
+    );
 }
 
 /// Catch 捕获网络错误（TcpConnect 被拒 → ConnectionRefused）且不粘滞：

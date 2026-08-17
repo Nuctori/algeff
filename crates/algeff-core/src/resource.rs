@@ -222,9 +222,8 @@ pub enum ResourceHandle {
 pub struct ResourceRegistry {
     next_fd: Fd,
     handles: HashMap<Fd, ResourceHandle>,
-    /// A4 线性检查：Write 已消费的资源（每资源至多一次）。
-    consumed: HashSet<Resource>,
     /// A4 线性检查：Own 已终结的资源（Own 之后该资源任何 usage 都拒绝）。
+    /// （D-0xx use/move 拆分后 Write 是 use 语义不消费，无 consumed 集。）
     owned_consumed: HashSet<Resource>,
     /// Fork 分支预留 fd 区间（F1 修复 + S6/A2 嵌套修复，由 `offset_next_fd`
     /// 记录）：`(未偏移基线, 偏移量)`。基线经 Clone 沿分支树传播：右分支首次
@@ -245,12 +244,11 @@ pub struct ResourceRegistry {
 }
 
 /// A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：捕获
-/// `ResourceRegistry` 的 `consumed`（Write 消费）与 `owned_consumed`
-/// （Own 终结）两集。由 `snapshot_linear` 产生、`rollback_linear_to`
-/// 消费（按「时段」回滚取消子树新增的线性标记）。
+/// `ResourceRegistry` 的 `owned_consumed`（Own 终结）集。由
+/// `snapshot_linear` 产生、`rollback_linear_to` 消费（按「时段」回滚
+/// 取消子树新增的 Own 终结标记）。
 #[derive(Default, Clone)]
 pub struct LinearSnapshot {
-    consumed: HashSet<Resource>,
     owned_consumed: HashSet<Resource>,
 }
 
@@ -285,7 +283,6 @@ impl ResourceRegistry {
     /// 注意：`next_fd` 不复位 —— Fd 全局唯一、单调递增、永不复用（决策 D1）。
     pub fn clear(&mut self) {
         self.handles.clear();
-        self.consumed.clear();
         self.owned_consumed.clear();
         // 审计 R3-E 修复（独立审查修正版）：fork_region 保留**树根基线**（offset
         // 归零）而非置 None——置 None 会让下一次 `offset_next_fd` 以当前 next_fd
@@ -356,7 +353,6 @@ impl ResourceRegistry {
     /// 本方法为加法 API，不改变任何既有方法签名。
     pub fn merge(&mut self, other: Self) {
         self.handles.extend(other.handles);
-        self.consumed.extend(other.consumed);
         self.owned_consumed.extend(other.owned_consumed);
         // F1/RFC-06 归一化：预留区间**从未实际分配**（next_fd 恰为 基线+偏移）
         // → 游标收敛回基线；**实际分配过** → 取 `max(self, 分支分配过的最大
@@ -425,26 +421,23 @@ impl ResourceRegistry {
     }
 
     /// 捕获当前 A4 线性状态快照（取消传播协议，RFC-08/09/12 残余修复用）：
-    /// `check_linear` 预插入的 Write（`consumed`）/ Own（`owned_consumed`）
-    /// 消费标记两集。快照**不含**句柄表与 `next_fd`——取消回滚只移除取消
-    /// 子树新插入的线性标记，不动句柄（物理清理由 undo 负责）与 D1 单调
-    /// 游标（fd 永不复用）。
+    /// `check_linear` 预插入的 Own（`owned_consumed`）终结标记集。
+    /// 快照**不含**句柄表与 `next_fd`——取消回滚只移除取消子树新插入的
+    /// Own 终结标记，不动句柄（物理清理由 undo 负责）与 D1 单调游标。
     pub fn snapshot_linear(&self) -> LinearSnapshot {
         LinearSnapshot {
-            consumed: self.consumed.clone(),
             owned_consumed: self.owned_consumed.clone(),
         }
     }
 
     /// 回滚线性状态至快照（取消传播协议，`Action::Timeout` 取消回滚用，
-    /// RFC-12 残余）：**移除**取消子树期间新增的 Write/Own 标记（当前集 ∖
+    /// RFC-12 残余）：**移除**取消子树期间新增的 Own 终结标记（当前集 ∖
     /// 快照集），子树自身移除的标记（如 Replace 的 `clear`、失败路径的
     /// `rollback_linear`）保持移除、不回补——只撤销新增，尊重子树自身的
     /// 状态操作。与 `rollback_linear`（逐批回滚）互补：快照回滚按「时段」
     /// 而非「批次」工作，适用于无法逐批跟踪的取消路径（inner future 被
     /// 丢弃/中断后不再有逐批上下文）。
     pub fn rollback_linear_to(&mut self, snap: &LinearSnapshot) {
-        self.consumed.retain(|r| snap.consumed.contains(r));
         self.owned_consumed
             .retain(|r| snap.owned_consumed.contains(r));
     }
@@ -683,7 +676,10 @@ mod tests {
         let u = usage(Resource::Fd(1), AccessMode::Write);
         // use 语义（D-0xx A4 拆分）：Write 不限次数，运行时维护每次独立 undo。
         assert!(reg.check_linear(&u).is_ok());
-        assert!(reg.check_linear(&u).is_ok(), "重复 Write 允许（use 可多次）");
+        assert!(
+            reg.check_linear(&u).is_ok(),
+            "重复 Write 允许（use 可多次）"
+        );
     }
 
     #[test]

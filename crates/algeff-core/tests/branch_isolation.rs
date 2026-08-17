@@ -130,7 +130,7 @@ impl SyscallExecutor for MockExecutor {
                 UndoCapability::Invertible(Box::pin(async move {
                     undo_log.lock().unwrap().push(label);
                     Ok(())
-                    }))
+                }))
             } else {
                 UndoCapability::Identity
             };
@@ -251,7 +251,8 @@ fn exec_P3_fork_left_write_right_read_isolated() {
 
     // (c) registry 线性标记：左分支 Write（use 语义）并入父 registry（F2 merge）
     assert!(
-        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write))
+            .is_ok(),
         "左分支 Write 并入父后 Write 仍允许（use 语义不消费）"
     );
     assert!(
@@ -384,7 +385,8 @@ fn exec_A5_choose_true_else_zero_effect() {
     assert_eq!(undo_len, 1, "撤销栈仅 then 分支的 undo");
     // 状态侧：then 分支 Write（use 语义）不消费；未选 else 分支资源零效应
     assert!(
-        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write))
+            .is_ok(),
         "then 分支 Write(fd 1) 不消费（use 语义）"
     );
     assert!(
@@ -412,7 +414,8 @@ fn exec_A5_choose_false_then_zero_effect() {
         "未选 then 分支资源零效应：Write(fd 1) 未被线性标记（A5 分支隔离）"
     );
     assert!(
-        reg.check_linear(&usage(Resource::Fd(2), AccessMode::Write)).is_ok(),
+        reg.check_linear(&usage(Resource::Fd(2), AccessMode::Write))
+            .is_ok(),
         "else 分支 Write(fd 2) 不消费（use 语义）"
     );
 }

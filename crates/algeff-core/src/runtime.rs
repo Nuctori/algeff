@@ -26,6 +26,77 @@ use crate::virtual_clock::VirtualClock;
 /// 超限返回 `SysError::InvalidInput`（可被外层 Catch 捕获）。
 pub const MAX_IO_LEN: usize = 64 * 1024 * 1024;
 
+/// 幂等键注册表（D-0xx 幂等键状态机）：键 → 状态机（COMMITTED/REVERTED）。
+///
+/// 跨执行持久（不随 Replace 的 reg.clear 清除）：恰好一次语义要求"副作用在
+/// 生命周期内只真正发生一次"——REVERTED 允许重执行，COMMITTED 返回缓存。
+#[derive(Debug, Default, Clone)]
+pub struct IdempotencyRegistry {
+    states: HashMap<String, IdempotencyState>,
+}
+
+/// 幂等键状态。
+#[derive(Debug, Clone)]
+pub struct IdempotencyState {
+    /// COMMITTED：副作用已发生且未撤销（重试返回缓存，不重执行）。
+    /// REVERTED：副作用已撤销（允许未来重新执行）。
+    pub status: IdempotencyStatus,
+    /// COMMITTED 时的缓存结果（REVERTED 后置 None）。
+    pub value: Option<Value>,
+}
+
+/// 幂等状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyStatus {
+    Committed,
+    Reverted,
+}
+
+impl IdempotencyRegistry {
+    pub fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+        }
+    }
+
+    /// 查键：COMMITTED 未 REVERTED → 返回缓存结果（重试去重）。
+    pub fn lookup_committed(&self, key: &str) -> Option<Value> {
+        match self.states.get(key) {
+            Some(s) if s.status == IdempotencyStatus::Committed => s.value.clone(),
+            _ => None,
+        }
+    }
+
+    /// 执行成功后提交：键置 COMMITTED + 缓存结果（幂等，重复 commit 不覆盖）。
+    pub fn commit(&mut self, key: &str, value: Value) {
+        let entry = self
+            .states
+            .entry(key.to_string())
+            .or_insert_with(|| IdempotencyState {
+                status: IdempotencyStatus::Reverted,
+                value: None,
+            });
+        if entry.status != IdempotencyStatus::Committed {
+            entry.status = IdempotencyStatus::Committed;
+            entry.value = Some(value);
+        }
+    }
+
+    /// 撤销后标记 REVERTED：键释放，允许未来重新执行（恰好一次语义的
+    /// "卸载不删日志，只执行逆函数"）。
+    pub fn revert(&mut self, key: &str) {
+        if let Some(s) = self.states.get_mut(key) {
+            s.status = IdempotencyStatus::Reverted;
+            s.value = None;
+        }
+    }
+
+    /// 当前键的状态（测试/诊断用）。
+    pub fn status_of(&self, key: &str) -> Option<IdempotencyStatus> {
+        self.states.get(key).map(|s| s.status)
+    }
+}
+
 /// 效果上下文 Γ（pdr.md §5.1.1）：当前状态（cwd + 环境变量）。
 ///
 /// 逻辑时钟放在 Context 内（而非 Runtime）：`interpret` 的签名冻结为
@@ -34,6 +105,8 @@ pub const MAX_IO_LEN: usize = 64 * 1024 * 1024;
 pub struct Context {
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
+    /// 幂等键注册表（D-0xx）：跨执行持久，undo 闭包经 Arc 共享访问。
+    pub idempotency: std::sync::Arc<std::sync::Mutex<IdempotencyRegistry>>,
     /// 逻辑时钟（可选 feature `virtual-clock`，pdr.md §5.2 / §12.1）。
     #[cfg(feature = "virtual-clock")]
     virtual_clock: Option<VirtualClock>,
@@ -52,6 +125,7 @@ impl Context {
         Self {
             cwd,
             env,
+            idempotency: std::sync::Arc::new(std::sync::Mutex::new(IdempotencyRegistry::new())),
             #[cfg(feature = "virtual-clock")]
             virtual_clock: Some(VirtualClock::new()),
         }
@@ -848,6 +922,9 @@ fn collect_syscall_resources(action: &Action, out: &mut ResourceSet) {
         }
         Action::Catch { action, .. } => collect_syscall_resources(action, out),
         Action::Sequential { current, .. } => collect_syscall_resources(current, out),
+        // D-0xx 幂等：inner 的副作用资源纳入冲突收集（键命中时 inner 不执行，
+        // 但静态判定保守——声明冲突仍可并行性判定）。
+        Action::Idempotent { inner, .. } => collect_syscall_resources(inner, out),
         // 审计 R7-D 修复：Invoke.captures 声明资源纳入静态冲突收集——此前
         // 落 `_ => {}` 被静默丢弃，Fork 分支含 Invoke 且 captures 与兄弟分支
         // 冲突时 can_parallel 误判 true → 真并行（captures 不经 check_linear，
@@ -857,7 +934,42 @@ fn collect_syscall_resources(action: &Action, out: &mut ResourceSet) {
     }
 }
 
-/// Fork 静态冲突检测（D14）：收集左右子树 Syscall 资源，查询冲突矩阵。
+/// 收集 Action 树中的幂等键（D-103）：遍历找 `Action::Idempotent` 的 key。
+fn collect_idempotency_keys(action: &Action, out: &mut std::collections::HashSet<String>) {
+    match action {
+        Action::Idempotent { key, inner, .. } => {
+            out.insert(key.clone());
+            collect_idempotency_keys(inner, out);
+        }
+        Action::Choose {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_idempotency_keys(then_branch, out);
+            collect_idempotency_keys(else_branch, out);
+        }
+        Action::Fork { left, right, .. } => {
+            collect_idempotency_keys(left, out);
+            collect_idempotency_keys(right, out);
+        }
+        Action::Scope { inner, .. } => collect_idempotency_keys(inner, out),
+        Action::Replace { target } => collect_idempotency_keys(target, out),
+        Action::Timeout {
+            action, on_timeout, ..
+        } => {
+            collect_idempotency_keys(action, out);
+            collect_idempotency_keys(on_timeout, out);
+        }
+        Action::Catch { action, .. } => collect_idempotency_keys(action, out),
+        Action::Sequential { current, .. } => collect_idempotency_keys(current, out),
+        _ => {}
+    }
+}
+
+/// Fork 静态冲突检测（D14 + D-103）：收集左右子树 Syscall 资源，查询冲突矩阵；
+/// 且两分支含**同幂等键** → 冲突（串行，防止并行同 key 重复执行——幂等键
+/// 语义要求"副作用只发生一次"，并行下两个分支都可能查到未 COMMITTED 都执行）。
 ///
 /// `can_parallel=false`（冲突）→ 顺序执行；`can_parallel=true` →
 /// `Runtime` 路径（Shared 通道）下真并行（`run_fork_parallel`）。
@@ -866,7 +978,15 @@ pub fn fork_conflict(reg: &ResourceRegistry, left: &Action, right: &Action) -> b
     let mut r_res = ResourceSet::new();
     collect_syscall_resources(left, &mut l_res);
     collect_syscall_resources(right, &mut r_res);
-    !reg.can_parallel(&l_res, &r_res)
+    if !reg.can_parallel(&l_res, &r_res) {
+        return true;
+    }
+    // D-103：幂等键冲突——同 key 的幂等段在两个分支并行会破坏"恰好一次"。
+    let mut l_keys = std::collections::HashSet::new();
+    let mut r_keys = std::collections::HashSet::new();
+    collect_idempotency_keys(left, &mut l_keys);
+    collect_idempotency_keys(right, &mut r_keys);
+    !l_keys.is_disjoint(&r_keys)
 }
 
 /// Fork 分支 fd 全局唯一区间序号（HIGH 嵌套碰撞修复，CTO 批准方向）。
@@ -1490,10 +1610,15 @@ async fn interpret_impl(
                 // 2. 执行段含不可逆副作用（has_irreversible）→ 不可真回归，拒绝，
                 //    显式报错（而不是静默假回滚）。
                 undo.recover().await?;
-                if undo.has_irreversible() {
+                // 语义真回归闸门：执行段含不可逆副作用（has_irreversible）→
+                // 拒绝（显式报错而非静默假回滚）。无论成功/拒绝，flag 都重置
+                // ——recover 已尽力回滚（可逆部分恢复），执行段结束，新段从
+                // 干净状态开始（修复 MEDIUM-2：拒绝后 Runtime 不再永久楔死）。
+                let irreversible = undo.has_irreversible();
+                undo.reset_irreversible();
+                if irreversible {
                     return Err(SysError::PermissionDenied);
                 }
-                undo.reset_irreversible();
                 reg.clear();
                 return run_sub_impl(
                     *target,
@@ -1658,6 +1783,46 @@ async fn interpret_impl(
                     .await
                 }
             },
+            Action::Idempotent { key, inner, next } => {
+                // 幂等键状态机（D-0xx）：COMMITTED 未 REVERTED → 返回缓存结果，
+                // 不执行 inner（重试去重）；否则执行 inner，成功后 COMMIT + 缓存，
+                // 并压入 REVERT undo（recover 撤销该段副作用时键置 REVERTED，
+                // 允许未来重执行——恰好一次语义）。
+                let idem = ctx.idempotency.clone();
+                let cached = {
+                    let guard = idem.lock().expect("幂等注册表锁中毒不可达");
+                    guard.lookup_committed(&key)
+                };
+                if let Some(cached) = cached {
+                    // 命中：重试去重，不触发逆函数（从未真正"新执行"）。
+                    let na = next(cached);
+                    (Value::Unit, na)
+                } else {
+                    let v = run_sub_impl(
+                        *inner,
+                        ctx,
+                        undo,
+                        reg,
+                        access.reborrow(),
+                        depth,
+                        cancel.as_deref_mut(),
+                    )
+                    .await?;
+                    // 成功后提交：键置 COMMITTED + 缓存结果。
+                    idem.lock()
+                        .expect("幂等注册表锁中毒不可达")
+                        .commit(&key, v.clone());
+                    // 压 REVERT undo：该段的逆操作被 recover 执行时键释放。
+                    let idem2 = idem.clone();
+                    let k = key.clone();
+                    undo.push(Box::pin(async move {
+                        idem2.lock().expect("幂等注册表锁中毒不可达").revert(&k);
+                        Ok(())
+                    }));
+                    let na = next(v);
+                    (Value::Unit, na)
+                }
+            }
         };
         cur = next_cur;
         action = next_action;

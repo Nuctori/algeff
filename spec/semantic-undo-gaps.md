@@ -1,6 +1,6 @@
 # 语义撤销缺口清单（Undo Semantics Gaps）
 
-> 状态：**已修复（P0+P1+A4 use/move 拆分）**。剩余：P3 确定性维度的完整落地（is_deterministic 已加）、chmod/chown 快照逆。P2 宏级 compile warning 因 stable Rust proc macro 无 Diagnostic API **不可行**——已由运行时 Replace 闸门（NonInvertible 标记）覆盖 + dx::irreversible 文档标记。
+> 状态：**已修复（P0+P1+A4 use/move 拆分 + 幂等键）**。剩余：chmod/chown 快照逆、P3 确定性完整落地（is_deterministic 已加）。P2 宏级 compile warning 因 stable Rust proc macro 无 Diagnostic API **不可行**——由运行时 Replace 闸门（NonInvertible 标记）覆盖。
 > 关联决策：D-098（语义真回归原则）、D-099（修复分层）、D-100（测试先行）、D-101（线性语义分层）。
 > 关联测试：`crates/algeff-std/tests/undo_semantics_contract.rs`（4 个锁定测试，当前 4/4 绿 = 问题行为基线）。
 > 记录日期：2026-08-17。修复时逐条勾销并反转对应测试断言。
@@ -81,14 +81,14 @@ A6 只要求单边逆（w;w̄ = 1，不要求 w̄;w = 1）→ 撤销是一次性
 
 - **P0（一期·撤销链路真回归）**：`UndoCapability` 类型三分（Identity/Invertible/NonInvertible）+ 部分逆定义域 Err（写前读失败） + recover 检查 undo 结果 + Replace 闸门（含 NonInvertible 标记 → Err）。验收 = 测试 1/2/4 断言反转。
 - **P1（补物理可逆）**：游标(Seek/Read) + Chmod/Chown 快照 + Open(truncate/create) + SendFile 目标侧。
-- **P2（不可逆显式化）**：DataOp 静态 role 标注 + do_! 宏编译期 warning + `dx::irreversible` 显式包装。
+- **P2（不可逆显式化）**：DataOp 静态 role 标注 ✓；do_! 宏编译期 warning **不可行**（stable proc macro 无 Diagnostic API）；`dx::irreversible` 已删（误导性 no-op）。
 - **P3（确定性维度）**：DataOp `deterministic` 静态位 + 重放性类型化（与二期 A4 use/move 拆分同批）。
 
 ## 五、与测试的对应
 
-| 锁定测试 | 缺口 |
+| 锁定测试（修复后语义） | 缺口 |
 | --- | --- |
-| `write_only_fd_write_silently_drops_undo_then_replace_fake_rolls_back` | Write 降级无声（部分逆定义域） |
-| `mkdir_undo_failure_swallowed_replace_reports_success` | Mkdir 部分逆执行失败吞错 |
-| `sequential_multi_write_same_fd_rejected_by_a4` | A4 过度拒绝（二期，不列入一期验收） |
-| `create_open_undo_missing_file_left_after_replace` | Open(create) 无逆（Replace 后残留） |
+| `write_only_fd_write_rejected_when_undo_unavailable` | Write 降级无声（部分逆定义域）→ 已修：写前读失败报 Err |
+| `mkdir_inverse_removes_dir_when_emptied_by_create_undo` | Mkdir 部分逆执行失败吞错 → 已修：create 逆先删文件使目录空，完全回归 |
+| `sequential_multi_write_same_fd_allowed_use_semantics` | A4 过度拒绝 → 已修：use 语义可多次 + LIFO 撤销 |
+| `create_open_inverse_removes_new_file_on_replace` | Open(create) 无逆（Replace 后残留）→ 已修：unlink 逆删除新建文件 |
