@@ -209,6 +209,32 @@ fn sequential_multi_write_same_fd_allowed_use_semantics() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn mutex_reentry_still_blocked_by_arbiter_after_a4_use_semantics() {
+    // A4 use/move 拆分（Write 放宽为不限次数）后，互斥锁防重入仍由仲裁器
+    // （A7 原子占坑）独立保证——同 id 二次 MutexLock 在仲裁层 WouldBlock，
+    // 不依赖 Write 消费（blocker-3 独立验证）。
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    rt.run_blocking(syscall(
+        DataOp::MutexLock { id: 9 },
+        vec![],
+        Action::Pure,
+    ))
+    .unwrap();
+    let e = rt
+        .run_blocking(syscall(
+            DataOp::MutexLock { id: 9 },
+            vec![],
+            Action::Pure,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::WouldBlock,
+        "同 id 二次 MutexLock → A7 仲裁 WouldBlock（不依赖 Write 消费）"
+    );
+}
+
+#[test]
 fn dataop_static_role_direct() {
     use algeff_core::{DataOp, OpenFlags, UndoRole};
     use std::path::PathBuf;

@@ -253,3 +253,13 @@ A7 + D6/§9.1 ──► P5（无死锁）
 
 - P1–P4 各自直接依赖单条（组）公理，无交叉依赖。
 - P5 依赖 A7（动态）与 §9.1/D6（静态），是唯一需要"公理 + 工程决策"共同支撑的命题。
+
+## 修订注（D-0xx A4 use/move 拆分）
+
+> 本版将公理 A4 从「Write/Own 均恰好消费一次」拆分为「**Own 恰好终结一次（move）**、**Write 不限次数（use 语义）**」（见 `axioms.md` A4 与 `pdr.md` §四 A4）。
+> **P1–P5 证明不因该拆分而失效**，理由：
+> - P1（幺半群）依赖 A1/A2，与 A4 无关；
+> - P2（并行交换律）依赖 A3（冲突矩阵），不依赖 Write 消费计数；
+> - P3（分支写隔离）依赖 A5（分支上下文隔离），谈 Write 的作用域而非消费次数；
+> - P4（撤销双态）依赖 A6（w;w̄=1），Write 多次只意味着多个独立逆操作，LIFO 撤销仍正确（`undo_semantics_contract::sequential_multi_write_same_fd_allowed_use_semantics` 正向验证）；
+> - P5（无死锁）依赖 A7（原子占坑），**互斥锁（MutexLock）防重入恰由 A7 仲裁器保证，不依赖 Write 消费**（`undo_semantics_contract::mutex_reentry_still_blocked_by_arbiter_after_a4_use_semantics` 独立验证）。
