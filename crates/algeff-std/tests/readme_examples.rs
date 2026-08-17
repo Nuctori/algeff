@@ -398,3 +398,57 @@ fn readme_painpoints_atomic_replay_undo_compose() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 痛点 5：重试安全——幂等键去重（README「痛点 5」镜像）。
+#[test]
+fn readme_painpoints_idempotency_retry() {
+    use algeff_core::prelude::*;
+    use algeff_core::OpenFlags;
+    use algeff_macro::do_;
+    use algeff_std::dx;
+
+    let dir = std::env::temp_dir().join(format!("algeff-readme-idem-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("charge.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+
+    // 带幂等键的副作用段（如扣款/发邮件/建表）：同 key 只真正执行一次。
+    // do_! 生成 'static 闭包：path clone 进闭包；Action 不可 Clone，重试重新构造。
+    let make_charge = || {
+        let p = path.clone();
+        dx::idempotent(
+            "charge:order-42",
+            do_! {
+                let fd = dx::open(&p, OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    ..Default::default()
+                });
+                dx::write(&fd, b"charged".to_vec());
+                dx::close(&fd);
+                Value::U64(42)
+            },
+        )
+    };
+
+    // 重试 3 次：只有第一次真正执行（键 COMMITTED → 后续返回缓存）。
+    for _ in 0..3 {
+        let v = rt.run_blocking(make_charge()).unwrap();
+        assert_eq!(v, Value::U64(42), "重试返回缓存结果（副作用未重复）");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "charged",
+        "文件只写了一次（非幂等效应未重复执行）"
+    );
+    // undo 栈只含第一次执行的副作用记录：open(create 新建→unlink 逆) + write 逆
+    // + REVERT 标记 = 3（后两次缓存命中不压 undo）。
+    assert_eq!(
+        rt.undo_stack().len(),
+        3,
+        "重试不产生新 undo（从未真正'新执行'）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

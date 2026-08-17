@@ -331,6 +331,37 @@ let combined = steps.into_iter().reduce(|acc, s| {
 rt.run_blocking(combined).unwrap();
 ```
 
+### 痛点 5：重试安全——非幂等效应不重复执行
+
+**传统**：消息队列消费/网络超时重试/异步重调，扣款、发邮件、库存扣减这类非幂等效应，失败重试极易重复伤害。要幂等得业务层手写去重表。
+
+**Algeff**：`dx::idempotent(key, action)` 给副作用段挂**全局幂等键**——键 COMMITTED 未 REVERTED 时重试返回缓存结果，**不重新执行**（运行时状态机去重，无需业务手写）：
+
+```rust
+let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+let path = std::path::PathBuf::from("charge.txt");
+
+// 带幂等键的副作用段（如扣款/发邮件/建表）：同 key 只真正执行一次
+// （do_! 生成 'static 闭包：path 需 clone 进闭包；Action 不可 Clone，重试重新构造）
+let make_charge = || {
+    let p = path.clone();
+    dx::idempotent("charge:order-42", do_! {
+        let fd = dx::open(&p, OpenFlags { read: true, write: true, create: true, ..Default::default() });
+        dx::write(&fd, b"charged".to_vec());
+        dx::close(&fd);
+        Value::U64(42)
+    })
+};
+
+// 重试 3 次：只有第一次真正执行（键 COMMITTED → 后续返回缓存）
+for _ in 0..3 {
+    let v = rt.run_blocking(make_charge()).unwrap();
+    println!("结果: {:?}", v); // 42 × 3（后两次来自缓存，副作用未重复）
+}
+```
+
+**恰好一次**：副作用被 `Replace`/`Scope` 撤销后键置 REVERTED，允许未来重新执行——"这个副作用在整个生命周期中只发生一次"（如插件热重载不重复建表初始化）。
+
 ---
 
 ## 核心概念：蓝图、执行、资源
