@@ -278,3 +278,119 @@ fn readme_tcp_bind() {
     };
     assert_eq!(rt.run_blocking(bounded).unwrap(), Value::Unit);
 }
+
+// ── 痛点对比章节（README「它解决什么：传统 IO 的四个痛点」）──────
+
+#[test]
+fn readme_painpoints_atomic_replay_undo_compose() {
+    use algeff_core::prelude::*;
+    use algeff_core::OpenFlags;
+    use algeff_macro::do_;
+    use algeff_std::dx;
+
+    let dir = std::env::temp_dir().join(format!("algeff-readme-pain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("atomic.txt");
+
+    // 痛点 1：原子写入（read: true 是撤销前提，只写句柄无法构造逆 → 报错）
+    std::fs::write(&path, "before").unwrap();
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    rt.run_blocking(do_! {
+        let fd = dx::open(&path, OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            ..Default::default()
+        });
+        dx::write(&fd, b"new content".to_vec());
+        dx::close(&fd);
+        Value::Unit
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "new content",
+        "痛点 1：写入生效（可撤销前提 read:true）"
+    );
+
+    // 痛点 2：可重放——同一蓝图结构 3 次，结果一致（每轮 truncate 打开）
+    for i in 0..3u64 {
+        let mut rt2 = Runtime::new(Box::new(TokioExecutor::new()));
+        // 闭包内引用 path → 每轮 clone owned 值（do_! 生成 'static 闭包）
+        let p2 = path.clone();
+        let v = rt2
+            .run_blocking(do_! {
+                let fd = dx::open(&p2, OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    ..Default::default()
+                });
+                dx::write(&fd, format!("round {i}").into_bytes());
+                dx::close(&fd);
+                let fd2 = dx::open(&p2, OpenFlags { read: true, ..Default::default() });
+                let data = dx::read(&fd2, 64);
+                dx::close(&fd2);
+                data
+            })
+            .unwrap();
+        assert_eq!(v, Value::Bytes(format!("round {i}").into_bytes()), "痛点 2 第 {i} 次重放");
+    }
+
+    // 痛点 3：Replace 一键撤销（独立 Runtime → 撤销栈只含本段副作用）
+    std::fs::write(&path, "original").unwrap();
+    let mut rt3 = Runtime::new(Box::new(TokioExecutor::new()));
+    rt3.run_blocking(do_! {
+        let fd = dx::open(&path, OpenFlags { read: true, write: true, ..Default::default() });
+        dx::write(&fd, b"temporary".to_vec());
+        dx::close(&fd);
+        Value::Unit
+    })
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "temporary");
+    rt3.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "original",
+        "痛点 3：Replace 一键回滚到 open 前状态"
+    );
+
+    // 痛点 4：组合性——小蓝图拼大蓝图一次执行
+    let mut rt4 = Runtime::new(Box::new(TokioExecutor::new()));
+    let mut steps: Vec<Action> = Vec::new();
+    for i in 0..3 {
+        let p = dir.join(format!("file_{i}.txt"));
+        steps.push(do_! {
+            let fd = dx::open(&p, OpenFlags {
+                read: true,
+                write: true,
+                create: true,
+                ..Default::default()
+            });
+            dx::write(&fd, format!("content {i}").into_bytes());
+            dx::close(&fd);
+            Value::Unit
+        });
+    }
+    let combined = steps
+        .into_iter()
+        .reduce(|acc, s| Action::Sequential {
+            current: Box::new(acc),
+            next: Box::new(move |_| s),
+        })
+        .unwrap();
+    rt4.run_blocking(combined).unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("file_{i}.txt"))).unwrap(),
+            format!("content {i}"),
+            "痛点 4：file_{i}.txt 写入生效"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

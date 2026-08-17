@@ -17,13 +17,14 @@ Algeff 写法：   先把"要做的事"写成一份数据蓝图（Action）→ �
 
 1. [这是什么？](#这是什么)
 2. [快速上手](#快速上手)
-3. [核心概念：蓝图、执行、资源](#核心概念蓝图执行资源)
-4. [常用模式速查](#常用模式速查)
-5. [深入：确定性、重放与撤销机制](#深入确定性重放与撤销机制)
-6. [设计推导速览](#设计推导速览)（工程师/研究者向）
-7. [性能速览](#性能速览)
-8. [已知限制与边界](#已知限制与边界)
-9. [文档入口](#文档入口)
+3. [它解决什么：传统 IO 的四个痛点](#它解决什么传统-io-的四个痛点)
+4. [核心概念：蓝图、执行、资源](#核心概念蓝图执行资源)
+5. [常用模式速查](#常用模式速查)
+6. [深入：确定性、重放与撤销机制](#深入确定性重放与撤销机制)
+7. [设计推导速览](#设计推导速览)（工程师/研究者向）
+8. [性能速览](#性能速览)
+9. [已知限制与边界](#已知限制与边界)
+10. [文档入口](#文档入口)
 
 ---
 
@@ -207,6 +208,125 @@ assert!(matches!(custom, Action::Syscall { .. }));
 ```
 
 > 覆盖优先级：`syscall_with` 显式声明 > `infer_usage` 自动推导 > 空集。更低层的预包装操作 `algeff_std::adapters`（`open_file` / `read` / `write` / `close` / `stat` / `unlink` / `open_tcp` / `connect` …）仍可用——它们返回 `Action`，可直接作 `do_!` 的语句（源码：`crates/algeff-std/src/adapters.rs`）。
+
+---
+
+## 它解决什么：传统 IO 的四个痛点
+
+### 痛点 1：原子性——写到一半失败怎么办？
+
+**传统**：`open → write → close`，任何一步失败（磁盘满、权限、崩溃）文件就是半写状态；要原子更新得手动临时文件 + fsync + rename + 删除，漏一步就是脏数据。
+
+**Algeff**：蓝图是数据，运行时自动追踪每个操作的逆操作；任一步失败，**已做的副作用自动回滚**：
+
+```rust
+use algeff_core::prelude::*;
+use algeff_core::OpenFlags;
+use algeff_macro::do_;
+use algeff_std::dx;
+use algeff_std::TokioExecutor;
+
+fn main() {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let path = std::path::PathBuf::from("atomic.txt");
+    std::fs::write(&path, "before").unwrap();
+
+    // Open 必须带 read: true——Write 的撤销需要写前读原内容；
+    // 只写句柄无法构造撤销 → 运行时报错（语义真回归，不静默降级）。
+    let blueprint = do_! {
+        let fd = dx::open(&path, OpenFlags {
+            read: true, write: true, create: true, ..Default::default()
+        });
+        dx::write(&fd, b"new content".to_vec());
+        // 若这里某步失败 → 前面的 Write 自动回滚，文件仍是 "before"
+        dx::close(&fd);
+        Value::Unit
+    };
+
+    rt.run_blocking(blueprint).unwrap();
+    println!("写入后: {:?}", std::fs::read_to_string(&path).unwrap());
+}
+```
+
+### 痛点 2：可重放——想再跑一遍？
+
+**传统**：复制粘贴整个函数；手动管理状态重置、mock 时间。
+
+**Algeff**：蓝图是不可变数据，同一份蓝图跑多少次结果一致（每轮 `truncate` 打开 + 写入 + 读回验证）：
+
+```rust
+for i in 0..3 {
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let v = rt.run_blocking(do_! {
+        let fd = dx::open(&path, OpenFlags {
+            read: true, write: true, create: true, truncate: true, ..Default::default()
+        });
+        dx::write(&fd, format!("round {i}").into_bytes());
+        dx::close(&fd);
+        let fd2 = dx::open(&path, OpenFlags { read: true, ..Default::default() });
+        let data = dx::read(&fd2, 64);
+        dx::close(&fd2);
+        data
+    }).unwrap();
+    println!("第 {} 次: {:?}", i + 1, v); // Ok(Bytes(b"round 0")) / round 1 / round 2
+}
+```
+
+### 痛点 3：一键撤销——做了 N 步想回滚？
+
+**传统**：手动写 N 个补偿逻辑（恢复原内容、删临时文件、关句柄），还容易漏。
+
+**Algeff**：`Replace` 节点 = 回滚执行段全部副作用 + 重新开始：
+
+```rust
+let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+std::fs::write(&path, "original").unwrap();
+
+// 第一步：做有副作用的操作（Write 是 use 语义，可多次）
+rt.run_blocking(do_! {
+    let fd = dx::open(&path, OpenFlags { read: true, write: true, ..Default::default() });
+    dx::write(&fd, b"temporary".to_vec());
+    dx::close(&fd);
+    Value::Unit
+}).unwrap();
+println!("副作用后: {:?}", std::fs::read_to_string(&path).unwrap()); // "temporary"
+
+// 第二步：Replace 一键回滚 → 文件恢复 "original"
+rt.run_blocking(Action::Replace {
+    target: Box::new(Action::Pure(Value::Unit)),
+}).unwrap();
+println!("撤销后: {:?}", std::fs::read_to_string(&path).unwrap()); // "original"
+```
+
+> 撤销能力是**类型化的**：每个操作属于 Identity（无副作用）/ Invertible（可逆，逆构造失败 → 报错）/ NonInvertible（不可逆，如 unlink/udp/管道写——Replace 闸门显式拒绝，**绝不静默假回滚**）。
+
+### 痛点 4：组合性——小蓝图拼大蓝图
+
+**传统**：函数调用耦合在控制流里，无法拆分复用、重排、缓存。
+
+**Algeff**：每个操作是独立的数据片段，自由组合成一条大蓝图一次执行：
+
+```rust
+let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+let dir = std::path::PathBuf::from("batch");
+
+let mut steps: Vec<Action> = Vec::new();
+for i in 0..3 {
+    let p = dir.join(format!("file_{i}.txt"));
+    steps.push(do_! {
+        let fd = dx::open(&p, OpenFlags { read: true, write: true, create: true, ..Default::default() });
+        dx::write(&fd, format!("content {i}").into_bytes());
+        dx::close(&fd);
+        Value::Unit
+    });
+}
+
+// 顺序组合成一条大蓝图（Sequential 链），一次执行
+let combined = steps.into_iter().reduce(|acc, s| {
+    Action::Sequential { current: Box::new(acc), next: Box::new(move |_| s) }
+}).unwrap();
+rt.run_blocking(combined).unwrap();
+```
 
 ---
 
