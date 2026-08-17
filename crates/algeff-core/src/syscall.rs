@@ -21,9 +21,10 @@ pub type UndoOp = Pin<Box<dyn Future<Output = Result<(), SysError>> + Send>>;
 /// - 单位元（Identity）：w = id_M，无副作用，天然可回归；
 /// - 可逆（Invertible）：∃w̄, w;w̄ = 1。逆的构造失败（部分逆定义域外，
 ///   如写前读失败）→ `execute` 以 Err 返回，**不静默降级**；
-/// - 不可逆（NonInvertible）：无逆元（unlink/rmdir/close/tcp/udp/kill/
-///   spawn/wait/signal），构造期可静态标注（`DataOp::role`），
-///   Replace 闸门将拒绝回滚（组合不可逆性 = 子操作合取）。
+/// - 不可逆（NonInvertible）：无逆元（unlink/rmdir/tcp/udp/kill/spawn/wait/
+///   signal/管道写——投递/消费/删除语义不可回滚；close/dup/bind/connect 是
+///   资源生命周期 Identity，由 reg.clear/drop 回归），构造期可静态标注
+///   （`DataOp::role`），Replace 闸门将拒绝回滚（组合不可逆性 = 子操作合取）。
 pub enum UndoCapability {
     /// 单位元：w = id_M（read/stat/readdir/get_time）。
     Identity,

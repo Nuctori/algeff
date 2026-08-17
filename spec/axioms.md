@@ -112,35 +112,38 @@
 
 ---
 
-## A4 资源线性
+## A4 资源线性（use/move 拆分，D-0xx）
 
 **形式化陈述**
 
 ```
 ∀ a, r ∈ Δ(a)：
-    mode(r) ∈ {Write, Own}  ⇒  r 在 a 的执行路径中被恰好消费一次
-    mode(r) ∈ {Read, Append} ⇒  r 不被消费（可重复）
+    mode(r) = Own     ⇒  r 在 a 的执行路径中被恰好终结一次（move 语义：
+                           Own 之后任何 usage —— Read/Write/Append/Own —— 拒绝）
+    mode(r) ∈ {Write, Read, Append} ⇒  r 不被消费（use 语义可重复；
+                           Write 每次由运行时维护独立逆操作，LIFO 撤销）
 ```
 
 **工程实现位置**
 
 | 层 | 文件 : 符号 | 说明 |
 | --- | --- | --- |
-| 运行时检查 | `resource.rs::ResourceRegistry::check_linear(&mut self, usage) -> Result<(), SysError>` | Write/Own 登记 `consumed: HashSet<Resource>`；重复消费返回 `SysError::InvalidInput` |
+| 运行时检查 | `resource.rs::ResourceRegistry::check_linear(&mut self, usage) -> Result<(), SysError>` | Own 登记 `owned_consumed: HashSet<Resource>`（终结）；Own 后任何 usage 返回 `SysError::InvalidInput`；Write 不消费（use 语义） |
 | 物理释放 | `resource.rs::ResourceHandle`（全 `Arc`）+ Rust 所有权 | pdr.md §1.2 物理层：Drop 保证释放；`take`（Own 语义：Close/替换） |
 | API 辅助 | `resource.rs::TypedResource<Owned>::new_owned` | Owned 不能降级为 Read/Write，防意外共享（pdr.md §3.3） |
 | 契约 | `contracts.md` §2 类型冻结 / pdr.md §四 A4、§九 | — |
 
 **验证方式（A6 建议）**
 
-- `axiom_a4_double_write_rejected`（已存在于 `resource.rs` 单测 `linearity_double_write_rejected`，升级为属性测试）：同一 Write 资源二次 `check_linear` 报 `InvalidInput`。
-- `axiom_a4_read_repeatable`（已存在 `linearity_read_repeatable`）：Read 资源可重复检查。
+- `axiom_a4_write_use_repeatable`（已存在于 `resource.rs` 单测 `linearity_double_write_allowed_use_semantics`，升级为属性测试）：同一 Write 资源二次 `check_linear` 均 Ok（use 语义）。
+- `axiom_a4_own_terminal`（已存在 `linearity_own_terminal`）：Own 后任何 usage 报 `InvalidInput`。
 - `axiom_a4_own_exactly_once_along_path`：蓝图路径上 Own 资源恰好 `take` 一次；`Scope`/`Catch`/`Replace` 各路径分支下仍恰好一次（proptest 枚举分支）。
 
 **风险备注**
 
-- `check_linear` 目前是**执行时断言**（非编译期线性类型），用户绕过 `TypedResource` 直接构造 `ResourceUsage` 可破坏 A4——pdr.md §3.5 / §18 明示这是用户责任。A6 测试应覆盖"绕过即破坏"的边界文档化，而非假设 A4 无条件成立。
-- 消费登记在**当前执行路径**上（Fork 子任务用 registry Clone 隔离，D13），合并回主 registry 时需合并 `consumed`，否则父路径重复消费误报/漏报（A2/A3 实现注意）。
+- `check_linear` 目前是**执行时断言**（非编译期线性类型），用户绕过 `TypedResource` 直接构造 `ResourceUsage` 可破坏 A4（Own 终结可被绕过）——pdr.md §3.5 / §18 明示这是用户责任。A6 测试应覆盖"绕过即破坏"的边界文档化，而非假设 A4 无条件成立。
+- Own 终结登记在**当前执行路径**上（Fork 子任务用 registry Clone 隔离，D13），合并回主 registry 时需合并 `owned_consumed`，否则父路径 Own 终结误报/漏报（A2/A3 实现注意）。
+- 互斥锁防重入由动态仲裁（A7 原子占坑）独立保证，不依赖 Write 消费。
 
 ---
 
