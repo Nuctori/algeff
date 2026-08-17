@@ -214,6 +214,55 @@ pub enum DataOp {
     },
 }
 
+/// 静态代数角色（D-0xx P2）：操作 w ∈ M 的可逆性分类，构造期可查询。
+/// 与运行时 `UndoCapability` 的关系：`role()` 是静态提示（最优情况），
+/// 实际以 `execute` 返回为准（如 Open(truncate 大文件) 静态 Invertible
+/// 但运行时可能 NonInvertible）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndoRole {
+    /// 单位元：w = id_M（无副作用）。
+    Identity,
+    /// 可逆：∃w̄, w;w̄ = 1（逆的构造可能依赖运行时条件）。
+    Invertible,
+    /// 不可逆：无逆元（投递/消费/删除语义不可回滚）。
+    NonInvertible,
+}
+
+impl DataOp {
+    /// 静态代数角色（D-0xx P2）：无需执行即可知的可逆性分类。
+    /// 用于构造期检查（do_! 宏 warning / dx 显式声明），非运行时保证。
+    pub const fn role(&self) -> UndoRole {
+        use DataOp::*;
+        match self {
+            // 无副作用：读/查询/时间
+            Read { .. } | Stat { .. } | ReadDir { .. } | GetTime | Mmap { .. } | Munmap { .. } => {
+                UndoRole::Identity
+            }
+            // 可逆：内容/游标/元数据变更（逆构造可能依赖运行时条件）
+            Write { .. } | Seek { .. } | Rename { .. } | Truncate { .. } | Mkdir { .. }
+            | Open { .. } | SendFile { .. } | Chmod { .. } | Chown { .. } | MutexLock { .. }
+            | MutexUnlock { .. } | Close { .. } | Dup { .. } | Dup2 { .. } | PipeOpen { .. }
+            | TcpBind { .. } | TcpAccept { .. } | TcpConnect { .. } | UdpBind { .. } => {
+                UndoRole::Invertible
+            }
+            // 不可逆：投递/消费/删除/信号
+            Unlink { .. } | Rmdir { .. } | TcpRead { .. } | TcpWrite { .. } | TcpShutdown { .. }
+            | UdpRecvFrom { .. } | UdpSendTo { .. } | Spawn { .. } | Kill { .. } | Wait { .. }
+            | SendSignal { .. } => UndoRole::NonInvertible,
+        }
+    }
+
+    /// 确定性（D-0xx P3）：可重放性维度——墙钟时间/网络投递/外部进程
+    /// 结果不确定，virtual-clock feature 下不可重放。
+    pub const fn is_deterministic(&self) -> bool {
+        use DataOp::*;
+        !matches!(
+            self,
+            GetTime | UdpRecvFrom { .. } | UdpSendTo { .. } | Spawn { .. } | TcpAccept { .. }
+        )
+    }
+}
+
 /// 蓝图（pdr.md §2.1）。注意：不含 Debug（NextFn 闭包不可 Debug）。
 pub enum Action {
     Pure(Value),

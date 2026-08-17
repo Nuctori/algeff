@@ -230,6 +230,16 @@ pub fn unit() -> Action {
     Action::Pure(Value::Unit)
 }
 
+/// 显式声明不可逆副作用（D-0xx P2）：包装一个操作，表明用户已知并接受
+/// 其不可逆性（unlink/udp/kill 等）——代码自文档化，Replace 闸门仍会拒绝
+/// 含不可逆副作用的执行段，但用户的选择是显式的而非执行中的意外。
+///
+/// 当前为文档标记（语义由 executor 的 UndoCapability 表达）；后续可升级为
+/// Action 包装节点以支持宏级静态检查。
+pub fn irreversible(action: Action) -> Action {
+    action
+}
+
 // ── 值提取（do_! 的 `let` 绑定的是原始 `Value`，使用处按类型提取）─────
 
 /// 从 `Value` 提取 Fd（borrow 语义：多处使用同一绑定不移动）。

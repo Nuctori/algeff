@@ -205,9 +205,44 @@ fn sequential_multi_write_same_fd_allowed_use_semantics() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 修复 4：open+create → NonInvertible 显式化 → Replace 闸门拒绝（不再假回滚）
+// P2：静态代数角色分类（DataOp::role）+ 显式不可逆声明（dx::irreversible）
 // ══════════════════════════════════════════════════════════════════════
 
+#[test]
+fn dataop_static_role_direct() {
+    use algeff_core::{DataOp, OpenFlags, UndoRole};
+    use std::path::PathBuf;
+
+    let p = PathBuf::from("/x");
+    assert_eq!(
+        DataOp::Stat { path: p.clone() }.role(),
+        UndoRole::Identity,
+        "Stat 无副作用 → Identity"
+    );
+    assert_eq!(
+        DataOp::Write { fd: 1, data: b"d".to_vec() }.role(),
+        UndoRole::Invertible,
+        "Write 可逆 → Invertible（静态，运行时写前读决定）"
+    );
+    assert_eq!(
+        DataOp::Unlink { path: p.clone() }.role(),
+        UndoRole::NonInvertible,
+        "Unlink 删除不可逆 → NonInvertible"
+    );
+    assert_eq!(
+        DataOp::Open { path: p, flags: OpenFlags::default() }.role(),
+        UndoRole::Invertible,
+        "Open 静态可逆（运行时按 flags/existed 细分）"
+    );
+    assert!(!DataOp::GetTime.is_deterministic(), "GetTime 不确定（P3）");
+    assert!(
+        DataOp::Stat { path: PathBuf::from("/y") }.is_deterministic(),
+        "Stat 确定（P3）"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 修复 4：open+create 逆 = unlink（P1）→ Replace 完全回归
 #[test]
 fn create_open_inverse_removes_new_file_on_replace() {
     let dir = tempfile::tempdir().unwrap();
