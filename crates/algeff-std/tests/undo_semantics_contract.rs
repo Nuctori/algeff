@@ -432,8 +432,68 @@ fn idempotent_key_exactly_once_across_replace() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// D-103：fork_conflict 幂等键判定——同 key 两分支 → 冲突串行（恰好一次）
+// 审计 blocker 回归：幂等段 inner 内嵌套 Replace → 不假 COMMIT（恰好一次保持）
 // ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn idempotent_inner_replace_does_not_commit_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("idem-replace.txt");
+    let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
+    let p1 = p.clone();
+
+    // 幂等段 inner 内含 Replace：副作用被内部 Replace 自清理。
+    // 断言：不 COMMIT（key 未记录）→ 重试重新执行，无假缓存。
+    // 注：do_! 尾表达式必须是 Value，Replace 用 and_then 组合；Action 不可 Clone，
+    // 重试用闭包重新构造。
+    let make_effect = || {
+        let p1 = p1.clone();
+        dx::idempotent(
+            "effect:inner-replace-2",
+            dx::and_then(
+                do_! {
+                    let fd = dx::open(
+                        &p1,
+                        OpenFlags {
+                            read: true,
+                            write: true,
+                            create: true,
+                            ..Default::default()
+                        },
+                    );
+                    dx::write(&fd, b"tmp".to_vec());
+                    dx::close(&fd);
+                    Value::Unit
+                },
+                |_| Action::Replace {
+                    target: Box::new(Action::Pure(Value::U64(7))),
+                },
+            ),
+        )
+    };
+
+    // 第一次执行：inner 先做副作用（写文件）→ 内部 Replace 撤销全部 → 文件不存在。
+    let v = rt.run_blocking(make_effect()).unwrap();
+    assert_eq!(v, Value::U64(7));
+    assert!(
+        !p.exists(),
+        "内部 Replace 撤销副作用：新建文件被删除（create 逆）"
+    );
+    assert_eq!(
+        rt.context()
+            .idempotency
+            .lock()
+            .unwrap()
+            .status_of("effect:inner-replace-2"),
+        None,
+        "内部 Replace 自清理 → 不 COMMIT（key 未记录，防假缓存）"
+    );
+
+    // 重试：key 未记录 → 重新执行（inner 的 Replace 再次自清理，无重复副作用）。
+    let v2 = rt.run_blocking(make_effect()).unwrap();
+    assert_eq!(v2, Value::U64(7));
+    assert!(!p.exists(), "重试重新执行，内部 Replace 再次自清理");
+}
 
 #[test]
 fn fork_conflict_same_idempotency_key_serialized() {

@@ -1798,6 +1798,12 @@ async fn interpret_impl(
                     let na = next(cached);
                     (Value::Unit, na)
                 } else {
+                    // 执行前记录 undo 栈深：inner 内含 Action::Replace 时，
+                    // Replace 分支会提前 recover 清空段内（乃至外层）undo——
+                    // 副作用已被内部 Replace 撤销。此时不得 COMMIT（否则
+                    // key=COMMITTED 但副作用不存在 → 恰好一次语义破坏，
+                    // 审计 blocker）。
+                    let mark_before = undo.len();
                     let v = run_sub_impl(
                         *inner,
                         ctx,
@@ -1808,17 +1814,23 @@ async fn interpret_impl(
                         cancel.as_deref_mut(),
                     )
                     .await?;
-                    // 成功后提交：键置 COMMITTED + 缓存结果。
-                    idem.lock()
-                        .expect("幂等注册表锁中毒不可达")
-                        .commit(&key, v.clone());
-                    // 压 REVERT undo：该段的逆操作被 recover 执行时键释放。
-                    let idem2 = idem.clone();
-                    let k = key.clone();
-                    undo.push(Box::pin(async move {
-                        idem2.lock().expect("幂等注册表锁中毒不可达").revert(&k);
-                        Ok(())
-                    }));
+                    // 仅当 inner 副作用仍在撤销栈（未被内部 Replace 清空）→ COMMIT。
+                    if undo.len() > mark_before {
+                        // 成功后提交：键置 COMMITTED + 缓存结果。
+                        idem.lock()
+                            .expect("幂等注册表锁中毒不可达")
+                            .commit(&key, v.clone());
+                        // 压 REVERT undo：该段的逆操作被 recover 执行时键释放。
+                        let idem2 = idem.clone();
+                        let k = key.clone();
+                        undo.push(Box::pin(async move {
+                            idem2.lock().expect("幂等注册表锁中毒不可达").revert(&k);
+                            Ok(())
+                        }));
+                    }
+                    // else：inner 内部 Replace 已自清理副作用 → 不 COMMIT，
+                    // key 保持未记录 → 重试重新执行（inner 的 Replace 保证
+                    // 段内自清理，无重复副作用）。
                     let na = next(v);
                     (Value::Unit, na)
                 }
