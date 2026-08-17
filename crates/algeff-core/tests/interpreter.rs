@@ -22,7 +22,7 @@ use algeff_core::resource::{
     AccessMode, Resource, ResourceHandle, ResourceRegistry, ResourceUsage,
 };
 use algeff_core::runtime::{interpret, Context, Runtime, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -100,7 +100,7 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
@@ -120,7 +120,7 @@ impl SyscallExecutor for MockExecutor {
                 if let DataOp::Open { path, .. } = op {
                     self.path_log.lock().unwrap().insert(fd, path.clone());
                 }
-                return Ok((Value::Fd(fd), None));
+                return Ok((Value::Fd(fd), UndoCapability::Identity));
             }
             // Read：若 fd 在本执行器开过（path_log 命中），返回路径内容 —— 供
             // 「读回内容验证映射未被覆盖」断言（fd 撞档时内容张冠李戴）。
@@ -128,7 +128,7 @@ impl SyscallExecutor for MockExecutor {
                 if let Some(p) = self.path_log.lock().unwrap().get(fd).cloned() {
                     let mut bytes = p.to_string_lossy().as_bytes().to_vec();
                     bytes.truncate(*len);
-                    return Ok((Value::Bytes(bytes), None));
+                    return Ok((Value::Bytes(bytes), UndoCapability::Identity));
                 }
             }
             let out = match self.responses.get(&desc).cloned() {
@@ -136,16 +136,17 @@ impl SyscallExecutor for MockExecutor {
                 Some(MockOutcome::Value(v)) => v,
                 None => Value::Unit,
             };
-            let undo: Option<UndoOp> = if self.with_undo {
+            let cap: UndoCapability = if self.with_undo {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(
-                    async move { undo_log.lock().unwrap().push(label) },
-                ))
+                UndoCapability::Invertible(Box::pin(async move {
+                    undo_log.lock().unwrap().push(label);
+                    Ok(())
+                    }))
             } else {
-                None
+                UndoCapability::Identity
             };
-            Ok((out, undo))
+            Ok((out, cap))
         })
     }
 }
@@ -526,7 +527,7 @@ fn undo_stack_lifo_order() {
     let v = drive(async {
         let v = interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex).await;
         assert_eq!(undo.len(), 2); // 两个 undo 已压栈
-        undo.recover().await; // recoverΓ：LIFO
+        undo.recover().await.unwrap(); // recoverΓ：LIFO
         v
     });
     assert_eq!(v, Ok(Value::Unit));
@@ -723,7 +724,7 @@ fn catch_after_partial_undo_keeps_stack() {
     });
     assert_eq!(v, Ok(Value::U64(7)));
     // 栈仍可用：recover 按 LIFO 执行已压栈的逆操作
-    drive(undo.recover());
+    drive(undo.recover()).unwrap();
     assert_eq!(ex.undo_ops(), vec!["undo(Close { fd: 999 })"]);
     assert!(undo.is_empty());
 }
@@ -1055,7 +1056,7 @@ fn fork_parallel_undo_merge() {
     assert_eq!(v, Ok(Value::U64(30)));
     assert_eq!(rt.undo_stack().len(), 2, "左右各压入一个 undo");
 
-    drive(rt.recover());
+    drive(rt.recover()).unwrap();
     assert_eq!(
         *undo_log.lock().unwrap(),
         vec!["undo(write:2)".to_string(), "undo(write:1)".to_string()],
@@ -1565,7 +1566,7 @@ fn fork_sequential_left_error_right_still_executes_and_merges() {
         "左分支失败的 Write（fd 3）标记已回滚，经 merge 后父侧未消费"
     );
     // recover 按 right→left 撤销（LIFO：右分支效果后发生、先撤销）。
-    drive(undo.recover());
+    drive(undo.recover()).unwrap();
     assert_eq!(
         *undo_log.lock().unwrap(),
         vec!["undo(write:2)".to_string(), "undo(write:1)".to_string()],

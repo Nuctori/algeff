@@ -18,7 +18,7 @@ use algeff_core::action::{Action, DataOp, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::ResourceRegistry;
 use algeff_core::runtime::{interpret, Context, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 /// 本地 current-thread runtime 驱动（interpret future 非 Send）。
 fn drive<F: Future>(f: F) -> F::Output {
@@ -46,13 +46,13 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = format!("{op:?}");
         Box::pin(async move {
             self.log.lock().unwrap().push(desc);
             match op {
-                DataOp::GetTime => Ok((Value::U64(21), None)),
-                _ => Ok((Value::Unit, None)),
+                DataOp::GetTime => Ok((Value::U64(21), UndoCapability::Identity)),
+                _ => Ok((Value::Unit, UndoCapability::Identity)),
             }
         })
     }

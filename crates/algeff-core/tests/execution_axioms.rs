@@ -34,7 +34,7 @@ use algeff_core::action::{Action, DataOp, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::{AccessMode, Resource, ResourceRegistry, ResourceUsage};
 use algeff_core::runtime::{fork_conflict, interpret, Context, Runtime, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 /// 本地 current-thread runtime 驱动（interpret/recover future 非 Send，
 /// 不能用多线程 block_on 直接驱动）。
@@ -100,7 +100,7 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
@@ -109,16 +109,17 @@ impl SyscallExecutor for MockExecutor {
                 Some(MockOutcome::Value(v)) => v,
                 None => Value::Unit,
             };
-            let undo: Option<UndoOp> = if self.with_undo {
+            let cap: UndoCapability = if self.with_undo {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(
-                    async move { undo_log.lock().unwrap().push(label) },
-                ))
+                UndoCapability::Invertible(Box::pin(async move {
+                    undo_log.lock().unwrap().push(label);
+                    Ok(())
+                    }))
             } else {
-                None
+                UndoCapability::Identity
             };
-            Ok((out, undo))
+            Ok((out, cap))
         })
     }
 }
@@ -434,7 +435,7 @@ fn exec_A6_undo_roundtrip() {
     assert_eq!(rt.undo_stack().len(), 2, "interpret 后两个 undo 已压栈");
 
     // recoverΓ：驱动 Runtime::recover（本地 current-thread runtime）
-    drive(rt.recover());
+    drive(rt.recover()).unwrap();
 
     assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
     assert_eq!(

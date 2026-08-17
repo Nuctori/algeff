@@ -216,8 +216,8 @@ fn catch_error_handled_then_100_node_read_chain_continues() {
     );
     assert_eq!(
         rt.undo_stack().len(),
-        1,
-        "失败 action 的 Write undo 按契约保留"
+        101,
+        "失败 action 的 Write undo + 100 节点读链的游标逆（每读 1 个）按契约保留"
     );
     assert_eq!(
         &std::fs::read(&pa).unwrap()[0..3],
@@ -446,8 +446,8 @@ fn fork_parallel_two_scopes_distinct_bases_3_rounds_isolated() {
         round_pairs.push((lfd, rfd));
         assert_eq!(
             rt.undo_stack().len(),
-            (round as usize + 1) * 2,
-            "每轮 2 条 Write undo 累积"
+            (round as usize + 1) * 6,
+            "每轮 6 条 undo（左右分支各 write + read_back 的 seek+read）累积"
         );
     }
 
@@ -885,7 +885,14 @@ fn blueprint_reuse_two_runtimes_twice_each_four_identical_results() {
             Value::Bytes(b) => results.push(b.clone()),
             other => panic!("期望 Bytes，得到 {other:?}"),
         }
-        assert!(rt.undo_stack().is_empty(), "第 {run} 次：只读蓝图无 undo");
+        // 只读蓝图每次产生 2 个游标逆（seek + read 的游标回归）；无 Replace，
+        // 栈跨次累积，且 rt_a/rt_b 独立（run 0-1 用 A、2-3 用 B）→
+        // 每个 Runtime 第 k 次 = (k+1)*2。
+        assert_eq!(
+            rt.undo_stack().len(),
+            ((run % 2) as usize + 1) * 2,
+            "第 {run} 次：seek + read 游标逆（per-Runtime 累积）"
+        );
         assert!(
             rt.registry().lookup(fd).is_some(),
             "第 {run} 次：fd {fd} 句柄可见"

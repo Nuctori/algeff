@@ -601,7 +601,9 @@ fn flow_and_then_10_layer_fd_value_chain() {
         Value::U64(f) => f,
         other => panic!("期望 U64(fd)，得到 {other:?}"),
     };
-    assert!(rt.undo_stack().is_empty(), "Open/Dup/Read 均不产生 undo");
+    // Read 现在产生游标逆操作（seek 回读前位置）→ 栈非空：open(无create
+    // →Identity) + dup(Identity) + read(游标逆 ×1) = 1。
+    assert_eq!(rt.undo_stack().len(), 1, "Read 游标逆操作入栈");
     assert!(
         rt.registry().lookup(last_fd).is_some(),
         "第 10 层 fd 句柄仍注册（Dup 链句柄可见）"
@@ -665,7 +667,12 @@ fn flow_seq_100_element_chain_value_threading() {
         Value::U64(100),
         "100 元素 Sequential 链全部执行并逐字节验证"
     );
-    assert!(rt.undo_stack().is_empty(), "Read 不产生 undo");
+    // Read 现在产生游标逆操作（seek 回读前位置）：100 次读 = 100 个游标逆。
+    assert_eq!(
+        rt.undo_stack().len(),
+        100,
+        "100 次 Read 各产生一个游标逆操作"
+    );
 
     // EOF 终止验证：同一 fd 游标已到文件尾，第 101 次 Read 返回空 Bytes。
     let fd = fd_slot.lock().unwrap().expect("Open 已执行");

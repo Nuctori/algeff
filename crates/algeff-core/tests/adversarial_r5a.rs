@@ -21,7 +21,7 @@
 //! 依赖执行器返回值（本文件不含任何 Syscall）。
 
 use algeff_core::{
-    Action, BoxFuture, ResourceRegistry, Runtime, SysError, SyscallExecutor, UndoOp, Value,
+    Action, BoxFuture, ResourceRegistry, Runtime, SysError, SyscallExecutor, UndoCapability, Value,
 };
 
 // ── 本地辅助（src/ 冻结不可改，测试内复制；与 R3b/R4c core 侧相同约定）──────────
@@ -34,8 +34,8 @@ impl SyscallExecutor for NoopExecutor {
         &'a mut self,
         _op: &'a algeff_core::DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
-        Box::pin(async { Ok((Value::Unit, None)) })
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
+        Box::pin(async { Ok((Value::Unit, UndoCapability::Identity)) })
     }
 }
 

@@ -13,7 +13,7 @@ use algeff_core::action::{DataOp, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::ResourceRegistry;
 use algeff_core::runtime::Runtime;
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 /// 本地 current-thread runtime 驱动（仅 coeffects 测试需要）。
 #[cfg(feature = "coeffects")]
@@ -37,8 +37,8 @@ impl SyscallExecutor for NoopExecutor {
         &'a mut self,
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
-        Box::pin(async { Ok((Value::Unit, None)) })
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
+        Box::pin(async { Ok((Value::Unit, UndoCapability::Identity)) })
     }
 }
 

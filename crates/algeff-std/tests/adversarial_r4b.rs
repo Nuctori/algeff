@@ -209,9 +209,9 @@ fn multi_runtime_same_file_blueprint_isolated() {
     assert_eq!(fda, 0, "A 的 fd 编号独立（首个分配 = 0）");
     assert_eq!(fdb, 0, "B 的 fd 编号独立（首个分配 = 0）");
 
-    // undo 独立：各栈一个 Write undo。
-    assert_eq!(rt_a.undo_stack().len(), 1, "A 栈 1 个 undo");
-    assert_eq!(rt_b.undo_stack().len(), 1, "B 栈 1 个 undo");
+    // undo 独立：各栈 4 个（两次 seek + write + read 游标/内容逆）。
+    assert_eq!(rt_a.undo_stack().len(), 4, "A 栈 4 个 undo");
+    assert_eq!(rt_b.undo_stack().len(), 4, "B 栈 4 个 undo");
 
     // 物理文件：两运行时效果叠加（非重叠区间）。
     assert_eq!(std::fs::read(&p).unwrap(), b"AAAABBBB89");
@@ -229,7 +229,7 @@ fn multi_runtime_same_file_blueprint_isolated() {
     assert_eq!(rt_a.undo_stack().len(), 0, "A 的栈已清空");
     assert_eq!(
         rt_b.undo_stack().len(),
-        1,
+        4,
         "B 的 undo 栈不受 A 的 recover 影响"
     );
 
@@ -366,8 +366,8 @@ fn run_rounds(path: PathBuf, offset: u64, payload: &'static [u8], rounds: usize)
     }
     assert_eq!(
         rt.undo_stack().len(),
-        rounds,
-        "每轮一个 Write undo，栈独立累积"
+        rounds * 4,
+        "每轮 4 个 undo（seek + write + read_back 的 seek+read），栈独立累积"
     );
 }
 
@@ -777,7 +777,12 @@ fn open_truncate_zeroes_len_then_write_grows_and_undo_restores() {
         0,
         "truncate 打开后长度 0"
     );
-    assert!(rt.undo_stack().is_empty(), "Open 无 undo");
+    // open(truncate) 现在携带逆操作（写回原内容，语义真回归）。
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "open(truncate) 逆操作入栈（写回原内容）"
+    );
 
     // 写入 3 字节 → 文件从 0 增长到 3。
     rt.run_blocking(syscall(
@@ -792,15 +797,15 @@ fn open_truncate_zeroes_len_then_write_grows_and_undo_restores() {
     assert_eq!(std::fs::read(&p).unwrap(), b"abc", "truncate 后写入生效");
 
     // Write 对 0 长文件也有 undo（原内容为空，Full 策略）→ recover 复原回
-    // 长度 0。
+    // truncate 打开前的原内容（语义真回归：open(truncate) 逆 = 写回原内容）。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
     assert!(rt.undo_stack().is_empty());
     assert_eq!(
-        std::fs::metadata(&p).unwrap().len(),
-        0,
-        "recover 撤销写后回到 truncate 后的长度 0"
+        std::fs::read(&p).unwrap(),
+        b"HELLOWORLD",
+        "recover 撤销 truncate 清空 + 写后，恢复到 open 前原内容（真回归）"
     );
 }

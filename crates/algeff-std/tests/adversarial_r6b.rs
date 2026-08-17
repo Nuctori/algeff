@@ -500,7 +500,11 @@ fn r6b_write_readonly_fd_error_no_poison_linearity() {
         ))
         .unwrap();
     assert_eq!(v, Value::Bytes(b"1".to_vec()), "写后游标处读回下一字节");
-    assert_eq!(rt.undo_stack().len(), 1, "成功 Write 的 undo 正常入栈");
+    assert_eq!(
+        rt.undo_stack().len(),
+        2,
+        "成功 Write 的 undo + Read 游标逆正常入栈"
+    );
 
     // 恢复链完整：Replace 撤销写、清空注册表。
     rt.run_blocking(Action::Replace {
@@ -803,7 +807,12 @@ fn r6b_send_file_closed_pipe_error_and_self_copy_invalid() {
         rt.run_blocking(syscall(DataOp::Close { fd }, vec![usage], Action::Pure))
             .unwrap();
     }
-    assert!(rt.undo_stack().is_empty(), "全程错误路径无 undo 残留");
+    // 错误路径无 undo 残留；Seek+Read 输入侧验证产生 2 个游标逆。
+    assert_eq!(
+        rt.undo_stack().len(),
+        2,
+        "全程错误路径无 undo 残留（seek+read 游标逆除外）"
+    );
 }
 
 /// SendFile 错误路径的 put_back 句柄恢复（blocker-3，direct executor 层）：
@@ -1118,14 +1127,18 @@ fn r6b_catch_error_then_new_ops_work() {
     ))
     .unwrap();
     assert_eq!(std::fs::read(&target).unwrap(), b"hello", "Write 落盘");
-    assert_eq!(rt.undo_stack().len(), 1, "Write undo 正常入栈");
+    assert_eq!(
+        rt.undo_stack().len(),
+        2,
+        "open(create) unlink 逆 + Write undo 正常入栈"
+    );
 
-    // Replace：写撤销（文件回到创建时状态=空）、注册表清空、undo 清空。
+    // Replace：写撤销 + create 逆（删除新建文件）→ 真回归到 open 前不存在。
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
     })
     .unwrap();
-    assert_eq!(std::fs::read(&target).unwrap(), b"", "Write undo 恢复");
+    assert!(!target.exists(), "Replace 后新建文件被删除（create 逆生效）");
     assert!(rt.undo_stack().is_empty(), "Replace 清空 undo");
     assert!(rt.registry().lookup(fd).is_none(), "Replace 释放句柄");
 }

@@ -212,11 +212,12 @@ fn fork_same_file_conflict_serializes_deterministic() {
         "冲突 Fork 应按 left→right 顺序执行，终态为右分支内容（确定性，无竞态）"
     );
 
-    // 两侧 Write 均真实执行并各登记一条 Full 撤销记录（确定性副产物）。
+    // 两侧 Write 各登记一条撤销 + 左分支 open(create 新建→unlink) 逆：
+    // 右分支 open 时文件已存在（左分支已建）→ Identity。共 3 条。
     assert_eq!(
         rt.undo_stack().len(),
-        2,
-        "两侧写各应登记一条撤销记录（顺序路径共享撤销栈）"
+        3,
+        "两侧写撤销 + 左分支 create 逆（顺序路径共享撤销栈）"
     );
 }
 

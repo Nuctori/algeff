@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use algeff_core::{
     AccessMode, Action, BoxFuture, DataOp, OpenFlags, ReadOnly, Resource, ResourceInner,
-    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoOp,
+    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability,
     Value, WriteOnly,
 };
 use algeff_std::TokioExecutor;
@@ -104,7 +104,7 @@ impl SyscallExecutor for TracedExecutor {
         &'a mut self,
         op: &'a DataOp,
         registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         Box::pin(async move {
             self.log
                 .lock()

@@ -36,7 +36,7 @@ use algeff_core::resource::{
     ResourceUsage,
 };
 use algeff_core::runtime::{interpret, Context, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 /// 本地 current-thread runtime 驱动（interpret future 非 Send，只能在阻塞线程内
 /// `block_on`；`spawn_blocking` 线程位于 tokio 上下文之外，满足 D9）。
@@ -111,21 +111,22 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         // Open/PipeOpen 由注册表分配 fd 且**不产生 undo**（简化：其逆操作 Close 不建模，
         // 聚焦 Write 撤销路径——保证本文件断言中的 undo 序列恰为各 Write 的 LIFO 逆序）。
         let is_open = matches!(op, DataOp::Open { .. } | DataOp::PipeOpen { .. });
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
-            let maybe_undo: Option<UndoOp> = if self.with_undo && !is_open {
+            let cap: UndoCapability = if self.with_undo && !is_open {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(
-                    async move { undo_log.lock().unwrap().push(label) },
-                ))
+                UndoCapability::Invertible(Box::pin(async move {
+                    undo_log.lock().unwrap().push(label);
+                    Ok(())
+                    }))
             } else {
-                None
+                UndoCapability::Identity
             };
             // Open/PipeOpen：由任务自己的 registry 隔离副本分配全局唯一 fd（D1/D13），
             // 并记录分配序列 —— 并发下「各 registry 分配序列一致」即隔离未被破坏的证据。
@@ -133,13 +134,13 @@ impl SyscallExecutor for MockExecutor {
                 let fd =
                     registry.allocate(ResourceHandle::Mutex(Arc::new(tokio::sync::Mutex::new(()))));
                 self.alloc_log.lock().unwrap().push(fd);
-                return Ok((Value::Fd(fd), maybe_undo));
+                return Ok((Value::Fd(fd), cap));
             }
             let out = match self.responses.get(&desc).cloned() {
                 Some(MockOutcome::Value(v)) => v,
                 None => Value::Unit,
             };
-            Ok((out, maybe_undo))
+            Ok((out, cap))
         })
     }
 }
@@ -550,7 +551,7 @@ fn run_replay_rounds(base: ResourceRegistry) -> ReplayOutcome {
         values.push(v);
         undo_lens.push(undo.len());
         // 含 recover：每轮显式撤销（LIFO 逆序执行 + 栈清空）。
-        drive(undo.recover());
+        drive(undo.recover()).unwrap();
         assert!(undo.is_empty(), "recover 后撤销栈清空");
     }
     ReplayOutcome {

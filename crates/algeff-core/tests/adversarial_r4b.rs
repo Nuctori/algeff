@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use algeff_core::{
     Action, BoxFuture, DataOp, OpenFlags, ResourceRegistry, ResourceUsage, Runtime, SysError,
-    SyscallExecutor, UndoOp, Value,
+    SyscallExecutor, UndoCapability, Value,
 };
 
 // ── 本地辅助（src/ 冻结不可改，测试内复制；与 R1/R2 相同约定）──────────────
@@ -54,24 +54,24 @@ impl SyscallExecutor for FixedErrorExecutor {
         &'a mut self,
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let err = self.err;
         Box::pin(async move { Err(err) })
     }
 }
 
-/// 脚本执行器：按调用队列依次返回预设 (Value, Option<UndoOp>)；队列耗尽后
+/// 脚本执行器：按调用队列依次返回预设 (Value, UndoCapability)；队列耗尽后
 /// 返回固定 fallback。`calls` 统计 execute 调用次数（并行 Fork 通道计数用）。
 struct ScriptExecutor {
-    queue: Arc<Mutex<VecDeque<(Value, Option<UndoOp>)>>>,
+    queue: Arc<Mutex<VecDeque<(Value, UndoCapability)>>>,
     fallback: Value,
     calls: Arc<AtomicUsize>,
 }
 
 impl ScriptExecutor {
     fn with_values(vals: Vec<Value>, fallback: Value) -> Self {
-        let items: VecDeque<(Value, Option<UndoOp>)> =
-            vals.into_iter().map(|v| (v, None)).collect();
+        let items: VecDeque<(Value, UndoCapability)> =
+            vals.into_iter().map(|v| (v, UndoCapability::Identity)).collect();
         Self {
             queue: Arc::new(Mutex::new(items)),
             fallback,
@@ -85,14 +85,14 @@ impl SyscallExecutor for ScriptExecutor {
         &'a mut self,
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let (v, undo) = self
             .queue
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or((self.fallback.clone(), None));
+            .unwrap_or((self.fallback.clone(), UndoCapability::Identity));
         Box::pin(async move { Ok((v, undo)) })
     }
 }
@@ -254,13 +254,14 @@ fn fake_executor_drives_interpreter_values_and_undo_contract() {
     // 压栈、recover 执行——解释器不依赖 TokioExecutor 的任何具体行为。
     let undo_runs = Arc::new(AtomicUsize::new(0));
     let ur = undo_runs.clone();
-    let undo: UndoOp = Box::pin(async move {
+    let undo = Box::pin(async move {
         ur.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     });
     let queue = Arc::new(Mutex::new(VecDeque::from([
-        (Value::Fd(7), None),
-        (Value::Bytes(b"XYZ".to_vec()), None),
-        (Value::U64(42), Some(undo)),
+        (Value::Fd(7), UndoCapability::Identity),
+        (Value::Bytes(b"XYZ".to_vec()), UndoCapability::Identity),
+        (Value::U64(42), UndoCapability::Invertible(undo)),
     ])));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut rt = Runtime::new(Box::new(ScriptExecutor {

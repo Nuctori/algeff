@@ -46,7 +46,7 @@ use algeff_core::action::{Action, DataOp, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::{AccessMode, Resource, ResourceRegistry, ResourceUsage};
 use algeff_core::runtime::{fork_conflict, interpret, Context, Runtime, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 
 /// 左分支 Write 的返回标记（Mock 配置）——执行层表示「写入已发生」。
 const WRITE_MARKER: u64 = 0xFEED;
@@ -114,7 +114,7 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
@@ -122,18 +122,19 @@ impl SyscallExecutor for MockExecutor {
                 Some(MockOutcome::Value(v)) => v,
                 None => Value::Unit,
             };
-            let undo: Option<UndoOp> = if self.with_undo && matches!(op, DataOp::Write { .. }) {
+            let cap: UndoCapability = if self.with_undo && matches!(op, DataOp::Write { .. }) {
                 // 真实语义：只有 Write 可逆（op_read 返回 undo=None，executor.rs）；
                 // Read 不产生逆操作，避免读侧隔离断言被 undo 记录干扰。
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(
-                    async move { undo_log.lock().unwrap().push(label) },
-                ))
+                UndoCapability::Invertible(Box::pin(async move {
+                    undo_log.lock().unwrap().push(label);
+                    Ok(())
+                    }))
             } else {
-                None
+                UndoCapability::Identity
             };
-            Ok((out, undo))
+            Ok((out, cap))
         })
     }
 }
@@ -304,7 +305,7 @@ fn exec_P3_fork_read_isolation_runtime_path() {
     );
 
     // 撤销路径：recover 逆序执行（仅左 Write 一个 undo）
-    drive(rt.recover());
+    drive(rt.recover()).unwrap();
     assert!(rt.undo_stack().is_empty(), "recover 后撤销栈清空");
     assert_eq!(
         *undo_log.lock().unwrap(),

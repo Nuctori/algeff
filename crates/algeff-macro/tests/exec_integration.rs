@@ -80,14 +80,14 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
             match self.responses.get(&desc).cloned() {
                 Some(MockOutcome::Err(e)) => Err(e),
-                Some(MockOutcome::Value(v)) => Ok((v, None)),
-                None => Ok((Value::Unit, None)),
+                Some(MockOutcome::Value(v)) => Ok((v, UndoCapability::Identity)),
+                None => Ok((Value::Unit, UndoCapability::Identity)),
             }
         })
     }

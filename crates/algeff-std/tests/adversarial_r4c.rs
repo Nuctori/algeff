@@ -275,29 +275,32 @@ fn undo_besteffort_exactly_1mb_write_persists_after_replace() {
     ))
     .unwrap();
 
-    // BestEffort：恰 1MB 时 `orig_len < 1024*1024` 不成立 → undo=None。
+    // 大文件（≥1MB）写 → 无 Full 撤销 → NonInvertible 标记 → Replace 拒绝
+    // （语义真回归 D-098：无法确保真回归 → 显式报错，不再静默 BestEffort）。
     assert_eq!(
         rt.undo_stack().len(),
         0,
-        "恰 1MB 文件 Write 应降级 BestEffort（不产生 undo）"
+        "大文件写不产生 undo（NonInvertible）"
     );
 
-    rt.run_blocking(Action::Replace {
-        target: Box::new(Action::Pure(Value::Unit)),
-    })
-    .unwrap();
+    let e = rt
+        .run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::PermissionDenied,
+        "含不可逆副作用（大文件写）→ Replace 拒绝（无法真回归）"
+    );
     let after = std::fs::read(&path).unwrap();
     assert_eq!(
         &after[0..4],
         b"NEW!",
-        "BestEffort 不恢复：恰 1MB 文件 Write 效果在 Replace 后保留"
+        "大文件写效果保留（不可逆副作用无法回滚，被显式报告）"
     );
     assert_eq!(after.len(), orig.len(), "文件长度不变");
     assert_eq!(&after[4..], &orig[4..], "仅写区域偏移，其余原样");
-    eprintln!(
-        "R4C 记录偏差（pdr §11.2 BestEffort）：恰 1MB 文件 Write 后 Replace 不恢复，\
-         违反 A6（w;w̄≠1）；Full 阈值 `orig_len < 1024*1024` 为硬边界"
-    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -334,23 +337,26 @@ fn undo_besteffort_2mb_write_persists_after_replace() {
         Action::Pure,
     ))
     .unwrap();
-    assert_eq!(rt.undo_stack().len(), 0, "2MB 文件 Write 应降级 BestEffort");
+    // 大文件（2MB）写 → 无 Full 撤销 → NonInvertible 标记 → Replace 拒绝。
+    assert_eq!(rt.undo_stack().len(), 0, "大文件写不产生 undo（NonInvertible）");
 
-    rt.run_blocking(Action::Replace {
-        target: Box::new(Action::Pure(Value::Unit)),
-    })
-    .unwrap();
+    let e = rt
+        .run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::PermissionDenied,
+        "含不可逆副作用（大文件写）→ Replace 拒绝（无法真回归）"
+    );
     let after = std::fs::read(&path).unwrap();
     assert_eq!(
         &after[0..4],
         b"NEW!",
-        "BestEffort 不恢复：2MB 文件 Write 效果在 Replace 后保留"
+        "大文件写效果保留（不可逆副作用无法回滚，被显式报告）"
     );
     assert_eq!(after.len(), orig.len());
-    eprintln!(
-        "R4C 记录偏差（pdr §11.2 BestEffort）：2MB 文件 Write 后 Replace 不恢复，\
-         违反 A6；仅全量写前读（Full）可恢复，大文件撤销为补偿挂钩职责"
-    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -457,7 +463,13 @@ fn fork_16_way_parallel_all_leaves_disjoint_merge_value_fidelity() {
             "第 {i} 叶 fd {fd} 事后读回一致（映射未被并发覆盖）"
         );
     }
-    assert!(rt.undo_stack().is_empty(), "只读路径不产生 undo");
+    // 只读路径现在产生游标逆操作（seek+read 各一个，A6 游标可观察）。
+    // 16 叶 × 2（seek+read）+ 16 次 read_back × 2 = 64 个游标逆。
+    assert_eq!(
+        rt.undo_stack().len(),
+        64,
+        "seek+read 游标逆操作（只读路径也维护游标回归）"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════

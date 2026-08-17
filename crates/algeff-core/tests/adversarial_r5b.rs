@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use algeff_core::{
     Action, BoxFuture, DataOp, Id, Owned, ReadOnly, ResourceInner, ResourceRegistry, ResourceSet,
-    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoOp, Value, WriteOnly,
+    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability, Value, WriteOnly,
 };
 
 // ── 本地辅助（src/ 冻结不可改，测试内复制；与 R1/R2 相同约定）──────────────
@@ -74,8 +74,8 @@ impl SyscallExecutor for RecordingInvokeExecutor {
         &'a mut self,
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
-        Box::pin(async { Ok((Value::Unit, None)) })
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
+        Box::pin(async { Ok((Value::Unit, UndoCapability::Identity)) })
     }
 
     fn invoke<'a>(

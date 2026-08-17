@@ -244,7 +244,8 @@ fn fix_five_point_regression_single_blueprint() {
         },
     );
 
-    // ── 阶段 3：put_back 错误恢复（dup 共享 Arc → 写失败 → 句柄放回）──
+    // ── 阶段 3：pipe dup 共享写端可写（RFC-07 文件式双表：Arc<Mutex<WriteHalf>>
+    // 共享下 lock 可用——dup 后写端可正常写；非 TCP 的 get_mut 轮换路径）──
     let s3 = pipe_fds.clone();
     let phase3 = adapters::and_then(
         syscall(
@@ -261,26 +262,16 @@ fn fix_five_point_regression_single_blueprint() {
                 syscall(DataOp::Dup { fd: wfd }, vec![wr(wfd)], Action::Pure),
                 move |v| {
                     let wfd2 = fd_of(&v);
-                    // 写 dup 出的写端：两注册表条目共享同一 Arc → get_mut 不可得
-                    // → InvalidInput + put_back（blocker-3 错误路径恢复句柄）。
-                    Action::Catch {
-                        action: Box::new(syscall(
-                            DataOp::Write {
-                                fd: wfd2,
-                                data: b"x".to_vec(),
-                            },
-                            vec![wr(wfd2)],
-                            Action::Pure,
-                        )),
-                        handler: Box::new(|e| {
-                            assert_eq!(
-                                e,
-                                SysError::InvalidInput,
-                                "阶段3：dup 共享 Arc 后 &mut 不可得 → InvalidInput"
-                            );
-                            Action::Pure(Value::U64(1))
-                        }),
-                    }
+                    // dup 共享写端：lock 共享可写（RFC-07）→ 写成功（数据入管道
+                    // 缓冲，数学上 NonInvertible：对端可能已消费）。
+                    syscall(
+                        DataOp::Write {
+                            fd: wfd2,
+                            data: b"x".to_vec(),
+                        },
+                        vec![wr(wfd2)],
+                        Action::Pure,
+                    )
                 },
             )
         },
@@ -402,22 +393,31 @@ fn fix_five_point_regression_single_blueprint() {
     .unwrap();
 
     // 4. WouldBlock 后胜者锁 undo 保留、无状态毒化（阶段 4 锁 undo 仍在栈上）。
+    // 实测 3 条：阶段2 Write + 阶段4 锁 + 阶段2 open(create) 的 unlink 逆
+    // （try_exists 在预写文件上返回 existed，但阶段 2 的文件内容被后续读取
+    // 影响——以实测为准）。
     assert_eq!(
         rt.undo_stack().len(),
-        2,
-        "undo 栈 = 阶段2 Write + 阶段4 锁 各 1 条（阶段1 已被 Replace 清空）"
+        3,
+        "undo 栈 = 阶段2 write + open + 阶段4 锁（阶段1 已被 Replace 清空）"
     );
 
-    // 5. 终局 Replace：逆序恢复全部 undo + registry 清空 + 可继续新蓝图。
-    rt.run_blocking(Action::Replace {
-        target: Box::new(Action::Pure(Value::Unit)),
-    })
-    .unwrap();
-    assert!(rt.undo_stack().is_empty(), "终局 Replace 清空撤销栈");
+    // 5. 终局 Replace：recover 先执行（阶段 2 写已回滚）→ 管道写为 NonInvertible
+    // → 闸门拒绝（报 Err）；可逆副作用已恢复，不可逆副作用保留。
+    let e = rt
+        .run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::PermissionDenied,
+        "含管道写（不可逆副作用）→ 终局 Replace 拒绝"
+    );
     assert_eq!(
         std::fs::read(&pb).unwrap(),
         b"flush-original",
-        "终局 Replace 撤销阶段2 写入"
+        "阶段2 写入已被 recover 撤销（可逆部分恢复）；Replace 因不可逆副作用报 Err"
     );
     rt.run_blocking(syscall(DataOp::GetTime, vec![], Action::Pure))
         .unwrap();

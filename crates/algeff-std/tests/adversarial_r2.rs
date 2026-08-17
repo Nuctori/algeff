@@ -399,10 +399,12 @@ fn fd_1000_conflict_forks_region_seq_and_fd_monotonic() {
     let c999 = read_back(&mut rt, files[999], 2);
     assert_eq!(c999, b"LR".to_vec(), "第 999 轮文件顺序双写");
     // 每轮左/右分支各一个 Write undo 经顺序路径直接压入父栈（A2 批 6 merge）。
+    // 1000 轮 × 2 Write undo = 2000 + 1000 个 open(create 新建→unlink) 逆
+    // + 2 次 read_back（seek+read 游标逆 ×2）= 3004。
     assert_eq!(
         rt.undo_stack().len(),
-        2000,
-        "1000 轮 × 2 个 Write undo 入父栈"
+        3004,
+        "1000 轮 × (2 Write + 1 unlink) + read_back 游标 undo"
     );
 }
 
@@ -672,7 +674,8 @@ fn arb_lock_write_recover_releases_all_reentrant() {
         String::from_utf8_lossy(&std::fs::read(&pa).unwrap()),
         String::from_utf8_lossy(&read_back(&mut rt, fd, 11))
     );
-    assert_eq!(rt.undo_stack().len(), 2);
+    // undo 栈：lock(1) + write(1) + read_back 的 seek+read 游标逆(2) = 4。
+    assert_eq!(rt.undo_stack().len(), 4);
     assert_eq!(std::fs::read(&pa).unwrap(), b"Xello world");
 
     // Replace → recover：文件恢复 + 锁 undo 释放物理锁与 arbiter 占坑。
@@ -1272,7 +1275,13 @@ fn err_fork_left_error_catch_merged_handle_visible_sequential() {
     );
     // 左分支 Write 在 pos 0 覆盖原首字节："seed-a" → "Leed-a"（写是覆盖不是插入）。
     assert_eq!(std::fs::read(&pa).unwrap(), b"Leed-a", "左分支 Write 生效");
-    assert_eq!(rt.undo_stack().len(), 1, "左分支 Write undo 合并回父");
+    // 左分支 Write undo（1）+ 右分支 Seek(Current(0)) 游标逆（1）
+    // + 右分支 Open(create 新建→unlink undo)（1）= 3。
+    assert_eq!(
+        rt.undo_stack().len(),
+        3,
+        "左分支 Write + 右分支 seek + create undo 合并回父"
+    );
 
     // recover（Replace）→ 左分支写撤销、文件恢复；registry 清空。
     rt.run_blocking(Action::Replace {
@@ -1360,7 +1369,12 @@ fn err_fork_left_error_catch_merged_handle_visible_parallel() {
         rt.registry().lookup(right_fd).is_some(),
         "并行错误路径下右分支句柄仍合并可见"
     );
-    assert!(rt.undo_stack().is_empty(), "Read/Open 均无 undo");
+    // 右分支 Open(create 新建→unlink undo) 合并回父 = 1 条。
+    assert_eq!(
+        rt.undo_stack().len(),
+        1,
+        "右分支 open(create) unlink 逆合并回父"
+    );
     // 状态未毒化：后续蓝图完全正常。
     let v = rt
         .run_blocking(syscall(

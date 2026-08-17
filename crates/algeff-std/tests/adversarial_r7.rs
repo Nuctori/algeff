@@ -1036,14 +1036,22 @@ fn dx_do_macro_blueprint_equivalent_to_handwritten() {
     let va = rt_a.run_blocking(blueprint_macro).unwrap();
     let undo_a = rt_a.undo_stack().len();
     assert_eq!(va, Value::Bytes(b"hello dx".to_vec()), "do_! 结果值");
-    assert_eq!(undo_a, 1, "do_! 链：Write 一条 undo");
+    assert_eq!(
+        undo_a,
+        4,
+        "do_! 链：open(create) unlink + write + seek + read 各一条逆"
+    );
     assert_eq!(std::fs::read(&pa).unwrap(), b"hello dx", "do_! 物理落盘");
 
     let mut rt_b = Runtime::new(Box::new(TokioExecutor::new()));
     let vb = rt_b.run_blocking(blueprint_hand).unwrap();
     let undo_b = rt_b.undo_stack().len();
     assert_eq!(vb, Value::Bytes(b"hello dx".to_vec()), "手写结果值");
-    assert_eq!(undo_b, 1, "手写链：Write 一条 undo");
+    assert_eq!(
+        undo_b,
+        4,
+        "手写链：open(create) unlink + write + seek + read 各一条逆（与 do_! 等价）"
+    );
     assert_eq!(std::fs::read(&pb).unwrap(), b"hello dx", "手写物理落盘");
 
     // 两构造的可观察面完全一致（等价值流 + 等量撤销 + 等量副作用）。

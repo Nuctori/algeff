@@ -132,10 +132,11 @@ async fn undo_lifo_with_registry() {
         let fd_val = *fd;
         stack.push(Box::pin(async move {
             log_ref.lock().unwrap().push(fd_val);
+            Ok(())
         }));
     }
     assert_eq!(stack.len(), 3);
-    stack.recover().await;
+    stack.recover().await.unwrap();
     assert_eq!(
         *log.lock().unwrap(),
         fds.iter().rev().copied().collect::<Vec<u64>>(),

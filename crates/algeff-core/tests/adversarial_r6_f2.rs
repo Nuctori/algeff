@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use algeff_core::{
     Action, BoxFuture, DataOp, OpenFlags, Owned, ReadOnly, ResourceInner, ResourceRegistry,
-    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoOp, Value, WriteOnly,
+    ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability, Value, WriteOnly,
 };
 
 // ── 本地辅助（src/ 冻结不可改，测试内复制；与 R4b 相同约定）──────────────
@@ -68,7 +68,7 @@ fn rw_flags() -> OpenFlags {
 /// （被 A4 拦截的调用不会到达执行器，故兜底在断言「重试后仍至多一次」时
 /// 永远不会被消费）。`&mut self` 顺序访问即天然互斥（解释器单线程 trampoline）。
 struct ScriptedExecutor {
-    results: VecDeque<Result<(Value, Option<UndoOp>), SysError>>,
+    results: VecDeque<Result<(Value, UndoCapability), SysError>>,
 }
 
 impl SyscallExecutor for ScriptedExecutor {
@@ -76,8 +76,8 @@ impl SyscallExecutor for ScriptedExecutor {
         &'a mut self,
         _op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
-        let r = self.results.pop_front().unwrap_or(Ok((Value::Unit, None)));
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
+        let r = self.results.pop_front().unwrap_or(Ok((Value::Unit, UndoCapability::Identity)));
         Box::pin(async move { r })
     }
 }
@@ -93,7 +93,7 @@ fn failed_open_write_rolls_back_path_marker_same_path_retry_ok() {
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
             Err(SysError::AlreadyExists), // 首次 Open(w) 物理失败
-            Ok((Value::Fd(7), None)),     // 重试 Open(rw) 成功
+            Ok((Value::Fd(7), UndoCapability::Identity)),     // 重试 Open(rw) 成功
         ]),
     }));
     let p = PathBuf::from("/same/path.txt");
@@ -142,9 +142,9 @@ fn failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept() {
     // 不因「失败-回滚-重试」而错乱）。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), None)),        // Open(rw) P 成功 → fd 0
+            Ok((Value::Fd(0), UndoCapability::Identity)),        // Open(rw) P 成功 → fd 0
             Err(SysError::PermissionDenied), // Write(fd 0) 物理失败（只读 fd 写）
-            Ok((Value::U64(4), None)),       // 重试 Write(fd 0) 成功
+            Ok((Value::U64(4), UndoCapability::Identity)),       // 重试 Write(fd 0) 成功
         ]),
     }));
     let p = PathBuf::from("/p.txt");
@@ -212,9 +212,9 @@ fn failed_close_rolls_back_own_terminal_marker_fd_still_usable() {
     // owned_consumed 残留 → 任何 usage 都被拒 InvalidInput）。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), None)),  // Open 成功 → fd 0
+            Ok((Value::Fd(0), UndoCapability::Identity)),  // Open 成功 → fd 0
             Err(SysError::BrokenPipe), // Close(fd 0) 物理失败
-            Ok((Value::U64(4), None)), // 随后 Write(fd 0) 成功
+            Ok((Value::U64(4), UndoCapability::Identity)), // 随后 Write(fd 0) 成功
         ]),
     }));
     let p = PathBuf::from("/own.txt");
@@ -256,7 +256,7 @@ fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
     // 标记、回滚无操作）。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), None)),        // Open(rw) P 成功（P 的 Write 标记消费）
+            Ok((Value::Fd(0), UndoCapability::Identity)),        // Open(rw) P 成功（P 的 Write 标记消费）
             Err(SysError::PermissionDenied), // Write(fd 0) 物理失败（fd 标记回滚）
         ]),
     }));
@@ -318,7 +318,7 @@ fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
 fn batch_partial_check_failure_rolls_back_prefix_only() {
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), None)), // Open(w) path2 成功 → path2 Write 标记消费
+            Ok((Value::Fd(0), UndoCapability::Identity)), // Open(w) path2 成功 → path2 Write 标记消费
                                       // 双资源 Open：check_linear(path1) 插入 → check_linear(path2) 失败
                                       // （已消费）→ 前缀 [W(path1)] 回滚，错误透传
         ]),

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use algeff_core::{
     AccessMode, Action, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceHandle,
-    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, Value,
+    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, UndoCapability, Value,
 };
 use algeff_std::TokioExecutor;
 
@@ -226,8 +226,10 @@ async fn undo_restores_file_content() {
         )
         .await
         .unwrap();
-    let undo = undo.expect("小文件 Write 应返回 Full 撤销（undo）");
-    undo.await;
+    let UndoCapability::Invertible(undo) = undo else {
+        panic!("小文件 Write 应返回 Full 撤销（undo）")
+    };
+    undo.await.unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), b"original content");
 }
@@ -255,7 +257,10 @@ async fn rename_undo() {
         .unwrap();
     assert!(b.exists() && !a.exists());
 
-    undo.expect("Rename 应返回 undo").await;
+let UndoCapability::Invertible(undo) = undo else {
+        panic!("Rename 应返回 undo")
+    };
+    undo.await.unwrap();
     assert!(a.exists() && !b.exists());
 }
 
@@ -443,8 +448,8 @@ async fn mutex_lock_exclusion() {
     }
 
     // 释放第一把锁：执行 undo（等价解释器 recover 路径）→ 重新获取成功。
-    if let Some(u) = undo1 {
-        u.await;
+if let UndoCapability::Invertible(u) = undo1 {
+        u.await.unwrap();
     }
     let (_v2, _undo2) = ex.lock().await.execute(&op, &mut reg).await.unwrap();
 }
@@ -490,7 +495,10 @@ async fn mutex_lock_arbiter_contention() {
     // 独占不变量：至多一个同时持有（恰好一个 Ok）。
     assert!(a_ok ^ b_ok, "至多一个同时持有（A={a_ok} B={b_ok}）");
     // 释放成功方的锁（undo 已同时释放 arbiter 占坑）→ 重新获取成功。
-    undo_opt.expect("MutexLock 应返回 undo").await;
+let UndoCapability::Invertible(undo) = undo_opt else {
+        panic!("MutexLock 应返回 undo")
+    };
+    undo.await.unwrap();
     let mut reg = ResourceRegistry::new();
     let mut g = ex.lock().await;
     let (_v, _u) = g
@@ -522,9 +530,12 @@ async fn mutex_unlock_releases_arbiter() {
         .unwrap();
     // undo1（recover 路径）此时全部 no-op：slot 已空 + release 幂等，
     // 不得破坏 lock#2 已释放的状态。
-    undo1.expect("MutexLock 应返回 undo").await;
-    if let Some(u2) = undo2 {
-        u2.await;
+let UndoCapability::Invertible(undo1) = undo1 else {
+        panic!("MutexLock 应返回 undo")
+    };
+    undo1.await.unwrap();
+    if let UndoCapability::Invertible(u2) = undo2 {
+        u2.await.unwrap();
     }
 }
 
@@ -680,8 +691,8 @@ async fn mutex_lock_timeout_stress_50_rounds_no_panic() {
                 )
                 .await;
                 // 成功路径立即执行 undo（释放占坑与物理锁），保证轮末无残留。
-                if let Ok(Ok((_v, Some(undo)))) = res {
-                    undo.await;
+                if let Ok(Ok((_v, UndoCapability::Invertible(undo)))) = res {
+                    undo.await.unwrap();
                 }
             }));
         }
@@ -697,8 +708,8 @@ async fn mutex_lock_timeout_stress_50_rounds_no_panic() {
             .await
             .expect("轮末应能重新获取锁（无占坑泄漏）");
         drop(g);
-        if let Some(u) = undo {
-            u.await;
+        if let UndoCapability::Invertible(u) = undo {
+            u.await.unwrap();
         }
     }
 }

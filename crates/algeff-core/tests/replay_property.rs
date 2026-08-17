@@ -37,7 +37,7 @@ use algeff_core::action::{Action, DataOp, Value};
 use algeff_core::error::SysError;
 use algeff_core::resource::{AccessMode, Resource, ResourceRegistry, ResourceUsage};
 use algeff_core::runtime::{interpret, Context, UndoStack};
-use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use algeff_core::syscall::{BoxFuture, SyscallExecutor, UndoCapability};
 use proptest::prelude::*;
 
 /// 本地 current-thread runtime 驱动（interpret future 非 Send；蓝图不含
@@ -311,7 +311,7 @@ impl SyscallExecutor for MockExecutor {
         &'a mut self,
         op: &'a DataOp,
         _registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         let desc = describe(op);
         let value = match op {
             DataOp::Write { fd, .. } => Value::U64(*fd),
@@ -321,16 +321,17 @@ impl SyscallExecutor for MockExecutor {
         };
         Box::pin(async move {
             self.log.lock().unwrap().push(desc.clone());
-            let undo: Option<UndoOp> = if self.with_undo {
+            let cap: UndoCapability = if self.with_undo {
                 let label = format!("undo({desc})");
                 let undo_log = self.undo_log.clone();
-                Some(Box::pin(
-                    async move { undo_log.lock().unwrap().push(label) },
-                ))
+                UndoCapability::Invertible(Box::pin(async move {
+                    undo_log.lock().unwrap().push(label);
+                    Ok(())
+                    }))
             } else {
-                None
+                UndoCapability::Identity
             };
-            Ok((value, undo))
+            Ok((value, cap))
         })
     }
 }
@@ -428,7 +429,7 @@ proptest! {
             .cloned()
             .chain(final_batch)
             .collect();
-        drive(undo1.recover());
+        drive(undo1.recover()).unwrap();
         prop_assert!(undo1.is_empty(), "recover 后撤销栈清空");
         prop_assert_eq!(
             ex1.undo_ops(),
@@ -489,7 +490,7 @@ proptest! {
         );
 
         // recover 后仍被拒：recover 恢复「状态」而非「线性标记」
-        drive(undo1.recover());
+        drive(undo1.recover()).unwrap();
         assert!(undo1.is_empty(), "recover 后撤销栈清空");
         assert_eq!(
             reg1.check_linear(&usage(res.clone(), AccessMode::Write)),

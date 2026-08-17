@@ -747,11 +747,17 @@ fn timeout_join_path_fork_lock_and_pipe_combined() {
         Action::Pure,
     ))
     .unwrap();
-    rt.run_blocking(Action::Replace {
-        target: Box::new(Action::Pure(Value::Unit)),
-    })
-    .unwrap();
-    assert!(rt.undo_stack().is_empty(), "清理后撤销栈干净");
+    // 终局 Replace：管道写为 NonInvertible（数据已投递到管道缓冲）→ 闸门拒绝。
+    let e = rt
+        .run_blocking(Action::Replace {
+            target: Box::new(Action::Pure(Value::Unit)),
+        })
+        .unwrap_err();
+    assert_eq!(
+        e,
+        SysError::PermissionDenied,
+        "含管道写（不可逆副作用）→ 终局 Replace 拒绝（无法真回归）"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -999,11 +1005,12 @@ fn shared_reactor_fork_branch_fds_usable_after_join() {
         Action::Pure,
     ))
     .unwrap();
-    // 分支 Write 产生 2 条 undo（Full 策略 <1MB 写前读）——断言并清理。
+    // 两分支 open(create 新建→unlink) + write undo（4）+ 父级 seek+read 游标逆
+    // （2 fd × 2）= 8。
     assert_eq!(
         rt.undo_stack().len(),
-        2,
-        "两分支的 Write undo 均已合并回父（Fork 后合并完整性）"
+        8,
+        "两分支 create+write undo + 父级 seek+read 游标逆（合并完整性）"
     );
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),
@@ -1097,11 +1104,12 @@ fn shared_reactor_nested_fork_two_level_io_merge() {
         rt.run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
             .unwrap();
     }
-    // 三个分支各 1 条 Write undo（Full 策略）→ 断言并 Replace 清理。
+    // 三分支 open(create 新建→unlink) + write undo（6）+ 三级 fd seek+read
+    // 游标逆（3 fd × 2）= 12。
     assert_eq!(
         rt.undo_stack().len(),
-        3,
-        "三层分支的 Write undo 均逐级合并回父（两级 Fork 合并完整性）"
+        12,
+        "三层分支 create+write undo + seek+read 游标逆（两级 Fork 合并完整性）"
     );
     rt.run_blocking(Action::Replace {
         target: Box::new(Action::Pure(Value::Unit)),

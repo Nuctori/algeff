@@ -44,7 +44,8 @@ use std::time::Duration;
 use algeff_core::runtime::MAX_IO_LEN;
 use algeff_core::{
     AccessMode, BoxFuture, DataOp, MmapProt, OpenFlags, PipeFlags, Resource, ResourceArbiter,
-    ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoOp, Value,
+    ResourceHandle, ResourceRegistry, ResourceUsage, SysError, SyscallExecutor, UndoCapability,
+    UndoOp, Value,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -313,6 +314,9 @@ pub struct TokioExecutor {
     pipe_readers: Arc<std::sync::Mutex<PipeReaderMap>>,
     /// 管道写端工作对象（RFC-07 文件式双表，同 `pipe_readers`）。
     pipe_writers: Arc<std::sync::Mutex<PipeWriterMap>>,
+    /// append 模式文件 fd（O_APPEND）：写只追加、不覆盖 → 逆 = 截断回原长度，
+    /// 无需写前读（Windows append 句柄 pos 不可靠，r4b (5) 场景）。
+    append_fds: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl Default for TokioExecutor {
@@ -326,6 +330,7 @@ impl Default for TokioExecutor {
             stream_fds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pipe_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pipe_writers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            append_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -434,7 +439,22 @@ impl TokioExecutor {
         path: &Path,
         flags: &OpenFlags,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
+        // truncate 清空已有文件：open 前读原内容（Full 逆准备，语义真回归——
+        // 否则 Replace 无法恢复到 open 前状态）。
+        // 先检测文件是否原本存在（必须在 open() 之前：open(create) 会创建文件，
+        // 之后 existed 恒为 true，create 逆与 truncate 逆都会失效）。
+        let existed_before = tokio::fs::try_exists(path).await.map_err(to_sys_err)?;
+        let trunc_orig: Option<Vec<u8>> = if flags.truncate && existed_before {
+            let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
+            if meta.len() < FULL_UNDO_MAX_BYTES {
+                Some(tokio::fs::read(path).await.map_err(to_sys_err)?)
+            } else {
+                None // 大文件（≥1MB）：无 Full 撤销（成本），标不可逆。
+            }
+        } else {
+            None
+        };
         let mut o = tokio::fs::OpenOptions::new();
         o.read(flags.read)
             .write(flags.write)
@@ -452,9 +472,54 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, Arc::new(tokio::sync::Mutex::new(file)));
-        // undo=None：物理关闭由 Arc Drop 保证；旧 fd 失效由 RFC-05 修复兜底
-        // （registry 活性校验，见 file_fd_stale）。
-        Ok((Value::Fd(fd), None))
+        if flags.append {
+            self.append_fds
+                .lock()
+                .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+                .insert(fd);
+        }
+        // 数学角色（D-0xx）：Open 的文件系统副作用按物理现实分类——
+        // - 无 create/truncate：仅建立内部句柄（registry 生命周期管理）→ Identity；
+        // - create 且文件原本不存在：新建文件 → 逆 = unlink → Invertible；
+        // - truncate 清空已有文件：逆 = 写回原内容（trunc_orig）→ Invertible；
+        // - truncate 大文件（trunc_orig=None）：无法 Full 撤销 → NonInvertible 显式化。
+        let cap = if let Some(orig) = trunc_orig {
+            let p = path.to_path_buf();
+            let undo: UndoOp = Box::pin(async move {
+                let mut f = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&p)
+                    .await
+                    .map_err(to_sys_err)?;
+                f.write_all(&orig).await.map_err(to_sys_err)?;
+                f.set_len(orig.len() as u64).await.map_err(to_sys_err)?;
+                Ok(())
+            });
+            UndoCapability::Invertible(undo)
+        } else if flags.create {
+            if !existed_before {
+                // 新建文件：逆 = unlink（撤销"创建"副作用，真回归）。
+                let p = path.to_path_buf();
+                let undo: UndoOp = Box::pin(async move {
+                    tokio::fs::remove_file(&p).await.map_err(to_sys_err)?;
+                    Ok(())
+                });
+                UndoCapability::Invertible(undo)
+            } else if flags.truncate {
+                // 已存在且 truncate 大文件（trunc_orig=None）→ 显式化。
+                UndoCapability::NonInvertible
+            } else {
+                UndoCapability::Identity
+            }
+        } else if flags.truncate {
+            // truncate 大文件（trunc_orig=None）→ 显式化。
+            UndoCapability::NonInvertible
+        } else {
+            UndoCapability::Identity
+        };
+        Ok((Value::Fd(fd), cap))
     }
 
     async fn op_read(
@@ -462,7 +527,7 @@ impl TokioExecutor {
         fd: u64,
         len: usize,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
         if self.file_fd_stale(fd, reg) {
             return Err(SysError::NotFound);
@@ -479,10 +544,19 @@ impl TokioExecutor {
             if len > MAX_IO_LEN {
                 return Err(SysError::InvalidInput);
             }
+            // 游标是可观察状态（A6 测试锁定）：读前记录位置；
+            // 逆 = seek 回读前位置（读不改变文件内容，仅游标移动）→ Invertible。
+            let pos_before = g.stream_position().await.map_err(to_sys_err)?;
             let mut buf = vec![0u8; len];
             let n = g.read(&mut buf).await.map_err(to_sys_err)?;
             buf.truncate(n);
-            return Ok((Value::Bytes(buf), None));
+            let undo_file = m.clone();
+            let undo: UndoOp = Box::pin(async move {
+                let mut g = undo_file.lock().await;
+                let _ = g.seek(std::io::SeekFrom::Start(pos_before)).await;
+                Ok(())
+            });
+            return Ok((Value::Bytes(buf), UndoCapability::Invertible(undo)));
         }
         // 管道读端（RFC-07 文件式双表：Arc<Mutex<ReadHalf>> 共享下 lock 可用，
         // 无需 take/get_mut 轮换 —— Fork（D13 registry Clone）与 Dup 共享均可 IO）。
@@ -509,7 +583,8 @@ impl TokioExecutor {
             };
             let n = n.map_err(to_sys_err)?;
             buf.truncate(n);
-            return Ok((Value::Bytes(buf), None));
+            // 管道读消费数据（对端缓冲被消费）→ 不可逆。
+            return Ok((Value::Bytes(buf), UndoCapability::NonInvertible));
         }
         Err(SysError::NotFound)
     }
@@ -519,12 +594,14 @@ impl TokioExecutor {
         fd: u64,
         data: &[u8],
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
         if self.file_fd_stale(fd, reg) {
             return Err(SysError::NotFound);
         }
-        // 文件：Full 撤销（<1MB 写前读原内容）或 BestEffort（大文件，undo=None）。
+        // 文件：Full 撤销（<1MB 写前读原内容）。无法构造逆（写前读失败）→ Err
+        // （语义真回归 D-098：不静默降级）；大文件（≥1MB）→ 暂时 NonInvertible
+        // （设计：默认 Full，超阈值需显式 opt-in，P2 提供）。
         let file = self
             .files
             .lock()
@@ -539,9 +616,25 @@ impl TokioExecutor {
                 .await
                 .map_err(to_sys_err)?;
             let orig_len = file.metadata().await.map_err(to_sys_err)?.len();
-            let undo = if orig_len < FULL_UNDO_MAX_BYTES {
+            let is_append = self
+            .append_fds
+            .lock()
+            .expect("executor 映射锁中毒不可达：临界区无 panic 源")
+            .contains(&fd);
+        let undo = if is_append {
+            // append 写：只追加到文件尾、不覆盖已有内容 → 逆 = 截断回原长度
+            // （无需写前读；Windows append 句柄 pos 不可靠，r4b (5) 场景）。
+            file.write_all(data).await.map_err(to_sys_err)?;
+            file.flush().await.map_err(to_sys_err)?;
+            let undo_file = m.clone();
+            let undo: UndoOp = Box::pin(async move {
+                let g = undo_file.lock().await;
+                let _ = g.set_len(orig_len).await;
+                Ok(())
+            });
+            UndoCapability::Invertible(undo)
+        } else if orig_len < FULL_UNDO_MAX_BYTES {
                 // 写前读：读取将被覆盖区域（pos..pos+len），完整回滚（Full 策略）。
-                // 只写句柄（Windows 上读会 ACCESS_DENIED）→ 降级 BestEffort（undo=None）。
                 let mut orig = vec![0u8; data.len()];
                 let mut filled = 0usize;
                 let mut readable = true;
@@ -587,22 +680,40 @@ impl TokioExecutor {
                     let undo: UndoOp = Box::pin(async move {
                         let mut g = undo_file.lock().await;
                         if g.seek(std::io::SeekFrom::Start(pos)).await.is_err() {
-                            return;
+                            return Err(SysError::Other(0));
                         }
-                        let _ = g.write_all(&orig).await;
-                        let _ = g.set_len(orig_len).await;
+                        g.write_all(&orig).await.map_err(to_sys_err)?;
+                        g.set_len(orig_len).await.map_err(to_sys_err)?;
                         let _ = g.seek(std::io::SeekFrom::Start(pos)).await;
+                        Ok(())
                     });
-                    Some(undo)
+                    UndoCapability::Invertible(undo)
                 } else {
-                    file.write_all(data).await.map_err(to_sys_err)?;
-                    file.flush().await.map_err(to_sys_err)?;
-                    None // 写前读失败（如只写句柄）→ 降级 BestEffort。
+                    // 写前读失败（如只写句柄无法读）：
+                    // - 覆盖区域确定为原样为空（pos >= orig_len：新文件/EOF 外
+                    //   写入）→ 逆仍可构造（截断回 orig_len），无需读 → Invertible；
+                    // - 否则无法构造逆 → Err（语义真回归：不静默降级）。
+                    if pos >= orig_len {
+                        file.write_all(data).await.map_err(to_sys_err)?;
+                        file.flush().await.map_err(to_sys_err)?;
+                        let undo_file = m.clone();
+                        let undo: UndoOp = Box::pin(async move {
+                            let mut g = undo_file.lock().await;
+                            let _ = g.seek(std::io::SeekFrom::Start(pos)).await;
+                            let _ = g.set_len(orig_len).await;
+                            Ok(())
+                        });
+                        UndoCapability::Invertible(undo)
+                    } else {
+                        return Err(SysError::PermissionDenied);
+                    }
                 }
             } else {
+                // 大文件（≥1MB）：当前无 Full 撤销（成本），标不可逆（等待 P2
+                // 显式 opt-in 机制；不再静默 None）。
                 file.write_all(data).await.map_err(to_sys_err)?;
                 file.flush().await.map_err(to_sys_err)?;
-                None // BestEffort（pdr.md §11.2）：大文件（≥1MB）不撤销。
+                UndoCapability::NonInvertible
             };
             return Ok((Value::Unit, undo));
         }
@@ -621,7 +732,7 @@ impl TokioExecutor {
         if let Some(m) = pipe_writer {
             let mut g = m.lock().await;
             g.write_all(data).await.map_err(to_sys_err)?;
-            return Ok((Value::Unit, None));
+            return Ok((Value::Unit, UndoCapability::NonInvertible));
         }
         // TCP 流（Write 对流的复用，轮换型；错误路径恢复句柄，blocker-3）。
         let is_stream = self
@@ -643,7 +754,7 @@ impl TokioExecutor {
             };
             guard.put_back();
             r.map_err(to_sys_err)?;
-            return Ok((Value::Unit, None));
+            return Ok((Value::Unit, UndoCapability::NonInvertible));
         }
         Err(SysError::NotFound)
     }
@@ -654,7 +765,7 @@ impl TokioExecutor {
         offset: i64,
         whence: &std::io::SeekFrom,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // RFC-05 修复：文件 fd 须在 registry 中存活（registry 是 fd 活性唯一真相）。
         if self.file_fd_stale(fd, reg) {
             return Err(SysError::NotFound);
@@ -673,11 +784,20 @@ impl TokioExecutor {
             std::io::SeekFrom::Current(_) => std::io::SeekFrom::Current(offset),
             std::io::SeekFrom::End(_) => std::io::SeekFrom::End(offset),
         };
+        // 游标是可观察状态（A6 测试锁定）：记录原位置；
+        // 逆 = seek 回原位置 → Invertible。
+        let pos_before = g.stream_position().await.map_err(to_sys_err)?;
         let pos = g.seek(sf).await.map_err(to_sys_err)?;
-        Ok((Value::U64(pos), None))
+        let undo_file = m.clone();
+        let undo: UndoOp = Box::pin(async move {
+            let mut g = undo_file.lock().await;
+            let _ = g.seek(std::io::SeekFrom::Start(pos_before)).await;
+            Ok(())
+        });
+        Ok((Value::U64(pos), UndoCapability::Invertible(undo)))
     }
 
-    async fn op_stat(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_stat(&mut self, path: &Path) -> Result<(Value, UndoCapability), SysError> {
         let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
         // 自设计格式：List([len, is_dir, is_file])。
         Ok((
@@ -686,7 +806,7 @@ impl TokioExecutor {
                 Value::Bool(meta.is_dir()),
                 Value::Bool(meta.is_file()),
             ]),
-            None,
+            UndoCapability::Identity,
         ))
     }
 
@@ -695,13 +815,13 @@ impl TokioExecutor {
         &mut self,
         path: &Path,
         mode: u32,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         use std::os::unix::fs::PermissionsExt;
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .await
             .map_err(to_sys_err)?;
         // undo=None：恢复需原权限快照；补偿挂钩由用户提供（RFC-05）。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     #[cfg(not(unix))]
@@ -709,7 +829,7 @@ impl TokioExecutor {
         &mut self,
         _path: &Path,
         _mode: u32,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 非 Unix 平台无 chmod 语义 → ENOSYS。
         Err(SysError::Other(38))
     }
@@ -720,12 +840,12 @@ impl TokioExecutor {
         path: &Path,
         uid: u32,
         gid: u32,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 同步系统调用（快速路径，无阻塞风险）。JD-5：补接统一入口 `to_sys_err`
         // （Linux 行为不变：raw 即 POSIX errno；macOS Darwin 码经 kind-first 归一）。
         std::os::unix::fs::chown(path, Some(uid), Some(gid)).map_err(to_sys_err)?;
         // undo=None：恢复需原 uid/gid 快照；补偿挂钩由用户提供（RFC-05）。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     #[cfg(not(unix))]
@@ -734,7 +854,7 @@ impl TokioExecutor {
         _path: &Path,
         _uid: u32,
         _gid: u32,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 非 Unix 平台无 chown 语义 → ENOSYS。
         Err(SysError::Other(38))
     }
@@ -743,7 +863,7 @@ impl TokioExecutor {
         &mut self,
         path: &Path,
         len: usize,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let meta = tokio::fs::metadata(path).await.map_err(to_sys_err)?;
         let undo = if meta.len() < FULL_UNDO_MAX_BYTES {
             let orig = tokio::fs::read(path).await.map_err(to_sys_err)?; // 写前读（Full 策略）。
@@ -758,18 +878,19 @@ impl TokioExecutor {
             let p = path.to_path_buf();
             let undo: UndoOp = Box::pin(async move {
                 // 恢复原内容与原长度（路径级撤销，仅捕获物理数据）。
-                if let Ok(mut f) = tokio::fs::OpenOptions::new()
+                // 失败上报（语义真回归）：truncate 撤销必须成功才是真回归。
+                let mut f = tokio::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
                     .open(&p)
                     .await
-                {
-                    let _ = f.write_all(&orig).await;
-                    let _ = f.set_len(orig.len() as u64).await;
-                }
+                    .map_err(to_sys_err)?;
+                f.write_all(&orig).await.map_err(to_sys_err)?;
+                f.set_len(orig.len() as u64).await.map_err(to_sys_err)?;
+                Ok(())
             });
-            Some(undo)
+            UndoCapability::Invertible(undo)
         } else {
             tokio::fs::OpenOptions::new()
                 .write(true)
@@ -779,36 +900,40 @@ impl TokioExecutor {
                 .set_len(len as u64)
                 .await
                 .map_err(to_sys_err)?;
-            None // BestEffort（pdr.md §11.2）：大文件（≥1MB）不撤销。
+            // 大文件（≥1MB）：无 Full 撤销（成本），标不可逆（等待 P2 opt-in）。
+            UndoCapability::NonInvertible
         };
         Ok((Value::Unit, undo))
     }
 
-    async fn op_unlink(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_unlink(&mut self, path: &Path) -> Result<(Value, UndoCapability), SysError> {
         tokio::fs::remove_file(path).await.map_err(to_sys_err)?;
         // undo=None：恢复需缓存原内容+元数据（BestEffort/Skip）；补偿挂钩由用户提供（RFC-05）。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     async fn op_rename(
         &mut self,
         from: &Path,
         to: &Path,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         tokio::fs::rename(from, to).await.map_err(to_sys_err)?;
-        let (f, t) = (from.to_path_buf(), to.to_path_buf());
+        let f = from.to_path_buf();
+        let t = to.to_path_buf();
         // 逆操作：反向 Rename（Full 策略，路径级撤销）。
+        // 撤销失败上报（语义真回归）：rename 逆必须成功才是真回归。
         let undo: UndoOp = Box::pin(async move {
-            let _ = tokio::fs::rename(&t, &f).await;
+            tokio::fs::rename(&t, &f).await.map_err(to_sys_err)?;
+            Ok(())
         });
-        Ok((Value::Unit, Some(undo)))
+        Ok((Value::Unit, UndoCapability::Invertible(undo)))
     }
 
     async fn op_mkdir(
         &mut self,
         path: &Path,
         mode: u32,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         tokio::fs::create_dir(path).await.map_err(to_sys_err)?;
         #[cfg(unix)]
         {
@@ -818,26 +943,27 @@ impl TokioExecutor {
         #[cfg(not(unix))]
         let _ = mode;
         let p = path.to_path_buf();
-        // 尽力撤销：仅空目录可删（非空 → remove_dir 失败静默，BestEffort）。
+        // 部分逆：仅空目录可删（非空 → remove_dir 失败 → 逆执行失败上报，而非静默）。
         let undo: UndoOp = Box::pin(async move {
-            let _ = tokio::fs::remove_dir(&p).await;
+            tokio::fs::remove_dir(&p).await.map_err(to_sys_err)?;
+            Ok(())
         });
-        Ok((Value::Unit, Some(undo)))
+        Ok((Value::Unit, UndoCapability::Invertible(undo)))
     }
 
-    async fn op_rmdir(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_rmdir(&mut self, path: &Path) -> Result<(Value, UndoCapability), SysError> {
         tokio::fs::remove_dir(path).await.map_err(to_sys_err)?;
         // undo=None：恢复目录内容不可行（BestEffort/Skip）；补偿挂钩由用户提供（RFC-05）。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
-    async fn op_read_dir(&mut self, path: &Path) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_read_dir(&mut self, path: &Path) -> Result<(Value, UndoCapability), SysError> {
         let mut rd = tokio::fs::read_dir(path).await.map_err(to_sys_err)?;
         let mut names = Vec::new();
         while let Some(entry) = rd.next_entry().await.map_err(to_sys_err)? {
             names.push(Value::Str(entry.file_name().to_string_lossy().into_owned()));
         }
-        Ok((Value::List(names), None))
+        Ok((Value::List(names), UndoCapability::Identity))
     }
 
     // ── 网络 TCP ───────────────────────────────────────────────────────
@@ -846,19 +972,19 @@ impl TokioExecutor {
         &mut self,
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let listener = TcpListener::bind(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpListener(Arc::new(listener)));
-        // undo=None：关闭由 Arc Drop 保证；旧 fd 失效由 RFC-05 修复兜底
-        // （registry 活性校验，见 file_fd_stale）。
-        Ok((Value::Fd(fd), None))
+        // 数学角色：Bind 建立资源（端口占用副作用随 Arc Drop 释放——
+        // Replace 的 reg.clear 即回归）→ Identity。
+        Ok((Value::Fd(fd), UndoCapability::Identity))
     }
 
     async fn op_tcp_accept(
         &mut self,
         listener: u64,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let handle = reg.lookup(listener).ok_or(SysError::NotFound)?;
         let (stream, peer) = match handle {
             ResourceHandle::TcpListener(l) => l.accept().await.map_err(to_sys_err)?,
@@ -869,21 +995,22 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, fd);
-        Ok((Value::List(vec![Value::Fd(fd), Value::Addr(peer)]), None))
+        Ok((Value::List(vec![Value::Fd(fd), Value::Addr(peer)]), UndoCapability::Identity))
     }
 
     async fn op_tcp_connect(
         &mut self,
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let stream = TcpStream::connect(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::TcpStream(Arc::new(stream)));
         self.stream_fds
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(fd, fd);
-        Ok((Value::Fd(fd), None))
+        // 数学角色：Connect 建立连接（副作用随 Arc Drop 关闭而回归）→ Identity。
+        Ok((Value::Fd(fd), UndoCapability::Identity))
     }
 
     async fn op_tcp_read(
@@ -891,7 +1018,7 @@ impl TokioExecutor {
         fd: u64,
         len: usize,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 审计 R2-F3 修复：len 上界检查必须在 take 之前（take 后早退会
         // 泄漏已取句柄：注册表条目丢失 + 物理关闭 + 映射残留）。
         if len > MAX_IO_LEN {
@@ -912,7 +1039,7 @@ impl TokioExecutor {
         guard.put_back();
         let n = n.map_err(to_sys_err)?;
         buf.truncate(n);
-        Ok((Value::Bytes(buf), None))
+        Ok((Value::Bytes(buf), UndoCapability::NonInvertible))
     }
 
     async fn op_tcp_write(
@@ -920,7 +1047,7 @@ impl TokioExecutor {
         fd: u64,
         data: &[u8],
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let arc = self.take_tcp_stream(fd, reg)?;
         // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
         let mut guard = TakeHandleGuard::new(self, fd, arc, tcp_stream_handle, reg);
@@ -934,7 +1061,7 @@ impl TokioExecutor {
         };
         guard.put_back();
         r.map_err(to_sys_err)?;
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     async fn op_tcp_shutdown(
@@ -942,7 +1069,7 @@ impl TokioExecutor {
         fd: u64,
         how: &std::net::Shutdown,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let arc = self.take_tcp_stream(fd, reg)?;
         // tokio 未公开 std::net::Shutdown 的 Read/Both 语义（shutdown_std 为
         // pub(super)），经 std 层往返实现完整 how 语义（被 Dup 共享时无法 → InvalidInput）。
@@ -985,7 +1112,7 @@ impl TokioExecutor {
             Err(e) => return Err(to_sys_err(e)), // std 句柄被 from_std 消费，无法恢复。
         };
         self.put_back(fd, ResourceHandle::TcpStream(Arc::new(stream)), reg);
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     // ── 网络 UDP ───────────────────────────────────────────────────────
@@ -994,10 +1121,11 @@ impl TokioExecutor {
         &mut self,
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let sock = UdpSocket::bind(addr).await.map_err(to_sys_err)?;
         let fd = reg.allocate(ResourceHandle::UdpSocket(Arc::new(sock)));
-        Ok((Value::Fd(fd), None))
+        // 数学角色：Bind 建立资源（端口占用副作用随 Arc Drop 释放）→ Identity。
+        Ok((Value::Fd(fd), UndoCapability::Identity))
     }
 
     async fn op_udp_recv_from(
@@ -1005,7 +1133,7 @@ impl TokioExecutor {
         fd: u64,
         len: usize,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let sock = match reg.lookup(fd).ok_or(SysError::NotFound)? {
             ResourceHandle::UdpSocket(s) => s,
             _ => return Err(SysError::InvalidInput),
@@ -1018,7 +1146,7 @@ impl TokioExecutor {
         buf.truncate(n);
         Ok((
             Value::List(vec![Value::Bytes(buf), Value::Addr(addr)]),
-            None,
+    UndoCapability::NonInvertible,
         ))
     }
 
@@ -1028,14 +1156,14 @@ impl TokioExecutor {
         data: &[u8],
         addr: &std::net::SocketAddr,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let sock = match reg.lookup(fd).ok_or(SysError::NotFound)? {
             ResourceHandle::UdpSocket(s) => s,
             _ => return Err(SysError::InvalidInput),
         };
         let _ = sock.send_to(data, addr).await.map_err(to_sys_err)?;
         // undo=None：UDP 发送不可逆（pdr.md §11.1）；补偿挂钩由用户提供。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     // ── 管道（决策 D5：tokio duplex 跨平台内存管道）───────────────────
@@ -1044,7 +1172,7 @@ impl TokioExecutor {
         &mut self,
         flags: &PipeFlags,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let _ = flags; // tokio duplex 天然非阻塞；nonblocking 标志忽略。
                        // duplex(n) 返回相连的一对：A.read 与 B.write 共享同一缓冲区。
                        // 读端取 A 的 ReadHalf，写端取 B 的 WriteHalf → 相连管道。
@@ -1069,7 +1197,7 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(wfd, w_arc);
-        Ok((Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]), None))
+        Ok((Value::List(vec![Value::Fd(rfd), Value::Fd(wfd)]), UndoCapability::Identity))
     }
 
     // ── 进程 ───────────────────────────────────────────────────────────
@@ -1078,7 +1206,7 @@ impl TokioExecutor {
         &mut self,
         cmd: &std::process::Command,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // std::process::Command 不可 Clone（&DataOp 只读借用），经 getter 重建
         // tokio Command（program/args/cwd/envs/stdio 保留；uid/gid 等不迁移）。
         let mut tc = tokio::process::Command::new(cmd.get_program());
@@ -1104,14 +1232,14 @@ impl TokioExecutor {
             .lock()
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .insert(pid, fd);
-        Ok((Value::Pid(pid), None))
+        Ok((Value::Pid(pid), UndoCapability::NonInvertible))
     }
 
     async fn op_wait(
         &mut self,
         pid: u32,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let fd = self
             .children
             .lock()
@@ -1156,7 +1284,7 @@ impl TokioExecutor {
             .remove(&pid);
         // 信号终止时无退出码 → 1（Unix 惯例 128+signal 留作注释）。
         let code = status.code().unwrap_or(1) as u64;
-        Ok((Value::U64(code), None))
+        Ok((Value::U64(code), UndoCapability::NonInvertible))
     }
 
     async fn op_kill(
@@ -1164,7 +1292,7 @@ impl TokioExecutor {
         pid: u32,
         signal: i32,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let fd = self
             .children
             .lock()
@@ -1202,7 +1330,7 @@ impl TokioExecutor {
         self.put_child_back(pid, arc, reg);
         res?;
         // undo=None：kill 不可逆（pdr.md §11.1）；补偿挂钩由用户提供。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     async fn op_send_signal(
@@ -1210,7 +1338,7 @@ impl TokioExecutor {
         signal: i32,
         pid: u32,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         if signal == SIGKILL
             && self
                 .children
@@ -1233,7 +1361,7 @@ impl TokioExecutor {
         path: &Path,
         len: usize,
         prot: &MmapProt,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let _ = prot; // prot 忽略：读入内存即完成映射语义（用户态 COW）。
                       // 审计 R2-F3 修复：读入前校验文件大小上限（tokio::fs::read 按文件全量
                       // 读入——蓝图对宿主大文件 Mmap 即触发与文件等大的分配，debug 下分配
@@ -1248,33 +1376,33 @@ impl TokioExecutor {
             bytes.truncate(len);
         }
         // undo=None：内存 COW 语义，撤销由上层（A2 用户态 COW 层）负责。
-        Ok((Value::Bytes(bytes), None))
+        Ok((Value::Bytes(bytes), UndoCapability::Identity))
     }
 
     async fn op_munmap(
         &mut self,
         addr: usize,
         len: usize,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         let _ = (addr, len); // 无真实映射（Mmap 返回 Bytes）；no-op。
-        Ok((Value::Unit, None))
+        Ok((Value::Unit, UndoCapability::NonInvertible))
     }
 
     // ── 时间 ───────────────────────────────────────────────────────────
 
-    async fn op_get_time(&mut self) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_get_time(&mut self) -> Result<(Value, UndoCapability), SysError> {
         // 非确定性：墙上时钟毫秒（SystemTime）。确定性方案（VirtualClock）
         // 由 A2 virtual-clock feature 提供（RFC）。
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        Ok((Value::U64(ms), None))
+        Ok((Value::U64(ms), UndoCapability::Identity))
     }
 
     // ── 同步 ───────────────────────────────────────────────────────────
 
-    async fn op_mutex_lock(&mut self, id: u64) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_mutex_lock(&mut self, id: u64) -> Result<(Value, UndoCapability), SysError> {
         let m = self
             .mutexes
             .lock()
@@ -1339,11 +1467,12 @@ impl TokioExecutor {
             // 幂等：release 对未占坑资源是 no-op（显式 MutexUnlock 已释放时安全）。
             // std Mutex 同步 lock（临界区无 await，A5 批 9）。
             arbiter.lock().unwrap().release(&claim_set);
+            Ok(())
         });
-        Ok((Value::Unit, Some(undo)))
+        Ok((Value::Unit, UndoCapability::Invertible(undo)))
     }
 
-    async fn op_mutex_unlock(&mut self, id: u64) -> Result<(Value, Option<UndoOp>), SysError> {
+    async fn op_mutex_unlock(&mut self, id: u64) -> Result<(Value, UndoCapability), SysError> {
         // 显式解锁：取走停车位中的 guard 并释放（若 undo 已释放则为 no-op，幂等）。
         let slot = self
             .held_locks
@@ -1364,7 +1493,9 @@ impl TokioExecutor {
             mode: AccessMode::Write,
         }];
         self.arbiter.lock().unwrap().release(&claim_set);
-        Ok((Value::Unit, None))
+        // 数学角色（D-0xx）：MutexUnlock 释放锁 = 内部状态管理（slot/占坑，
+        // 幂等），对外部可观察状态无副作用 → Identity。
+        Ok((Value::Unit, UndoCapability::Identity))
     }
 
     // ── 其他 ───────────────────────────────────────────────────────────
@@ -1376,7 +1507,7 @@ impl TokioExecutor {
         offset: usize,
         len: usize,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         if out == input {
             // 同 fd 读写 → 自拷贝（无意义）；拒绝（InvalidInput）。
             return Err(SysError::InvalidInput);
@@ -1437,8 +1568,32 @@ impl TokioExecutor {
             .expect("executor 映射锁中毒不可达：临界区无 panic 源")
             .get(&out)
             .cloned();
-        let written = if let Some(m) = out_file {
+        let (written, cap) = if let Some(m) = out_file {
             let mut g = m.lock().await;
+            // 数学角色：文件目标侧写入 → Invertible（写前读目标区域，
+            // 逆 = 恢复原区域 + 原长度；语义真回归 D-098）。
+            let pos = g.stream_position().await.map_err(to_sys_err)?;
+            let orig_len = g.metadata().await.map_err(to_sys_err)?.len();
+            // 写前读：读取将被覆盖区域（pos..pos+len），完整回滚。
+            let mut orig = vec![0u8; buf.len()];
+            let mut filled = 0usize;
+            let mut readable = true;
+            while filled < orig.len() {
+                match g.read(&mut orig[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(_) => {
+                        readable = false;
+                        break;
+                    }
+                }
+            }
+            g.seek(std::io::SeekFrom::Start(pos)).await.map_err(to_sys_err)?;
+            if !readable {
+                // 无法构造逆（如只写句柄）→ 不静默降级。
+                return Err(SysError::PermissionDenied);
+            }
+            orig.truncate(filled);
             let n = g.write(&buf).await.map_err(to_sys_err)?;
             // 写后必须 flush（D-039 对齐；R3c MEDIUM-1）：op_send_file 输出到
             // 文件与 op_write 同属**异步落盘**面——tokio::fs::File 的 write
@@ -1451,7 +1606,18 @@ impl TokioExecutor {
             // 投递语义，无“落盘”可观察面（同 op_write 管道路径不 flush
             // 的约定）。
             g.flush().await.map_err(to_sys_err)?;
-            n
+            let undo_file = m.clone();
+            let undo: UndoOp = Box::pin(async move {
+                let mut g = undo_file.lock().await;
+                if g.seek(std::io::SeekFrom::Start(pos)).await.is_err() {
+                    return Err(SysError::Other(0));
+                }
+                g.write_all(&orig).await.map_err(to_sys_err)?;
+                g.set_len(orig_len).await.map_err(to_sys_err)?;
+                let _ = g.seek(std::io::SeekFrom::Start(pos)).await;
+                Ok(())
+            });
+            (n, UndoCapability::Invertible(undo))
         } else if out_is_stream {
             let arc = self.take_tcp_stream(out, reg)?;
             // R7-A 修复：已取句柄进入取消窗口前套 RAII 守卫（取消/错误路径均归还）。
@@ -1465,7 +1631,8 @@ impl TokioExecutor {
                 s.write(&buf).await
             };
             guard.put_back();
-            n.map_err(to_sys_err)?
+            // TCP 流目标：数据投递到对端 → 不可逆（对端不可回滚）。
+            (n.map_err(to_sys_err)?, UndoCapability::NonInvertible)
         } else if let Some(m) = out_pipe_writer {
             // 文件式双表（RFC-07）：Arc<Mutex<WriteHalf>> 共享下 lock 可用。
             // RFC-05 修复：registry 活性校验（Replace 后旧 fd 不得再 IO）。
@@ -1473,19 +1640,21 @@ impl TokioExecutor {
                 return Err(SysError::NotFound);
             }
             let mut g = m.lock().await;
-            g.write(&buf).await.map_err(to_sys_err)?
+            // 管道目标：投递到对端缓冲 → 不可逆（对端不可回滚）。
+            let n = g.write(&buf).await.map_err(to_sys_err)?;
+            (n, UndoCapability::NonInvertible)
         } else {
             return Err(SysError::NotFound);
         };
-        // undo=None：输出侧写入的撤销由调用方按需补偿（BestEffort，注释）。
-        Ok((Value::U64(written as u64), None))
+        // 数学角色：文件目标 Invertible（写前读逆）；流/管道 NonInvertible。
+        Ok((Value::U64(written as u64), cap))
     }
 
     async fn op_dup(
         &mut self,
         fd: u64,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 轮换型句柄先取当前注册表 fd（直存句柄则原样；管道经 RFC-07 双表改造后
         // 不轮换，映射恒等，translated_fd 返回 None → 回落 fd 本身）。
         let cur = self.translated_fd(fd).unwrap_or(fd);
@@ -1541,7 +1710,7 @@ impl TokioExecutor {
                 .expect("executor 映射锁中毒不可达：临界区无 panic 源")
                 .insert(new_fd, new_fd);
         }
-        Ok((Value::Fd(new_fd), None))
+        Ok((Value::Fd(new_fd), UndoCapability::Identity))
     }
 
     async fn op_dup2(
@@ -1549,7 +1718,7 @@ impl TokioExecutor {
         old_fd: u64,
         new_fd: u64,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
         // 先释放 new_fd 占用（轮换型经逻辑映射移除，直存型直接 take）。
         // RFC-05 修复：new_fd 已在 registry 失效（Replace 后旧 fd）→ 不再触碰
@@ -1591,7 +1760,7 @@ impl TokioExecutor {
         &mut self,
         fd: u64,
         reg: &mut ResourceRegistry,
-    ) -> Result<(Value, Option<UndoOp>), SysError> {
+    ) -> Result<(Value, UndoCapability), SysError> {
         // RFC-05 修复：关闭前先校验 registry 活性——Replace（reg.clear()）后旧
         // fd 在 executor 内部映射（files/stream/pipe）中仍残留，直接 remove 会
         // 「成功关闭」已失效 fd（可观察反例）；以 registry 为唯一真相：失效 →
@@ -1633,9 +1802,11 @@ impl TokioExecutor {
         } else {
             return Err(SysError::NotFound);
         }
-        // undo=None：关闭不可逆；旧 fd 失效由 RFC-05 修复兜底（op_close 先校验
-        // registry 活性，失效 fd 的 Close → NotFound）。
-        Ok((Value::Unit, None))
+        // 数学角色（D-0xx）：Close 仅终结内部句柄（registry 生命周期管理，
+        // reg.clear 同样释放）——对外部可观察状态无副作用 → Identity
+        // （不是 NonInvertible：文件内容撤销由 Write undo 负责，fd 终结不
+        // 阻止 Replace 真回归）。
+        Ok((Value::Unit, UndoCapability::Identity))
     }
 }
 
@@ -1652,6 +1823,7 @@ impl SyscallExecutor for TokioExecutor {
             stream_fds: self.stream_fds.clone(),
             pipe_readers: self.pipe_readers.clone(),
             pipe_writers: self.pipe_writers.clone(),
+            append_fds: self.append_fds.clone(),
         }))
     }
 
@@ -1659,7 +1831,7 @@ impl SyscallExecutor for TokioExecutor {
         &'a mut self,
         op: &'a DataOp,
         registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         Box::pin(async move {
             match op {
                 DataOp::Open { path, flags } => self.op_open(path, flags, registry).await,
@@ -1792,7 +1964,7 @@ mod tests {
             .op_mutex_lock(id)
             .await
             .expect("取消后应能重新获取锁（claim 未泄漏）");
-        assert!(undo.is_some(), "重新获取的锁应带 undo");
+        assert!(undo.is_invertible(), "重新获取的锁应带 undo");
     }
 
     /// A5 批 9 审计 blocker 的确定性复现：取消路径的守卫 drop 与「另一任务正
@@ -1883,7 +2055,7 @@ mod tests {
             .op_mutex_lock(id)
             .await
             .expect("取消后应能重新获取锁（claim 未泄漏）");
-        assert!(undo.is_some(), "重新获取的锁应带 undo");
+        assert!(undo.is_invertible(), "重新获取的锁应带 undo");
     }
 
     /// A5 批 9 确定性单测：`disarm` 后 drop 不触碰 arbiter 锁 —— 手动

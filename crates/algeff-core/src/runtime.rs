@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::action::{Action, DataOp, Id, Signal, Value};
 use crate::error::SysError;
 use crate::resource::{ResourceRegistry, ResourceSet};
-use crate::syscall::{BoxFuture, SyscallExecutor, UndoOp};
+use crate::syscall::{BoxFuture, SyscallExecutor, UndoCapability, UndoOp};
 
 #[cfg(feature = "virtual-clock")]
 use crate::virtual_clock::VirtualClock;
@@ -68,11 +68,18 @@ impl Context {
 #[derive(Default)]
 pub struct UndoStack {
     ops: Vec<UndoOp>,
+    /// 已发生不可逆副作用（NonInvertible，无逆元操作被真实执行）。
+    /// 置位后不因 `rollback_from` 清除（不可逆副作用无法撤销，回滚只是
+    /// 尽力恢复可逆部分）；仅 Replace 成功完成恢复后重置（新执行段起点）。
+    irreversible: bool,
 }
 
 impl UndoStack {
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            irreversible: false,
+        }
     }
 
     pub fn push(&mut self, op: UndoOp) {
@@ -87,18 +94,46 @@ impl UndoStack {
         self.ops.len()
     }
 
+    /// 记录一次不可逆副作用（NonInvertible 操作被真实执行）。
+    pub fn mark_irreversible(&mut self) {
+        self.irreversible = true;
+    }
+
+    /// 执行段内是否已发生不可逆副作用（Replace 闸门检查，真回归前提）。
+    pub fn has_irreversible(&self) -> bool {
+        self.irreversible
+    }
+
+    /// 重置不可逆标记（Replace 检查通过后 / RuntimeException 恢复完成后：
+    /// 新执行段起点）。
+    pub fn reset_irreversible(&mut self) {
+        self.irreversible = false;
+    }
+
     /// 把另一个栈的全部逆操作按序追加到本栈（Fork 并行合并用，D14）。
     /// 调用方按 **left → right** 顺序 append（栈底到栈顶），使 LIFO recover
     /// 先执行 **right** 的逆操作、再执行 left 的 —— 与顺序路径「left 先执行、
     /// right 后执行」的观察序一致（right 的效果后发生、先撤销）。
     pub fn append(&mut self, other: UndoStack) {
         self.ops.extend(other.ops);
+        self.irreversible |= other.irreversible;
     }
 
     /// recoverΓ：按 LIFO 顺序执行全部逆操作（pdr.md §5.1.3）。
-    pub async fn recover(&mut self) {
+    /// 每个逆操作返回 Result——撤销失败必须上报（语义真回归，D-098）：
+    /// 继续执行剩余逆操作（尽力回滚），聚合首个错误返回。
+    pub async fn recover(&mut self) -> Result<(), SysError> {
+        let mut first_err = None;
         while let Some(op) = self.ops.pop() {
-            op.await;
+            if let Err(e) = op.await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -107,10 +142,20 @@ impl UndoStack {
     /// `ops[..mark]` 保留——外层效果（Timeout 之前已入栈的 undo）不属于本次
     /// 回滚范围。`mark >= len` 时为空操作（防御：无内层效果需要回滚）。
     /// undo 可为异步 IO（决策 D4），故本方法为 async。
-    pub async fn rollback_from(&mut self, mark: usize) {
+    /// 撤销失败同样上报（聚合首个错误）；不可逆标记不清除（副作用无法撤销）。
+    pub async fn rollback_from(&mut self, mark: usize) -> Result<(), SysError> {
+        let mut first_err = None;
         while self.ops.len() > mark {
             let op = self.ops.pop().expect("len > mark 保证栈非空");
-            op.await;
+            if let Err(e) = op.await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 }
@@ -291,8 +336,13 @@ impl Runtime {
     }
 
     /// 恢复效果上下文：执行全部累积逆操作（pdr.md §5.1.3 recoverΓ）。
-    pub async fn recover(&mut self) {
-        self.undo_stack.recover().await;
+    /// 撤销失败上报（语义真回归）；成功后重置不可逆标记（恢复完成 = 段结束）。
+    pub async fn recover(&mut self) -> Result<(), SysError> {
+        let r = self.undo_stack.recover().await;
+        if r.is_ok() {
+            self.undo_stack.reset_irreversible();
+        }
+        r
     }
 }
 
@@ -482,7 +532,9 @@ fn run_virtual_timeout<'a>(
             Err(_elapsed) => {
                 // 墙钟通道超时：inner 已 drop（无分支可 join），回滚其已入栈
                 // undo 与线性标记后执行 on_timeout。
-                undo.rollback_from(undo_mark).await;
+                // 语义真回归：回滚失败（撤销 Err）→ 传播错误，不执行 on_timeout
+                // （状态未恢复时执行替代方案会在不一致基础上继续）。
+                undo.rollback_from(undo_mark).await?;
                 reg.rollback_linear_to(&linear_snap);
                 run_sub_impl(
                     on_timeout,
@@ -674,8 +726,10 @@ async fn run_wall_timeout<'a>(
     }
     // 超时取消：先回滚 inner 已入栈 undo（异步，可含 IO），
     // 再回滚 inner 新增的线性标记，最后执行 on_timeout。
+    // 语义真回归：inner 回滚失败（撤销 Err）→ 传播错误，不执行 on_timeout
+    // （状态未恢复时执行替代方案会在不一致基础上继续）。
     drop(inner_result);
-    undo.rollback_from(undo_mark).await;
+    undo.rollback_from(undo_mark).await?;
     reg.rollback_linear_to(&linear_snap);
     run_sub_impl(on_timeout, ctx, undo, reg, access.reborrow(), depth, cancel).await
 }
@@ -724,7 +778,7 @@ async fn exec_via(
     access: &mut ExecAccess<'_>,
     op: &DataOp,
     reg: &mut ResourceRegistry,
-) -> Result<(Value, Option<UndoOp>), SysError> {
+) -> Result<(Value, UndoCapability), SysError> {
     match access {
         ExecAccess::Direct(ex) => (**ex).execute(op, reg).await,
         ExecAccess::Shared { executor, .. } => {
@@ -1293,9 +1347,11 @@ async fn interpret_impl(
                     // 毒化）。成功路径 A4 语义不变（恰好消费一次），错误不压 undo
                     // （现有契约）。
                     None => match exec_via(&mut access, &op, reg).await {
-                        Ok((v, maybe_undo)) => {
-                            if let Some(u) = maybe_undo {
-                                undo.push(u);
+                        Ok((v, capability)) => {
+                            match capability {
+                                UndoCapability::Identity => {}
+                                UndoCapability::Invertible(u) => undo.push(u),
+                                UndoCapability::NonInvertible => undo.mark_irreversible(),
                             }
                             let na = next(v);
                             (Value::Unit, na)
@@ -1428,7 +1484,16 @@ async fn interpret_impl(
             Action::Replace { target } => {
                 // D10：先 recover（清空撤销栈）+ reg.clear()（释放 handles 与线性
                 // 标记，next_fd 保留 D1 单调），再执行 target，以其结果结束（不回原流）。
-                undo.recover().await;
+                // 语义真回归闸门（D-0xx）：
+                // 1. recover 任一逆操作失败 → 传播错误，不执行 target（状态未真回归
+                //    时继续会在不一致基础上叠加）；
+                // 2. 执行段含不可逆副作用（has_irreversible）→ 不可真回归，拒绝，
+                //    显式报错（而不是静默假回滚）。
+                undo.recover().await?;
+                if undo.has_irreversible() {
+                    return Err(SysError::PermissionDenied);
+                }
+                undo.reset_irreversible();
                 reg.clear();
                 return run_sub_impl(
                     *target,

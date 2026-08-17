@@ -99,7 +99,7 @@ async fn a2_empty_undo_stack_recover_noop() {
     let mut stack = UndoStack::new();
     assert!(stack.is_empty());
     assert_eq!(stack.len(), 0);
-    stack.recover().await; // 空栈 recover 直接返回，无副作用
+    stack.recover().await.unwrap(); // 空栈 recover 直接返回，无副作用
     assert!(stack.is_empty());
     assert_eq!(stack.len(), 0);
 }
@@ -304,10 +304,11 @@ async fn a6_undo_lifo_order() {
         let log_ref = log.clone();
         stack.push(Box::pin(async move {
             log_ref.lock().unwrap().push(id);
+            Ok(())
         }));
     }
     assert_eq!(stack.len(), 2);
-    stack.recover().await;
+    stack.recover().await.unwrap();
     assert_eq!(
         *log.lock().unwrap(),
         vec![2u8, 1u8],
@@ -325,9 +326,10 @@ async fn a6_undo_restores_observable_state() {
     let mut stack = UndoStack::new();
     stack.push(Box::pin(async move {
         undo_state.fetch_sub(2, Ordering::SeqCst);
+        Ok(())
     }));
     assert_eq!(state.load(Ordering::SeqCst), 2);
-    stack.recover().await;
+    stack.recover().await.unwrap();
     assert_eq!(
         state.load(Ordering::SeqCst),
         0,
@@ -348,10 +350,11 @@ async fn a6_undo_multiple_restores_full_state() {
         stack.push(Box::pin(async move {
             undo_state.fetch_sub(delta, Ordering::SeqCst);
             undo_executed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }));
     }
     assert_eq!(state.load(Ordering::SeqCst), 11);
-    stack.recover().await;
+    stack.recover().await.unwrap();
     assert_eq!(state.load(Ordering::SeqCst), 0);
     assert_eq!(executed.load(Ordering::SeqCst), 2);
 }

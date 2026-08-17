@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use algeff_core::{
     AccessMode, Action, BoxFuture, DataOp, OpenFlags, PipeFlags, Resource, ResourceHandle,
-    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoOp,
+    ResourceRegistry, ResourceUsage, Runtime, SysError, SyscallExecutor, TypedResource, UndoCapability,
     Value,
 };
 use algeff_std::adapters::{and_then, open_file};
@@ -265,12 +265,13 @@ fn rev_undo_restores_file_cursor() {
     ))
     .unwrap();
     assert_eq!(std::fs::read(&pa).unwrap(), b"XYllo world");
-    assert_eq!(rt.undo_stack().len(), 1);
+    // Seek 与 Write 各压入一个 undo（游标逆 + 内容逆，数学上均 Invertible）。
+    assert_eq!(rt.undo_stack().len(), 2);
 
     // recoverΓ（D4 异步逆操作）：经外部 runtime 驱动（不违反 D9——recover
     // 不创建 reactor）
     let outer = tokio::runtime::Runtime::new().unwrap();
-    outer.block_on(rt.recover());
+    outer.block_on(rt.recover()).unwrap();
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), b"hello world", "内容恢复");
 
@@ -978,8 +979,8 @@ fn conc_nested_fork_mixed_parallel_sequential() {
     assert_eq!(std::fs::read(&pb).unwrap(), b"R", "外层右分支落盘");
     assert_eq!(
         rt.undo_stack().len(),
-        3,
-        "内层 2 + 外层右 1 个 undo 合并回父"
+        4,
+        "内层 2 + 外层右 open(create 新建→unlink) + write = 4 条 undo 合并回父"
     );
 
     // 全链 Replace → 全部撤销恢复（LIFO：右分支先、内层 L2、L1 后）
@@ -989,8 +990,8 @@ fn conc_nested_fork_mixed_parallel_sequential() {
     .unwrap();
     assert!(rt.undo_stack().is_empty());
     assert_eq!(std::fs::read(&pa).unwrap(), b"seed", "嵌套链撤销恢复 pa");
-    // pb 的 undo（写前读为空 → 恢复空内容 + 截断回 0）不删除文件本身
-    assert_eq!(std::fs::read(&pb).unwrap(), b"", "嵌套链撤销恢复 pb 内容");
+    // pb 由 open(create) 新建 → unlink 逆删除（真回归：回到 open 前不存在）。
+    assert!(!pb.exists(), "嵌套链撤销删除新建的 pb（create 逆生效）");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1375,7 +1376,7 @@ impl SyscallExecutor for LoggingExecutor {
         &'a mut self,
         op: &'a DataOp,
         registry: &'a mut ResourceRegistry,
-    ) -> BoxFuture<'a, Result<(Value, Option<UndoOp>), SysError>> {
+    ) -> BoxFuture<'a, Result<(Value, UndoCapability), SysError>> {
         Box::pin(async move {
             self.log.lock().unwrap().push(format!("{op:?}"));
             self.inner.execute(op, registry).await
