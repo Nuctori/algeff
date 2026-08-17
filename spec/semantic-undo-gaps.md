@@ -1,6 +1,6 @@
 # 语义撤销缺口清单（Undo Semantics Gaps）
 
-> 状态：**已修复（P0+P1+A4 use/move 拆分）**。剩余：P2（DataOp 静态 role 位 + 宏 warning + dx::irreversible）、P3（确定性维度）、chmod/chown 快照逆。
+> 状态：**已修复（P0+P1+A4 use/move 拆分）**。剩余：P3 确定性维度的完整落地（is_deterministic 已加）、chmod/chown 快照逆。P2 宏级 compile warning 因 stable Rust proc macro 无 Diagnostic API **不可行**——已由运行时 Replace 闸门（NonInvertible 标记）覆盖 + dx::irreversible 文档标记。
 > 关联决策：D-098（语义真回归原则）、D-099（修复分层）、D-100（测试先行）、D-101（线性语义分层）。
 > 关联测试：`crates/algeff-std/tests/undo_semantics_contract.rs`（4 个锁定测试，当前 4/4 绿 = 问题行为基线）。
 > 记录日期：2026-08-17。修复时逐条勾销并反转对应测试断言。
