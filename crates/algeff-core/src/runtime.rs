@@ -26,10 +26,22 @@ use crate::virtual_clock::VirtualClock;
 /// 超限返回 `SysError::InvalidInput`（可被外层 Catch 捕获）。
 pub const MAX_IO_LEN: usize = 64 * 1024 * 1024;
 
+/// 判断 Value 是否含资源句柄（Fd/Pid，含嵌套 List）——含则结果不可缓存
+/// （句柄可能随 Replace 的 reg.clear / Fork 分支丢弃失效，D-103）。
+fn value_contains_handle(v: &Value) -> bool {
+    match v {
+        Value::Fd(_) | Value::Pid(_) => true,
+        Value::List(items) => items.iter().any(value_contains_handle),
+        _ => false,
+    }
+}
+
 /// 幂等键注册表（D-0xx 幂等键状态机）：键 → 状态机（COMMITTED/REVERTED）。
 ///
 /// 跨执行持久（不随 Replace 的 reg.clear 清除）：恰好一次语义要求"副作用在
 /// 生命周期内只真正发生一次"——REVERTED 允许重执行，COMMITTED 返回缓存。
+/// **注意**：无淘汰/容量上限——动态 key（如按请求/订单号）场景下随 Runtime
+/// 生命周期无界累积，属设计取舍（Note-1）；容量上限留待全局共享升级。
 #[derive(Debug, Default, Clone)]
 pub struct IdempotencyRegistry {
     states: HashMap<String, IdempotencyState>,
@@ -60,14 +72,23 @@ impl IdempotencyRegistry {
     }
 
     /// 查键：COMMITTED 未 REVERTED → 返回缓存结果（重试去重）。
+    /// 含资源句柄（Fd/Pid）的结果不缓存（可能随 Replace/分支丢弃失效）——
+    /// COMMITTED 但无缓存 → fallback 返回 `Unit`（副作用已发生，结果不可再得，
+    /// D-103 承诺）；未记录/REVERTED → None（重执行）。
     pub fn lookup_committed(&self, key: &str) -> Option<Value> {
         match self.states.get(key) {
-            Some(s) if s.status == IdempotencyStatus::Committed => s.value.clone(),
+            Some(s) if s.status == IdempotencyStatus::Committed => match &s.value {
+                Some(v) => Some(v.clone()),
+                None => Some(Value::Unit), // fallback：已发生但结果不可缓存
+            },
             _ => None,
         }
     }
 
     /// 执行成功后提交：键置 COMMITTED + 缓存结果（幂等，重复 commit 不覆盖）。
+    /// 含资源句柄（Fd/Pid）的结果**不缓存**（COMMITTED 但 value=None）——
+    /// 句柄可能随 Replace 的 reg.clear / Fork 分支丢弃而失效，缓存命中会返回
+    /// use-after-release 的死句柄（D-103：Fd 失效风险 + fallback）。
     pub fn commit(&mut self, key: &str, value: Value) {
         let entry = self
             .states
@@ -78,7 +99,11 @@ impl IdempotencyRegistry {
             });
         if entry.status != IdempotencyStatus::Committed {
             entry.status = IdempotencyStatus::Committed;
-            entry.value = Some(value);
+            entry.value = if value_contains_handle(&value) {
+                None // 含 Fd/Pid：不缓存（句柄易失效），重试 fallback Unit
+            } else {
+                Some(value)
+            };
         }
     }
 
@@ -935,6 +960,9 @@ fn collect_syscall_resources(action: &Action, out: &mut ResourceSet) {
 }
 
 /// 收集 Action 树中的幂等键（D-103）：遍历找 `Action::Idempotent` 的 key。
+/// **注意**：只遍历可见 AST 节点——`next`/`cond`/`combine`/`handler` 闭包内的
+/// Idempotent 不可见（与 `collect_syscall_resources` 的资源盲区同族，R3 审计；
+/// 闭包内同 key + Fork 并行时"恰好一次"可能被双执行——已知模式，阶段 1 接受）。
 fn collect_idempotency_keys(action: &Action, out: &mut std::collections::HashSet<String>) {
     match action {
         Action::Idempotent { key, inner, .. } => {
@@ -1609,13 +1637,13 @@ async fn interpret_impl(
                 //    时继续会在不一致基础上叠加）；
                 // 2. 执行段含不可逆副作用（has_irreversible）→ 不可真回归，拒绝，
                 //    显式报错（而不是静默假回滚）。
-                undo.recover().await?;
-                // 语义真回归闸门：执行段含不可逆副作用（has_irreversible）→
-                // 拒绝（显式报错而非静默假回滚）。无论成功/拒绝，flag 都重置
-                // ——recover 已尽力回滚（可逆部分恢复），执行段结束，新段从
-                // 干净状态开始（修复 MEDIUM-2：拒绝后 Runtime 不再永久楔死）。
+                // 无论 recover 成败/闸门拒绝，irreversible flag 都重置——recover
+                // 已尽力（可逆部分恢复），执行段结束，新段从干净状态开始
+                // （MEDIUM-2 + LOW-3：失败路径不永久楔死）。
+                let recover_result = undo.recover().await;
                 let irreversible = undo.has_irreversible();
                 undo.reset_irreversible();
+                recover_result?;
                 if irreversible {
                     return Err(SysError::PermissionDenied);
                 }

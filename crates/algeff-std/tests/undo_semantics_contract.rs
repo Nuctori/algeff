@@ -571,7 +571,7 @@ fn replace_rejected_then_reusable_same_runtime() {
     let mut rt = Runtime::new(Box::new(TokioExecutor::new()));
 
     // 段 1：管道写（NonInvertible，不可回滚）→ Replace 拒绝。
-    let (rfd, wfd) = {
+    let (_rfd, wfd) = {
         let v = rt.run_blocking(dx::pipe_open()).unwrap();
         match v {
             Value::List(l) => (fd_of(&l[0]), fd_of(&l[1])),

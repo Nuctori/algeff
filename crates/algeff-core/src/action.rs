@@ -356,11 +356,15 @@ pub enum Action {
     },
     /// 幂等执行（D-0xx 幂等键状态机）：带全局幂等键的副作用段。
     ///
-    /// 状态机：`PENDING → COMMITTED → REVERTED`。
+    /// 状态机：`COMMITTED → REVERTED`（PENDING 留待全局共享注册表升级，
+    /// per-Runtime 单线程天然串行，无需中间态）。
     /// - 执行时查键：COMMITTED 未 REVERTED → 返回缓存结果，**不执行 inner**；
-    /// - 未命中/REVERTED → 执行 inner（undo 压栈），成功后键置 COMMITTED 并缓存结果；
+    /// - 未命中/REVERTED → 执行 inner（undo 压栈），成功后键置 COMMITTED 并缓存结果
+    ///   （含 Fd/Pid 的结果不缓存，重试 fallback Unit）；
     /// - 该段的 undo 被 recover 执行（Replace/Scope 退出）→ 键置 REVERTED，
     ///   允许未来重新执行（恰好一次语义：生命周期内副作用只真正发生一次）。
+    /// - inner 内含 Replace（自清理副作用）→ 不 COMMIT（undo 长度回落检测），
+    ///   重试重新执行。
     Idempotent {
         key: String,
         inner: Box<Action>,
