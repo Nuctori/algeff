@@ -376,12 +376,16 @@ impl ResourceRegistry {
         }
     }
 
-    /// 公理 A4 线性检查（运行时断言）：
-    /// - Write：每资源至多一次（重复 Write 拒绝）；
-    /// - Own：终结操作（Own 之后该资源任何 usage —— Read/Write/Append/Own —— 都拒绝）；
+    /// 公理 A4 线性检查（运行时断言，D-0xx use/move 拆分）：
+    /// - Write：**use 语义，不限次数**（顺序多次写由运行时维护每次独立 undo，
+    ///   LIFO 撤销仍正确——物理现实：文件可多次写，类型系统保证不了的线性
+    ///   问题运行时确保语义，不拒绝）；
+    /// - Own：**move 语义，终结一次**（Own 之后该资源任何 usage ——
+    ///   Read/Write/Append/Own —— 都拒绝，fd 释放后无法确保语义）；
     /// - Read/Append：不限次数。
     ///
-    /// Write 与 Own 分属不同消费集：`Write → Close(Own)` 是合法序列（pdr.md §14 示例）。
+    /// mutex 防重入由仲裁器（A7）独立保证（op_mutex_lock 的 arbiter 占坑），
+    /// 不依赖 Write 消费。
     pub fn check_linear(&mut self, usage: &ResourceUsage) -> Result<(), SysError> {
         let r = &usage.resource;
         // Own 为终结：先于一切模式检查。
@@ -389,11 +393,7 @@ impl ResourceRegistry {
             return Err(SysError::InvalidInput);
         }
         match usage.mode {
-            AccessMode::Write => {
-                if !self.consumed.insert(r.clone()) {
-                    return Err(SysError::InvalidInput);
-                }
-            }
+            AccessMode::Write => {}
             AccessMode::Own => {
                 self.owned_consumed.insert(r.clone());
             }
@@ -403,26 +403,23 @@ impl ResourceRegistry {
     }
 
     /// 失败路径线性标记回滚（RFC-12，R6-F2 修复）：`check_linear` 在 syscall
-    /// **执行前**预插入 Write/Own 消费标记；物理执行失败时这些标记必须回滚
-    /// （与 A7 仲裁「失败回滚」同原则）——否则失败后同路径再以 Write 模式
+    /// **执行前**预插入 Own 终结标记；物理执行失败时这些标记必须回滚
+    /// （与 A7 仲裁「失败回滚」同原则）——否则失败后同路径再以 Own 模式
     /// 重试会被 A4 误拒（`InvalidInput`，线性标记残留毒化）。
     ///
     /// 前置条件：对传入切片内的**每个** usage，`check_linear` 均已返回 Ok
-    /// （即：全部成功——或批内部分失败时对成功前缀调用）。此时每个 Write/Own
-    /// 标记都是本批新插入的（Write 至多一次、Own 终结——重复插入会返回 Err 且
+    /// （即：全部成功——或批内部分失败时对成功前缀调用）。此时每个 Own
+    /// 标记都是本批新插入的（Own 终结——重复插入会返回 Err 且
     /// 不进入执行阶段），故恰好移除一个标记是安全的：不会误删早前成功 syscall
-    /// 的消费记录。Read/Append 不插标记，无操作。成功路径行为不变（公理 A4：
-    /// Write/Own 恰好消费一次）。
+    /// 的消费记录。Write（use 语义）不插标记，Read/Append 不插标记，无操作。
+    /// 成功路径行为不变（公理 A4：Own 恰好终结一次）。
     pub fn rollback_linear(&mut self, resources: &[ResourceUsage]) {
         for u in resources {
             match u.mode {
-                AccessMode::Write => {
-                    self.consumed.remove(&u.resource);
-                }
                 AccessMode::Own => {
                     self.owned_consumed.remove(&u.resource);
                 }
-                AccessMode::Read | AccessMode::Append => {}
+                AccessMode::Write | AccessMode::Read | AccessMode::Append => {}
             }
         }
     }
@@ -681,11 +678,12 @@ mod tests {
     }
 
     #[test]
-    fn linearity_double_write_rejected() {
+    fn linearity_double_write_allowed_use_semantics() {
         let mut reg = ResourceRegistry::new();
         let u = usage(Resource::Fd(1), AccessMode::Write);
+        // use 语义（D-0xx A4 拆分）：Write 不限次数，运行时维护每次独立 undo。
         assert!(reg.check_linear(&u).is_ok());
-        assert_eq!(reg.check_linear(&u), Err(SysError::InvalidInput));
+        assert!(reg.check_linear(&u).is_ok(), "重复 Write 允许（use 可多次）");
     }
 
     #[test]

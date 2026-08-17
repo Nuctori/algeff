@@ -509,26 +509,21 @@ fn lin_fork_conflict_double_write_then_parent_blocked() {
     // 冲突 Fork → 顺序执行（left→right）；D13 隔离 → 两侧 Write 都物理发生
     assert_eq!(std::fs::read(&pa).unwrap(), b"LR", "顺序路径两分支写均生效");
 
-    // F2（38bca67）：分支线性标记经 merge 并入父 → 父级同资源 Write 被 A4 拒绝
-    let err = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd,
-                data: b"X".to_vec(),
-            },
-            vec![wu(fd)],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(
-        err,
-        SysError::InvalidInput,
-        "Fork 后父级同资源 Write 应被 A4 拦截"
-    );
+    // F2（38bca67）：分支 Write（use 语义）并入父 → 父级同资源 Write 仍允许
+    // （运行时维护独立 undo）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd,
+            data: b"X".to_vec(),
+        },
+        vec![wu(fd)],
+        Action::Pure,
+    ))
+    .unwrap();
     assert_eq!(
         std::fs::read(&pa).unwrap(),
-        b"LR",
-        "拦截发生在 execute 之前（无第三次写）"
+        b"LRX",
+        "父级第三次写真实生效（use 语义不拦截）"
     );
 }
 

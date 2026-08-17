@@ -2,7 +2,8 @@
 //!
 //! 1. **write-only 句柄写 → 写前读失败 → Err**：无法构造逆 → 报错（不再静默降级）。
 //! 2. **undo 闭包失败上报**：mkdir 逆（remove_dir 非空失败）→ recover 返回 Err。
-//! 3. **A4 拒绝二写（二期反转）**：A4 use/move 拆分前保持现状（锁定 A4 拒绝行为）。
+//! 3. **A4 use/move 拆分（已反转）**：Write 是 use 语义可多次（独立 undo +
+//!    LIFO 撤销）；Own 是 move 语义终结一次。二写允许且撤销正确。
 //! 4. **open+create 不可逆显式化**：Open(create) 标 NonInvertible → Replace 闸门拒绝
 //!    （不再静默残留）。
 
@@ -142,7 +143,7 @@ fn mkdir_inverse_removes_dir_when_emptied_by_create_undo() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn sequential_multi_write_same_fd_rejected_by_a4() {
+fn sequential_multi_write_same_fd_allowed_use_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("multi.txt");
     std::fs::write(&p, b"original").unwrap();
@@ -177,22 +178,29 @@ fn sequential_multi_write_same_fd_rejected_by_a4() {
     .unwrap();
     assert_eq!(rt.undo_stack().len(), 1, "首次写有 undo");
 
-    // 第二次写：被 A4 拒绝——运行时本可记录第二个独立 undo（LIFO 撤销仍
-    // 正确：先还原第二次写，再还原第一次 → 回到 open 前状态）。
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd,
-                data: b"second".to_vec(),
-            },
-            vec![wr(fd)],
-            Action::Pure,
-        ))
-        .unwrap_err();
+    // 第二次写：允许（A4 use/move 拆分，D-0xx：Write 是 use 语义可多次）
+    // → 独立 undo 入栈（写前读第二次覆盖区域）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd,
+            data: b"second".to_vec(),
+        },
+        vec![wr(fd)],
+        Action::Pure,
+    ))
+    .unwrap();
+    assert_eq!(rt.undo_stack().len(), 2, "两次写各一个独立 undo");
+
+    // LIFO 撤销正确：先还原第二次写（写回 first 覆盖区），再还原第一次
+    // （写回 original 覆盖区）→ 回到 open 前状态（真回归）。
+    rt.run_blocking(Action::Replace {
+        target: Box::new(Action::Pure(Value::Unit)),
+    })
+    .unwrap();
     assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "顺序二写被 A4 拒绝——运行时本可确保每次写的独立撤销（能确保却拒绝）"
+        std::fs::read(&p).unwrap(),
+        b"original".to_vec(),
+        "两次写都被独立撤销（LIFO，语义真回归）"
     );
 }
 

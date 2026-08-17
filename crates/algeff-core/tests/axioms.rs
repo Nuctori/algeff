@@ -198,15 +198,12 @@ proptest! {
 // ── A4 资源线性（pdr.md §四 A4）────────────────────────────────────────
 
 #[test]
-fn a4_write_duplicate_rejected() {
+fn a4_write_use_semantics_repeatable() {
     let mut reg = ResourceRegistry::new();
     let u = usage(Resource::Fd(1), AccessMode::Write);
-    assert!(reg.check_linear(&u).is_ok(), "首次 Write 消费应 Ok");
-    assert_eq!(
-        reg.check_linear(&u),
-        Err(SysError::InvalidInput),
-        "重复 Write 应拒绝（恰好消费一次）"
-    );
+    // use 语义（D-0xx A4 拆分）：Write 不限次数。
+    assert!(reg.check_linear(&u).is_ok(), "首次 Write 应 Ok");
+    assert!(reg.check_linear(&u).is_ok(), "重复 Write 允许（use 可多次）");
 }
 
 #[test]
@@ -243,14 +240,13 @@ proptest! {
     }
 
     /// 随机混合序列（对齐 A3 合并后的最终线性语义）：
-    /// Read/Append 可重复（但 Own 之后拒绝）；Write 每资源至多一次；Own 为终结；
+    /// Read/Append/Write 可重复（use 语义）；Own 为终结（move 语义）；
     /// Write→Own（Close）合法。
     #[test]
     fn a4_random_read_write_sequence(
         ref seq in proptest::collection::vec((arb_resource(), arb_mode()), 0..16),
     ) {
         let mut reg = ResourceRegistry::new();
-        let mut written: HashSet<Resource> = HashSet::new();
         let mut owned: HashSet<Resource> = HashSet::new();
         for (r, m) in seq {
             let u = usage(r.clone(), *m);
@@ -264,21 +260,12 @@ proptest! {
                 continue;
             }
             match m {
-                AccessMode::Read | AccessMode::Append => {
-                    prop_assert!(reg.check_linear(&u).is_ok(), "Read/Append 可重复: {:?}", u);
-                }
-                AccessMode::Write => {
-                    if written.contains(&r) {
-                        prop_assert_eq!(
-                            reg.check_linear(&u),
-                            Err(SysError::InvalidInput),
-                            "重复 Write 应拒绝: {:?}",
-                            u
-                        );
-                    } else {
-                        prop_assert!(reg.check_linear(&u).is_ok(), "首次 Write 应 Ok: {:?}", u);
-                        written.insert(r.clone());
-                    }
+                AccessMode::Read | AccessMode::Append | AccessMode::Write => {
+                    prop_assert!(
+                        reg.check_linear(&u).is_ok(),
+                        "Read/Append/Write（use 语义）可重复: {:?}",
+                        u
+                    );
                 }
                 AccessMode::Own => {
                     prop_assert!(

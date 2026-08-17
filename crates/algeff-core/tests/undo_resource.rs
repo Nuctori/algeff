@@ -76,18 +76,18 @@ fn undo_restores_linear_state() {
     );
     assert_eq!(t1, t2, "两次序列结果应完全一致（可重放性）");
 
-    // 负向对照：不执行撤销时 Write 消费标记残留 → 重放被线性约束拒绝，
+    // 负向对照：Own 终结标记残留 → 重放被线性约束拒绝，
     // 证明「可重放」依赖撤销动作（状态复位），而非 check_linear 本身放行
     let mut reg2 = ResourceRegistry::new();
     let fd2 = reg2.allocate(handle);
     let r = Resource::Fd(fd2);
     assert!(reg2
-        .check_linear(&usage(r.clone(), AccessMode::Write))
+        .check_linear(&usage(r.clone(), AccessMode::Own))
         .is_ok());
     assert_eq!(
-        reg2.check_linear(&usage(r.clone(), AccessMode::Write)),
+        reg2.check_linear(&usage(r.clone(), AccessMode::Read)),
         Err(SysError::InvalidInput),
-        "无撤销时重复 Write 应被拒绝（A4 恰好消费一次）"
+        "无撤销时 Own 后任何 usage 应被拒绝（A4 move 终结）"
     );
 }
 

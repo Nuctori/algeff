@@ -258,15 +258,10 @@ fn alloc_in_conflict_fork_sequential_values_and_merge() {
         other => panic!("期望 List([U64, U64])，得到 {other:?}"),
     }
 
-    // F2 合并：两分支的 Fd(77) Write 消费并入父 → 父级同资源再声明被 A4 拦截
-    let e = rt
-        .run_blocking(syscall(DataOp::GetTime, vec![wu(77)], Action::Pure))
-        .unwrap_err();
-    assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "冲突 Fork 后父级同资源 Write 声明应被 A4 拦截（线性标记合并）"
-    );
+    // F2 合并：两分支的 Fd(77) Write（use 语义）并入父 → 父级同资源再声明
+    // 允许（运行时维护独立 undo）。
+    rt.run_blocking(syscall(DataOp::GetTime, vec![wu(77)], Action::Pure))
+        .unwrap();
 
     // Replace（D10）复位线性标记 → 同资源再可用
     rt.run_blocking(Action::Replace {

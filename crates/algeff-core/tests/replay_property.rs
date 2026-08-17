@@ -442,11 +442,10 @@ proptest! {
         prop_assert_eq!(t1, t2, "撤销往返后重放同蓝图，轨迹与第一次完全一致");
     }
 
-    /// 属性 3（线性守恒，pdr.md §四 A4 + §11 recoverΓ 语义）：
-    /// 构造首 op 必为 Write(Fd(r)) 的随机蓝图（主路径消费标记建立），执行后：
-    /// 同资源第二次 Write 在同一 registry 被拒；**recover 之后仍被拒** ——
-    /// recover 恢复的是「状态」（撤销副作用）而非「线性标记」（consumed 集
-    /// 保留，当前实现如此，注释断言）；全新 registry 上重放 → 轨迹一致。
+    /// 属性 3（线性守恒，pdr.md §四 A4 + §11 recoverΓ 语义，D-0xx use/move 拆分）：
+    /// 构造首 op 必为 Write(Fd(r)) 的随机蓝图，执行后：同资源第二次 Write 在
+    /// 同一 registry 仍被允许（use 语义）；**recover 之后仍允许**（Write 不消费，
+    /// 无标记可恢复）；全新 registry 上重放 → 轨迹一致。
     #[test]
     fn prop_linearity_marker_survives_recover(
         bp in arb_bp_no_replace(3, 11),
@@ -482,21 +481,24 @@ proptest! {
             "首 op 必为 Write(Fd(r))（主路径）"
         );
 
-        // 同 registry 第二次 Write 被拒：A4 消费标记保留
-        assert_eq!(
-            reg1.check_linear(&usage(res.clone(), AccessMode::Write)),
-            Err(SysError::InvalidInput),
-            "含 Write 的蓝图执行后，同资源第二次 Write 在同一 registry 上被拒"
-        );
+        // 同 registry 第二次 Write（D-0xx use/move 拆分后的正确语义）：
+        // - 蓝图未 Close(Own) res → Ok（use 语义，Write 不限次数）；
+        // - 蓝图已 Own 终结 res → Err(InvalidInput)（move 终结后任何 usage 拒绝）。
+        // 两种都是新 A4 的合法行为，取决于随机蓝图是否包含对 res 的 Own。
+        match reg1.check_linear(&usage(res.clone(), AccessMode::Write)) {
+            Ok(()) => {}
+            Err(SysError::InvalidInput) => {}
+            Err(e) => panic!("check_linear 意外错误: {e:?}"),
+        }
 
-        // recover 后仍被拒：recover 恢复「状态」而非「线性标记」
+        // recover 后：Write 不消费（无标记可恢复）；Own 终结标记保留。
         drive(undo1.recover()).unwrap();
         assert!(undo1.is_empty(), "recover 后撤销栈清空");
-        assert_eq!(
-            reg1.check_linear(&usage(res.clone(), AccessMode::Write)),
-            Err(SysError::InvalidInput),
-            "recover 不恢复线性标记：consumed 集保留（§11 recoverΓ 只执行逆操作）"
-        );
+        match reg1.check_linear(&usage(res.clone(), AccessMode::Write)) {
+            Ok(()) => {}
+            Err(SysError::InvalidInput) => {}
+            Err(e) => panic!("check_linear 意外错误: {e:?}"),
+        }
 
         // 全新 registry 重放同蓝图 → 与第一次轨迹一致（可重放性）
         let t2 = run_once(&with_write);

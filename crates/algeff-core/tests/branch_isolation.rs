@@ -249,11 +249,10 @@ fn exec_P3_fork_left_write_right_read_isolated() {
     // 撤销栈只有左分支 Write 的 undo（右 Read 无 undo，读不产生逆操作）
     assert_eq!(undo.len(), 1, "仅左分支 Write 压入撤销栈");
 
-    // (c) registry 线性标记：左 Write 消费并入父 registry（F2 merge）
-    assert_eq!(
-        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "左分支 Write 的线性消费已并入父 registry（右分支副本未含该消费，故右 Read 未被拒绝）"
+    // (c) registry 线性标记：左分支 Write（use 语义）并入父 registry（F2 merge）
+    assert!(
+        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)).is_ok(),
+        "左分支 Write 并入父后 Write 仍允许（use 语义不消费）"
     );
     assert!(
         reg.check_linear(&usage(Resource::Fd(1), AccessMode::Read))
@@ -290,12 +289,12 @@ fn exec_P3_fork_read_isolation_runtime_path() {
     );
     assert_eq!(rt.undo_stack().len(), 1, "仅左分支 Write 的 undo 压栈");
 
-    // 状态侧：父 registry 线性标记经 merge 归位
-    assert_eq!(
+    // 状态侧：父 registry 线性标记经 merge 归位（use 语义：Write 不消费）
+    assert!(
         rt.registry()
-            .check_linear(&usage(Resource::Fd(1), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "左 Write 消费经 F2 merge 并入父 registry"
+            .check_linear(&usage(Resource::Fd(1), AccessMode::Write))
+            .is_ok(),
+        "左 Write 并入父后 Write 仍允许（use 语义）"
     );
     assert!(
         rt.registry()
@@ -383,11 +382,10 @@ fn exec_A5_choose_true_else_zero_effect() {
         "未选 else 分支 op 零记录（Write fd 2 从未执行）"
     );
     assert_eq!(undo_len, 1, "撤销栈仅 then 分支的 undo");
-    // 状态侧：then 分支资源已线性消费；未选 else 分支资源零消费
-    assert_eq!(
-        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "then 分支 Write(fd 1) 已消费"
+    // 状态侧：then 分支 Write（use 语义）不消费；未选 else 分支资源零效应
+    assert!(
+        reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write)).is_ok(),
+        "then 分支 Write(fd 1) 不消费（use 语义）"
     );
     assert!(
         reg.check_linear(&usage(Resource::Fd(2), AccessMode::Write))
@@ -407,15 +405,14 @@ fn exec_A5_choose_false_then_zero_effect() {
         "未选 then 分支 op 零记录（Write fd 1 从未执行）"
     );
     assert_eq!(undo_len, 1, "撤销栈仅 else 分支的 undo");
-    // 状态侧（对称验证）：未选 then 分支资源零消费；else 分支资源已消费
+    // 状态侧（对称验证）：未选 then 分支资源零效应；else 分支 Write（use）不消费
     assert!(
         reg.check_linear(&usage(Resource::Fd(1), AccessMode::Write))
             .is_ok(),
         "未选 then 分支资源零效应：Write(fd 1) 未被线性标记（A5 分支隔离）"
     );
-    assert_eq!(
-        reg.check_linear(&usage(Resource::Fd(2), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "else 分支 Write(fd 2) 已消费"
+    assert!(
+        reg.check_linear(&usage(Resource::Fd(2), AccessMode::Write)).is_ok(),
+        "else 分支 Write(fd 2) 不消费（use 语义）"
     );
 }

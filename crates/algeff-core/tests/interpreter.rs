@@ -1163,11 +1163,10 @@ fn fork_conflict_merge_keeps_linear_marks() {
     assert_eq!(v, Ok(Value::U64(20)), "冲突 Fork 顺序执行，combine 正确");
     assert_eq!(ex.ops(), vec!["write:1", "write:1"], "left→right 顺序执行");
 
-    // 分支的 Write 消费已随 merge 并入父：父级对该资源再次 Write 被拒（F2）
-    assert_eq!(
-        reg.check_linear(&w),
-        Err(SysError::InvalidInput),
-        "冲突型 Fork 后父级同资源 Write 应被 A4 拒绝（线性标记经 merge 保留）"
+    // 分支的 Write（use 语义）并入父：父级再次 Write 允许（F2 merge 后仍可用）。
+    assert!(
+        reg.check_linear(&w).is_ok(),
+        "冲突型 Fork 后父级同资源 Write 仍允许（use 语义）"
     );
 }
 
@@ -1550,21 +1549,14 @@ fn fork_sequential_left_error_right_still_executes_and_merges() {
         vec!["write:1", "write:3", "write:2"],
         "右分支在左分支 Err 后仍执行（left→right 顺序）"
     );
-    // merge 发生：两分支的线性标记并入父 —— 成功的 Write 消费并入
-    // （fd 1/2）；左分支**失败**的 Write（fd 3，NotFound）标记已回滚
-    // （RFC-12：失败 syscall 预插入的消费标记不残留），不并入父。
-    for fd in [1u64, 2] {
-        assert_eq!(
-            reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write)),
-            Err(SysError::InvalidInput),
-            "分支 fd {fd} 的成功 Write 消费经 merge 并入父"
+    // merge 发生：两分支的线性标记并入父 —— Write（use 语义）不消费
+    // （fd 1/2/3 均允许重复；失败 Write 的标记回滚语义对 use 无影响）。
+    for fd in [1u64, 2, 3] {
+        assert!(
+            reg.check_linear(&usage(Resource::Fd(fd), AccessMode::Write)).is_ok(),
+            "分支 fd {fd} 的 Write 并入父后仍允许（use 语义）"
         );
     }
-    assert_eq!(
-        reg.check_linear(&usage(Resource::Fd(3), AccessMode::Write)),
-        Ok(()),
-        "左分支失败的 Write（fd 3）标记已回滚，经 merge 后父侧未消费"
-    );
     // recover 按 right→left 撤销（LIFO：右分支效果后发生、先撤销）。
     drive(undo.recover()).unwrap();
     assert_eq!(

@@ -506,11 +506,12 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
         })
         .unwrap();
         let content = std::fs::read(&pa).unwrap();
+        // 前 2 字节 = 双写竞争结果（父级第三次写 X 追加在游标后——use 语义）。
         assert!(
-            content == b"LR" || content == b"RL",
-            "第 {round} 轮写竞争结果 ∈ {{LR, RL}}，实测 {content:?}"
+            content.starts_with(b"LR") || content.starts_with(b"RL"),
+            "第 {round} 轮写竞争结果前 2 字节 ∈ {{LR, RL}}，实测 {content:?}"
         );
-        match &content[..] {
+        match &content[..2] {
             b"LR" => lr += 1,
             _ => rl += 1,
         }
@@ -518,29 +519,24 @@ fn ub_fork_conflict_blindspot_hidden_closure_write() {
         // （左先右后），仅真并行竞争（50ms 窗口重叠）可出现 RL 序；共享
         // reactor 不保证不同 worker，线程断言已废弃（迭代 3-A1）。
 
-        // A4 线性在并行路径上仍经 merge 并入父：父级同 fd Write 被拦截
-        // （盲区不破坏线性保证）
-        let e = rt
-            .run_blocking(syscall(
-                DataOp::Write {
-                    fd,
-                    data: b"X".to_vec(),
-                },
-                vec![wu(fd)],
-                Action::Pure,
-            ))
-            .unwrap_err();
-        assert_eq!(
-            e,
-            SysError::InvalidInput,
-            "第 {round} 轮：并行 Fork 后父级同资源 Write 应被 A4 拦截"
-        );
+        // A4 use 语义：并行 Fork 后父级同 fd Write 仍允许（运行时维护独立 undo，
+        // 盲区不破坏可逆性保证）。
+        rt.run_blocking(syscall(
+            DataOp::Write {
+                fd,
+                data: b"X".to_vec(),
+            },
+            vec![wu(fd)],
+            Action::Pure,
+        ))
+        .unwrap();
     }
     // 并行证据（语义级，调度无关）：本测试的**盲区并发证据**由
     // ub_fork_conflict_blindspot_mutex_wouldblock 承担（双分支竞争 MutexLock
     // → 败者 WouldBlock——仅真并行路径可出现）；本测试职责为盲区双写语义
-    // （每轮 ∈ {LR, RL} 已断言 + A4 合并拦截）。两写序分布（LR/RL 计数）为
-    // 软观察：共享 reactor 下单 worker 顺序轮询可致全 LR（左分支恒先完成），
-    // 不设硬断言（reviewer MEDIUM-1 实测 LR×8 间歇失败，2026-08-16）。
+    // （每轮前 2 字节 ∈ {LR, RL} 已断言 + 父级 use 语义写允许）。两写序分布
+    // （LR/RL 计数）为软观察：共享 reactor 下单 worker 顺序轮询可致全 LR
+    // （左分支恒先完成），不设硬断言（reviewer MEDIUM-1 实测 LR×8 间歇失败，
+    // 2026-08-16）。
     eprintln!("r3b blind-write race distribution: LR×{lr} RL×{rl}");
 }

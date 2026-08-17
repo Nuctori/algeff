@@ -770,19 +770,17 @@ fn d10_replace_resets_linearity_same_resource_rewrite() {
     assert_eq!(std::fs::read(&pa).unwrap(), b"Z10-original");
     assert_eq!(rt.undo_stack().len(), 1);
 
-    // Replace 前 A4 线性仍在：同一 fd 第二次 Write 被运行时拦截。
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd: fd1,
-                data: b"W".to_vec(),
-            },
-            vec![wr(fd1)],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(e, SysError::InvalidInput, "Replace 前同 fd 二写被 A4 拦截");
-    assert_eq!(rt.undo_stack().len(), 1, "被拦截的写不产生 undo");
+    // Replace 前同 fd 二次 Write：use 语义允许（独立 undo 入栈）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd: fd1,
+            data: b"W".to_vec(),
+        },
+        vec![wr(fd1)],
+        Action::Pure,
+    ))
+    .unwrap();
+    assert_eq!(rt.undo_stack().len(), 2, "二写各一个独立 undo");
 
     // Replace = recover + clear：文件恢复、句柄释放、线性标记清除（D10 复位）。
     rt.run_blocking(Action::Replace {

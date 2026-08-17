@@ -61,17 +61,16 @@ fn open_write_close_lifecycle() {
     let r = Resource::Fd(fd);
     assert!(reg.lookup(fd).is_some(), "Open 后句柄应可见");
 
-    // Write：A4 线性通过（Write 至多一次）
+    // Write：A4 use 语义通过（Write 不限次数）
     assert!(
         reg.check_linear(&usage(r.clone(), AccessMode::Write))
             .is_ok(),
         "首次 Write 应通过线性检查"
     );
-    // 重复 Write 拒绝（A4）
-    assert_eq!(
-        reg.check_linear(&usage(r.clone(), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "同一资源二次 Write 应被拒绝"
+    // 重复 Write 允许（use 语义，运行时维护独立 undo）
+    assert!(
+        reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok(),
+        "同一资源二次 Write 允许（use 语义）"
     );
 
     // Close 的 Own 语义：Own 终结检查通过，随后 take 移除句柄
@@ -308,7 +307,6 @@ proptest! {
         let mut reg = ResourceRegistry::new();
         // 资源键直接用 Fd(i)，无需真实句柄 —— check_linear 只追踪资源键
         let keys: Vec<Resource> = (0..N_RES as Fd).map(Resource::Fd).collect();
-        let mut written = [false; N_RES];
         let mut owned = [false; N_RES];
 
         for (ri, mi) in ops {
@@ -321,26 +319,26 @@ proptest! {
             };
             let ok = reg.check_linear(&usage(keys[i].clone(), mode)).is_ok();
 
-            // 状态机预期：Own 终结后一切拒绝；Write 至多一次
+            // 状态机预期：Own 终结后一切拒绝；Write（use 语义）不限次数
             let expected = if owned[i] {
                 false
             } else {
                 match mode {
-                    AccessMode::Write => !written[i],
-                    AccessMode::Own | AccessMode::Read | AccessMode::Append => true,
+                    AccessMode::Write | AccessMode::Own | AccessMode::Read | AccessMode::Append => {
+                        true
+                    }
                 }
             };
             prop_assert_eq!(
                 ok, expected,
-                "资源 {} {:?}：written={} owned={}",
-                i, mode, written[i], owned[i]
+                "资源 {} {:?}：owned={}",
+                i, mode, owned[i]
             );
 
             // 推进状态机（失败时状态不变，故无条件置位安全）
             match mode {
-                AccessMode::Write => written[i] = true,
                 AccessMode::Own => owned[i] = true,
-                AccessMode::Read | AccessMode::Append => {}
+                AccessMode::Write | AccessMode::Read | AccessMode::Append => {}
             }
         }
     }

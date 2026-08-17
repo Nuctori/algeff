@@ -350,11 +350,12 @@ fn exec_A2_identity() {
 // 同资源 Write 两次（两个 Sequential Syscall 共享同一 registry）→ 第二次 Err(InvalidInput)。
 
 #[test]
-fn exec_A4_linearity_runtime() {
+fn exec_A4_linearity_runtime_use_semantics() {
     let mut ctx = Context::new();
     let mut undo = UndoStack::new();
     let mut reg = ResourceRegistry::new();
     let mut ex = MockExecutor::new();
+    ex.with_undo = true;
     ex.respond("write:1:1", MockOutcome::Value(Value::U64(10)));
 
     let w = usage(Resource::Fd(1), AccessMode::Write);
@@ -377,17 +378,13 @@ fn exec_A4_linearity_runtime() {
         }),
     };
     let v = drive(interpret(action, &mut ctx, &mut undo, &mut reg, &mut ex));
-    assert_eq!(
-        v,
-        Err(SysError::InvalidInput),
-        "第二次同资源 Write 在运行时被 A4 线性检查拒绝"
-    );
+    assert_eq!(v, Ok(Value::U64(10)), "第二次同资源 Write 允许（use 语义）");
     assert_eq!(
         ex.ops(),
-        vec!["write:1:1"],
-        "拒绝发生在第二次 execute 之前（check_linear 先行）"
+        vec!["write:1:1", "write:1:1"],
+        "两次 Write 都到达执行器（不拦截）"
     );
-    assert!(undo.is_empty(), "被拒绝的第二次 Write 未产生任何副作用");
+    assert_eq!(undo.len(), 2, "两次 Write 各产生一个 undo");
 }
 
 // ── A6 撤销双态：Runtime 路径往返 ─────────────────────────────────────
@@ -516,6 +513,7 @@ fn exec_fork_conflict_static() {
     );
 
     let mut ex = MockExecutor::new();
+    ex.with_undo = true;
     ex.respond("write:1:1", MockOutcome::Value(Value::U64(10)));
     ex.respond("write:1:2", MockOutcome::Value(Value::U64(20)));
 

@@ -187,8 +187,8 @@ fn failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept() {
         .unwrap();
     assert_eq!(v, Value::U64(4), "同 fd 重试 Write 成功");
 
-    // A4 至多一次在重试成功后仍然成立（第三次 Write 被解释器拦截，不触达执行器）。
-    let e2 = rt
+    // A4 use 语义（D-0xx 拆分）：第三次 Write 也允许（队列耗尽兜底 Ok(Unit)）。
+    let v3 = rt
         .run_blocking(syscall(
             DataOp::Write {
                 fd: 0,
@@ -197,13 +197,8 @@ fn failed_write_on_fd_rolls_back_then_retry_ok_and_at_most_once_kept() {
             vec![wr(0)],
             Action::Pure,
         ))
-        .unwrap_err();
-    assert_eq!(
-        e2,
-        SysError::InvalidInput,
-        "重试成功后仍至多一次（A4，不重复消费）"
-    );
-    assert!(rt.undo_stack().is_empty(), "被 A4 拦截的写不产生 undo");
+        .unwrap();
+    assert_eq!(v3, Value::Unit, "第三次 Write 允许（use 语义，不消费）");
 }
 
 #[test]
@@ -249,15 +244,13 @@ fn failed_close_rolls_back_own_terminal_marker_fd_still_usable() {
 }
 
 #[test]
-fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
-    // 回滚不得误删早前成功 syscall 的消费记录：Open(rw) 成功消费路径 P 的
-    // Write 标记 → Write(fd) 失败只回滚 fd 标记 → 同路径再 Open(w) 仍被 A4
-    // 拒绝（P 已消费，成功路径恰好一次不变）；fd 上 Read 不受影响（Read 不插
-    // 标记、回滚无操作）。
+fn rollback_only_touches_this_syscall_own_marker_success_path_axiom_kept() {
+    // 回滚不得误删早前成功 syscall 的 Own 终结标记：Open(rw) 不消费 Write
+    // （use 语义）→ 同路径再 Open(w) 允许；fd 上 Read 不受影响。
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), UndoCapability::Identity)),        // Open(rw) P 成功（P 的 Write 标记消费）
-            Err(SysError::PermissionDenied), // Write(fd 0) 物理失败（fd 标记回滚）
+            Ok((Value::Fd(0), UndoCapability::Identity)), // Open(rw) P 成功
+            Err(SysError::PermissionDenied), // Write(fd 0) 物理失败
         ]),
     }));
     let p = PathBuf::from("/keep.txt");
@@ -282,22 +275,16 @@ fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
     ))
     .unwrap_err();
 
-    // 同路径再 Open(w)：P 的 Write 标记来自**成功的** Open，仍应拒绝（A4）。
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: p.clone(),
-                flags: rw_flags(),
-            },
-            vec![wr_path(p.clone())],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "成功 Open 消费的路径 Write 标记不受失败 Write 的回滚影响"
-    );
+    // 同路径再 Open(w)：Write 是 use 语义（不消费）→ 允许（队列兜底 Ok(Unit)）。
+    rt.run_blocking(syscall(
+        DataOp::Open {
+            path: p.clone(),
+            flags: rw_flags(),
+        },
+        vec![wr_path(p.clone())],
+        Action::Pure,
+    ))
+    .unwrap();
 
     // fd 上 Read 照常（Read 不插标记；回滚对 Read/Append 无操作）。
     let v = rt
@@ -315,12 +302,10 @@ fn rollback_only_touches_this_syscall_markers_success_path_axiom_kept() {
 /// path1 的标记先插入、path2 检查失败 → 只回滚前缀 [W(path1)]：
 /// path1 不被毒化（可重试），path2 的**早前**消费记录不被误删（仍拒绝）。
 #[test]
-fn batch_partial_check_failure_rolls_back_prefix_only() {
+fn batch_partial_check_own_rolls_back_prefix_only() {
     let mut rt = Runtime::new(Box::new(ScriptedExecutor {
         results: VecDeque::from([
-            Ok((Value::Fd(0), UndoCapability::Identity)), // Open(w) path2 成功 → path2 Write 标记消费
-                                      // 双资源 Open：check_linear(path1) 插入 → check_linear(path2) 失败
-                                      // （已消费）→ 前缀 [W(path1)] 回滚，错误透传
+            Ok((Value::Fd(0), UndoCapability::Identity)), // Open(w) path2 成功
         ]),
     }));
     let p1 = PathBuf::from("/a.txt");
@@ -336,45 +321,25 @@ fn batch_partial_check_failure_rolls_back_prefix_only() {
     ))
     .unwrap();
 
-    // 双资源批：path1 标记插入后 path2 检查失败（InvalidInput）
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: p1.clone(),
-                flags: rw_flags(),
-            },
-            vec![wr_path(p1.clone()), wr_path(p2.clone())],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(e, SysError::InvalidInput, "path2 已消费 → 批检查失败");
-    assert!(rt.undo_stack().is_empty(), "失败不产生 undo");
-
-    // path1 前缀标记已回滚 → 同路径 Write 模式重开成功（B2 修复后）
+    // 双资源批：Write 是 use 语义（不消费）→ 批检查通过，Open 成功（队列兜底）。
     rt.run_blocking(syscall(
         DataOp::Open {
             path: p1.clone(),
             flags: rw_flags(),
         },
-        vec![wr_path(p1.clone())],
+        vec![wr_path(p1.clone()), wr_path(p2.clone())],
         Action::Pure,
     ))
     .unwrap();
 
-    // path2 的早前消费记录未被前缀回滚误删 → 仍被 A4 拒绝
-    let e2 = rt
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: p2.clone(),
-                flags: rw_flags(),
-            },
-            vec![wr_path(p2.clone())],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(
-        e2,
-        SysError::InvalidInput,
-        "早前成功消费的 path2 标记不被前缀回滚误删（A4 恰好一次）"
-    );
+    // 同路径再次 Open(w) 也允许（use 语义，不消费）。
+    rt.run_blocking(syscall(
+        DataOp::Open {
+            path: p2.clone(),
+            flags: rw_flags(),
+        },
+        vec![wr_path(p2.clone())],
+        Action::Pure,
+    ))
+    .unwrap();
 }

@@ -709,7 +709,7 @@ fn failed_exclusive_open_same_path_write_reopen_ok() {
         .unwrap();
     let fd = fd_of(&v);
 
-    // 重开后可写（真实全链路：写生效 + A4 至多一次仍成立，标记计数不重复消费）。
+    // 重开后可写（真实全链路：use 语义——同 fd 二写允许，独立 undo 入栈）。
     rt.run_blocking(syscall(
         DataOp::Write {
             fd,
@@ -719,25 +719,23 @@ fn failed_exclusive_open_same_path_write_reopen_ok() {
         Action::Pure,
     ))
     .unwrap();
-    let e2 = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd,
-                data: b"again".to_vec(),
-            },
-            vec![wr(fd)],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(e2, SysError::InvalidInput, "成功路径 A4 至多一次不变");
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd,
+            data: b"again".to_vec(),
+        },
+        vec![wr(fd)],
+        Action::Pure,
+    ))
+    .unwrap();
     assert_eq!(
         rt.undo_stack().len(),
-        1,
-        "被 A4 拦截的二写不产生 undo（栈中仅剩首次成功写的 undo）"
+        2,
+        "二写各一个独立 undo（use 语义）"
     );
     assert!(
-        std::fs::read(&p).unwrap().starts_with(b"patched"),
-        "重开后的写真实生效（物理文件）"
+        std::fs::read(&p).unwrap().starts_with(b"patchedagain"),
+        "两次写都真实生效（物理文件）"
     );
 }
 

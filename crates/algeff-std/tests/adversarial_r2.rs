@@ -1117,22 +1117,17 @@ fn r1_stale_fd_write_after_replace_recheck() {
         1,
         "父级 Write undo 未被分支级 Replace 吞掉"
     );
-    // 父级 A4：同资源再 Write 仍被拦截（分支级 Replace 不清父 consumed）。
-    let e = rt
-        .run_blocking(syscall(
-            DataOp::Write {
-                fd,
-                data: b"XX".to_vec(),
-            },
-            vec![wr(fd)],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "分支级 Replace 后父级 A4 消费标记仍生效"
-    );
+    // 父级 A4：use 语义——分支级 Replace 不清父 consumed，同资源再 Write 允许
+    // （运行时维护独立 undo）。
+    rt.run_blocking(syscall(
+        DataOp::Write {
+            fd,
+            data: b"XX".to_vec(),
+        },
+        vec![wr(fd)],
+        Action::Pure,
+    ))
+    .unwrap();
 
     // 父级 Replace（D10：recover + reg.clear）→ 旧 fd 写不再被 A4 拦截。
     rt.run_blocking(Action::Replace {

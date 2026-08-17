@@ -65,15 +65,14 @@ fn reg_external_allocate_take_clear_d1_monotonic() {
     assert_eq!(n1, 5, "next_fd 跳过已分配区间（{n1} != 2）");
     assert!(fds.iter().all(|f| *f != n1), "新 fd 不复用任何历史 fd");
 
-    // A4 消费：Write 至多一次。
+    // A4 use 语义：Write 不限次数（D-0xx 拆分，运行时维护独立 undo）。
     let r = Resource::Fd(fds[0]);
     assert!(reg
         .check_linear(&usage(r.clone(), AccessMode::Write))
         .is_ok());
-    assert_eq!(
-        reg.check_linear(&usage(r.clone(), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "同一资源二次 Write 拒绝（A4）"
+    assert!(
+        reg.check_linear(&usage(r.clone(), AccessMode::Write)).is_ok(),
+        "同一资源二次 Write 允许（use 语义）"
     );
 
     // clear（D10 复位）：句柄与线性标记全清，next_fd 保留（D1）。
@@ -210,10 +209,10 @@ fn reg_external_mixed_sequence_d1_d13_d10() {
         "合并后子句柄可见"
     );
     assert!(reg.lookup(a0).is_some(), "父原句柄保留");
-    assert_eq!(
-        reg.check_linear(&usage(Resource::Fd(c1), AccessMode::Write)),
-        Err(SysError::InvalidInput),
-        "子路径 Write 消费并入父（A4 状态随 merge 传播）"
+    // 子路径 Write（use 语义）并入父：允许重复（运行时维护独立 undo）。
+    assert!(
+        reg.check_linear(&usage(Resource::Fd(c1), AccessMode::Write)).is_ok(),
+        "merge 后 Write 仍允许（use 语义，不消费）"
     );
 
     // 阶段 6：D10 —— clear 复位句柄与线性标记，next_fd 保留（D1）。

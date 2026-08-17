@@ -962,12 +962,11 @@ fn r6_snapshot_a4_linear_and_undo_preserved() {
     assert_eq!(std::fs::read(&fa).unwrap(), b"NEW-A", "左分支写落盘");
     assert_eq!(std::fs::read(&fb).unwrap(), b"NEW-B", "右分支写落盘");
 
-    // A4 线性：分支 Write(path) 消费标记并入父 → 父级同路径 Write 声明被拒。
+    // A4 use 语义：分支 Write（use）并入父 → 父级同路径 Write 声明仍允许。
     let u = wr_path(fa.clone());
-    assert_eq!(
-        rt.registry().check_linear(&u),
-        Err(SysError::InvalidInput),
-        "分支 Write 线性标记应随 merge 并入父（A4 保持）"
+    assert!(
+        rt.registry().check_linear(&u).is_ok(),
+        "分支 Write 标记并入父后 Write 仍允许（use 语义）"
     );
     assert_eq!(rt.undo_stack().len(), 2, "两分支 Write undo 并入父栈");
 
@@ -1110,7 +1109,7 @@ fn dx_explicit_override_conflicts_with_inference() {
     let fdb = fd_of(&v);
     assert_ne!(fda, fdb, "二次打开成功（覆盖声明 Read 未插 Write 标记）");
 
-    // 对照（无覆盖）：两个自动推导 Write(path) 打开同路径 → 第二次 A4 拒绝。
+    // 对照（无覆盖）：两个自动推导 Write(path) 打开同路径 → 均允许（use 语义）。
     let mut rt2 = Runtime::new(Box::new(TokioExecutor::new()));
     let v = rt2
         .run_blocking(syscall(
@@ -1123,21 +1122,15 @@ fn dx_explicit_override_conflicts_with_inference() {
         ))
         .unwrap();
     let _ = fd_of(&v);
-    let e = rt2
-        .run_blocking(syscall(
-            DataOp::Open {
-                path: pb.clone(),
-                flags: rw_flags(),
-            },
-            vec![wr_path(pb.clone())],
-            Action::Pure,
-        ))
-        .unwrap_err();
-    assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "无覆盖：同路径二次 Write 声明被 A4 拒绝（对照）"
-    );
+    rt2.run_blocking(syscall(
+        DataOp::Open {
+            path: pb.clone(),
+            flags: rw_flags(),
+        },
+        vec![wr_path(pb.clone())],
+        Action::Pure,
+    ))
+    .unwrap();
 }
 
 /// do_! + dx 的 fd 操作推导：管道写读回 + **Dup 推导冲突锁定 + 显式覆盖**
@@ -1163,8 +1156,8 @@ fn dx_do_macro_pipe_and_dup_semantics() {
     let v = rt.run_blocking(blueprint).unwrap();
     assert_eq!(v, Value::Bytes(b"pipe-dx".to_vec()), "do_! 管道写读回");
 
-    // Dup 推导冲突（F-R7-4 行为锁定）：dx::dup 推断 `Write(fd)`（A4 消费），
-    // 天然序列 dup → 同 fd 写被 InvalidInput 拒绝（默认值的保守代价）。
+    // Dup 推导（F-R7-4 更新）：dx::dup 推断 `Write(fd)`（use 语义不消费）→
+    // 同 fd 写允许（默认值不再带来 A4 冲突；Dup 共享写端物理生效）。
     let dir = tempfile::tempdir().unwrap();
     let pc = dir.path().join("dup-conflict.txt");
     let blueprint = do_! {
@@ -1175,11 +1168,11 @@ fn dx_do_macro_pipe_and_dup_semantics() {
         dx::close(&d);
         Value::Unit
     };
-    let e = rt.run_blocking(blueprint).unwrap_err();
+    rt.run_blocking(blueprint).unwrap();
     assert_eq!(
-        e,
-        SysError::InvalidInput,
-        "F-R7-4 行为锁定：dx::dup 推断 Write(fd) 消费写许可 → 同 fd 写被 A4 拒绝"
+        std::fs::read(&pc).unwrap(),
+        b"ab",
+        "dup 后同 fd 写允许（use 语义）且物理落盘"
     );
 
     // 显式覆盖（文档承诺 2）：dup 改声明 Read(Fd(fd)) → 同 fd 写可用，
