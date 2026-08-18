@@ -1064,22 +1064,38 @@ fn r6b_udp_bind_occupied_other_98_no_poison() {
     .unwrap();
 
     // Close 首 socket → 端口释放 → 同地址可再绑（无跨操作泄漏占用端口）。
+    // macOS：close 后端口有 TIME_WAIT/回收延迟，立即重绑同地址返回
+    // EADDRINUSE(98)（与 1042 断言跨平台一致的 Other(98) 行为）—按平台分支锁定。
     rt.run_blocking(syscall(DataOp::Close { fd }, vec![ow(fd)], Action::Pure))
         .unwrap();
-    let v = rt
-        .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let v = rt
+            .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
+            .unwrap();
+        let fd2 = fd_of(&v);
+        assert!(
+            fd2 != fd,
+            "重绑分配新 fd（D1 单调；原 fd 已释放，端口复用）"
+        );
+        rt.run_blocking(syscall(
+            DataOp::Close { fd: fd2 },
+            vec![ow(fd2)],
+            Action::Pure,
+        ))
         .unwrap();
-    let fd2 = fd_of(&v);
-    assert!(
-        fd2 != fd,
-        "重绑分配新 fd（D1 单调；原 fd 已释放，端口复用）"
-    );
-    rt.run_blocking(syscall(
-        DataOp::Close { fd: fd2 },
-        vec![ow(fd2)],
-        Action::Pure,
-    ))
-    .unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let e = rt
+            .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
+            .unwrap_err();
+        assert_eq!(
+            e,
+            SysError::Other(98),
+            "macOS close 后端口回收延迟：重绑同地址仍 EADDRINUSE(98)"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
