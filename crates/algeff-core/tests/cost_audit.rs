@@ -54,7 +54,7 @@ fn idempotent(key: &str, inner: Action) -> Action {
     Action::Idempotent {
         key: key.to_string(),
         inner: Box::new(inner),
-        next: Box::new(|v| Action::Pure(v)),
+        next: Box::new(Action::Pure),
     }
 }
 

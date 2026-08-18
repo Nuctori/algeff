@@ -120,12 +120,15 @@ impl EffectCost {
                 read: Grade::point(1).with_max(*len as u64),
                 ..Default::default()
             },
-            Stat { .. } | ReadDir { .. } | GetTime | TcpAccept { .. } | TcpRead { .. } => {
-                EffectCost {
-                    read: Grade::point(1),
-                    ..Default::default()
-                }
-            }
+            Stat { .. } | ReadDir { .. } | GetTime | TcpAccept { .. } => EffectCost {
+                read: Grade::point(1),
+                ..Default::default()
+            },
+            // 带长度的接收：read 维度以字节量为 max（保守上界，与 Read 一致，文档 B1）。
+            TcpRead { len, .. } => EffectCost {
+                read: Grade::point(1).with_max(*len as u64),
+                ..Default::default()
+            },
             // 带长度的接收：read 维度以字节量为 max（保守上界）。
             UdpRecvFrom { len, .. } => EffectCost {
                 read: Grade::point(1).with_max(*len as u64),
