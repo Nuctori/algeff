@@ -4,6 +4,7 @@
 //! 不包含任何物理 IO 实现——物理执行由 `algeff-std` 的 `SyscallExecutor` 提供。
 
 pub mod action;
+pub mod cost;
 pub mod error;
 pub mod resource;
 pub mod runtime;
@@ -20,6 +21,9 @@ pub use error::SysError;
 pub use resource::*;
 pub use runtime::{Context, IdempotencyRegistry, IdempotencyStatus, Runtime, UndoStack};
 pub use syscall::{BoxFuture, SyscallExecutor, UndoCapability, UndoOp};
+
+/// 效应开销代数（D-104 落点 a，运行时可审计路线）。
+pub use cost::{CostBudget, EffectCost, Grade};
 
 /// 常用入口（pdr.md §14 示例风格）。
 pub mod prelude {

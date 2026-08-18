@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::action::{Action, DataOp, Id, Signal, Value};
+use crate::cost::EffectCost;
 use crate::error::SysError;
 use crate::resource::{ResourceRegistry, ResourceSet};
 use crate::syscall::{BoxFuture, SyscallExecutor, UndoCapability, UndoOp};
@@ -171,6 +172,12 @@ pub struct UndoStack {
     /// 置位后不因 `rollback_from` 清除（不可逆副作用无法撤销，回滚只是
     /// 尽力恢复可逆部分）；仅 Replace 成功完成恢复后重置（新执行段起点）。
     irreversible: bool,
+    /// 运行时累计开销（D-104 落点 a，文档 v0.1 审计结论）：与义务效应同源
+    /// 累加——每个经 `exec_via` 真实执行的 DataOp 在此落点记账。幂等键命中
+    /// （`Action::Idempotent` 缓存命中不调 `exec_via`）→ 开销自动不累计，
+    /// 满足文档 C1（幂等段 inner 开销塌缩为 ~0）。纯计算（无 DataOp）开销为
+    /// 零。代数结构见 `crate::cost`：三原语 [min,max] 区间，顺序组合逐分量加法。
+    accrued: EffectCost,
 }
 
 impl UndoStack {
@@ -178,6 +185,7 @@ impl UndoStack {
         Self {
             ops: Vec::new(),
             irreversible: false,
+            accrued: EffectCost::ZERO,
         }
     }
 
@@ -191,6 +199,16 @@ impl UndoStack {
 
     pub fn len(&self) -> usize {
         self.ops.len()
+    }
+
+    /// 累加一次真实执行的效应开销（与 `push` 同源落点，D-104）。
+    pub fn add_cost(&mut self, cost: EffectCost) {
+        self.accrued = self.accrued.plus(&cost);
+    }
+
+    /// 运行时累计开销查询（可审计：跑完拿到 cost trace，文档 §1 规约落地）。
+    pub fn accrued_cost(&self) -> EffectCost {
+        self.accrued
     }
 
     /// 记录一次不可逆副作用（NonInvertible 操作被真实执行）。
@@ -216,6 +234,7 @@ impl UndoStack {
     pub fn append(&mut self, other: UndoStack) {
         self.ops.extend(other.ops);
         self.irreversible |= other.irreversible;
+        self.accrued = self.accrued.plus(&other.accrued);
     }
 
     /// recoverΓ：按 LIFO 顺序执行全部逆操作（pdr.md §5.1.3）。
@@ -1496,6 +1515,9 @@ async fn interpret_impl(
                     // （现有契约）。
                     None => match exec_via(&mut access, &op, reg).await {
                         Ok((v, capability)) => {
+                            // D-104（落点 a）：真实执行的效应在此落点记账——与
+                            // `undo.push` 同源，幂等命中不调用 `exec_via` 故不计。
+                            undo.add_cost(EffectCost::for_op(&op));
                             match capability {
                                 UndoCapability::Identity => {}
                                 UndoCapability::Invertible(u) => undo.push(u),
