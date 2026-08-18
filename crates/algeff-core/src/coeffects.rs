@@ -80,10 +80,11 @@ impl CoeffectStore {
                     t.entries.remove(&k);
                 }
             }
+            Ok(())
         })
     }
 
-    /// 可逆注册并同时产出两份等价逆操作（`Runtime::set_dependency` 场景）：
+    /// 可逆注册并同时产出两份等价逆操作
     /// 一份压入撤销栈随 `recover()` 生效，一份返回调用方供即时撤销。
     ///
     /// 两份逆操作各自独立持有撤销所需信息（旧绑定/删除），语义等价；
@@ -93,8 +94,8 @@ impl CoeffectStore {
         let mut table = self.inner.lock().await;
         let old = table.entries.insert(k, v);
         drop(table);
-        let make_undo = |store: CoeffectStore| -> UndoOp {
-            let old = old.clone();
+        let build_undo = |k: DepKey, old: Option<Value>| -> UndoOp {
+            let store = self.clone();
             Box::pin(async move {
                 let mut t = store.inner.lock().await;
                 match old {
@@ -105,9 +106,10 @@ impl CoeffectStore {
                         t.entries.remove(&k);
                     }
                 }
+                Ok(())
             })
         };
-        (make_undo(self.clone()), make_undo(self.clone()))
+        (build_undo(k, old.clone()), build_undo(k, old))
     }
 }
 

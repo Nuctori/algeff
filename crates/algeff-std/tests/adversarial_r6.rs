@@ -330,10 +330,11 @@ async fn chain_mkdir_existing_maps_already_exists_dir_usable() {
 }
 
 /// 映射表边界（未入 14 错误集的码 → Other(n)）：Rmdir 非空 → Windows
-/// ERROR_DIR_NOT_EMPTY(145) → Other(145)；Unix ENOTEMPTY(39) → Other(39)。
-/// 行为锁定 + 疑似缺陷 S1 记录：同蓝图跨平台 Other(n) 不一致（EADDRINUSE 已
-/// 归一化 98，ENOTEMPTY 类未归一化 → normalize 表策略不一致）。
-/// 毒化检查：失败后目录内容仍可读；清空后同 executor Rmdir 成功。
+/// ERROR_DIR_NOT_EMPTY(145) → Other(145)；Linux ENOTEMPTY(39) → Other(39)；
+/// macOS/BSD ENOTEMPTY(66) → Other(66)。行为锁定 + 疑似缺陷 S1 记录：同蓝图
+/// 跨平台 Other(n) 不一致（EADDRINUSE 已归一化 98，ENOTEMPTY 类未归一化 →
+/// normalize 表策略不一致）。毒化检查：失败后目录内容仍可读；清空后同 executor
+/// Rmdir 成功。
 #[tokio::test]
 async fn chain_rmdir_nonempty_platform_other_locked() {
     let dir = tempfile::tempdir().unwrap();
@@ -350,11 +351,17 @@ async fn chain_rmdir_nonempty_platform_other_locked() {
         SysError::Other(145),
         "Windows ERROR_DIR_NOT_EMPTY(145) → Other(145)（S1 行为锁定）"
     );
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), target_os = "macos"))]
+    assert_eq!(
+        e,
+        SysError::Other(66),
+        "macOS/BSD ENOTEMPTY(66) → Other(66)（S1 行为锁定）"
+    );
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     assert_eq!(
         e,
         SysError::Other(39),
-        "Unix ENOTEMPTY(39) → Other(39)（S1 行为锁定）"
+        "Linux ENOTEMPTY(39) → Other(39)（S1 行为锁定）"
     );
 
     // 毒化：目录内容仍可读；清空后 Rmdir 成功（错误不粘滞）。
