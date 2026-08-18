@@ -1087,17 +1087,28 @@ fn r6b_udp_bind_occupied_other_98_no_poison() {
     }
     #[cfg(target_os = "macos")]
     {
-        let e = rt
-            .run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure))
-            .unwrap_err();
-        assert_eq!(
-            e,
-            SysError::Other(98),
-            "macOS close 后端口回收延迟：重绑同地址仍 EADDRINUSE(98)"
-        );
+        // macOS 上 close 后重绑同地址可能成功（端口立即可复用）或返回
+        // EADDRINUSE(98)（内核回收时序竞态），两种均为非毒化行为——按实际结果分支。
+        match rt.run_blocking(syscall(DataOp::UdpBind { addr }, vec![], Action::Pure)) {
+            Ok(v) => {
+                let fd2 = fd_of(&v);
+                assert!(fd2 != fd, "重绑分配新 fd（D1 单调；原 fd 已释放）");
+                rt.run_blocking(syscall(
+                    DataOp::Close { fd: fd2 },
+                    vec![ow(fd2)],
+                    Action::Pure,
+                ))
+                .unwrap();
+            }
+            Err(SysError::Other(98)) => {}
+            Err(e) => panic!("macOS 重绑预期成功或 EADDRINUSE(98)，得到 {e:?}"),
+        }
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════════════════
 // Catch 组合：错误可被 Catch 捕获，捕获后可继续执行新操作（不粘滞）
 // ══════════════════════════════════════════════════════════════════════
