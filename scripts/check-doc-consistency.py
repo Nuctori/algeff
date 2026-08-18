@@ -22,6 +22,7 @@
 """
 
 import sys
+import contextlib
 
 FILES = [
     "README.md",
@@ -161,4 +162,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Windows CI 默认 stdout 编码为 cp1252，无法 encode 中文 print，强制 UTF-8。
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
     sys.exit(main())
